@@ -31,11 +31,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional, TypedDict
 
-try:
-    from . import protocol, security
-except ImportError:
-    import protocol
-    import security
+from . import protocol, security
 
 logger = logging.getLogger(__name__)
 

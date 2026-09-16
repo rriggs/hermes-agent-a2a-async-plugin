@@ -14,7 +14,7 @@ assert spec and spec.loader
 plugin = __import__("importlib.util", fromlist=["module_from_spec"]).module_from_spec(spec)
 sys.modules[spec.name] = plugin
 spec.loader.exec_module(plugin)
-tools = sys.modules["a2a_async_plugin.tools"]
+from a2a_async_plugin import tools
 
 
 class Peer(BaseHTTPRequestHandler):

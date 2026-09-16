@@ -1050,8 +1050,8 @@ def _a2a_tools_available() -> bool:
 
 
 def register_tools(ctx) -> None:
-    """Register only asynchronous tools in the shared ``a2a`` toolset."""
-    for name in ("a2a_steer", "a2a_submit", "a2a_get_task", "a2a_await", "a2a_cancel"):
+    """Register all A2A client tools in the shared ``a2a`` toolset."""
+    for name in _SCHEMAS:
         function_schema = _SCHEMAS[name]["function"]
         ctx.register_tool(
             name=name,

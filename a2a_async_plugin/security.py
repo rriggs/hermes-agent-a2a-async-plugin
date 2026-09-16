@@ -17,7 +17,14 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from typing import Optional
-from gateway.platforms._shared import profile_scoped as _profile_scoped
+def _profile_scoped() -> bool:
+    """Return whether the adapter is running in a multiplexed profile scope."""
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+        return bool(is_multiplex_active() and current_secret_scope() is not None)
+    except Exception:
+        return False
+
 
 logger = logging.getLogger(__name__)
 

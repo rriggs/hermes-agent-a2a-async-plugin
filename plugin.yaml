@@ -1,0 +1,15 @@
+name: a2a-async
+version: 0.1.0
+description: "Asynchronous A2A client tools contributed to the shared a2a toolset."
+author: Rob Riggs
+kind: standalone
+platforms:
+  - linux
+  - macos
+  - windows
+provides_tools:
+  - a2a_submit
+  - a2a_get_task
+  - a2a_await
+  - a2a_cancel
+  - a2a_steer

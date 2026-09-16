@@ -55,7 +55,7 @@ The plugin uses the stdlib HTTP transport and the A2A JSON-RPC protocol. It has 
 | Path | Purpose |
 |---|---|
 | `plugin.yaml` | Hermes plugin manifest |
-| `a2a_async/__init__.py` | `register(ctx)` entry point |
+| `__init__.py` | Hermes plugin entry point; delegates to the implementation package |
 | `a2a_async/tools.py` | Async tool schemas, handlers, and registration |
 | `a2a_async/protocol.py` | A2A protocol helpers and durable task store |
 | `a2a_async/security.py` | Outbound redaction and audit helpers |

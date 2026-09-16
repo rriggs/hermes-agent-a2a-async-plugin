@@ -1,5 +1,5 @@
 name: a2a-async
-version: 0.1.0
+version: 0.1.1
 description: "Asynchronous A2A client tools contributed to the shared a2a toolset."
 author: Rob Riggs
 kind: standalone

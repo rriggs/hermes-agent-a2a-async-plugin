@@ -58,6 +58,23 @@ def test_plugin_manifest_declares_registered_tools():
     }
 
 
+def test_secondary_profile_agent_name_comes_from_secret_scope(monkeypatch):
+    load_plugin()
+    import importlib
+    adapter = importlib.import_module("a2a_async_plugin.a2a_async_plugin.adapter")
+
+    monkeypatch.setattr(adapter, "_profile_scoped", lambda: True)
+    monkeypatch.setattr(adapter.os, "environ", {"A2A_AGENT_NAME": "hermes-emerald"})
+
+    import sys
+    import types
+    scope = types.ModuleType("agent.secret_scope")
+    scope.get_secret = lambda name: "kevin" if name == "A2A_AGENT_NAME" else None
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", scope)
+
+    assert adapter._default_agent_name() == "kevin"
+
+
 def test_async_tool_handlers_reject_missing_required_arguments():
     plugin = load_plugin()
     context = Context()

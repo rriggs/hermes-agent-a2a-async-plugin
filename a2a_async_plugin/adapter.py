@@ -112,12 +112,18 @@ def _return_immediately(params: dict) -> bool:
 
 
 def _default_agent_name() -> str:
-    # Scope-aware: inside a secondary multiplex profile, os.environ holds the
-    # DEFAULT profile's bridged A2A_AGENT_NAME — borrowing it would brand a
-    # secondary profile's Agent Card with another profile's identity. There
-    # is no per-profile config.yaml equivalent yet, so a scoped profile just
-    # falls through to the hostname-based default below instead.
-    name = "" if _profile_scoped() else os.getenv("A2A_AGENT_NAME", "").strip()
+    # In a multiplexed gateway, os.environ contains the default profile's
+    # bridged value. Resolve the profile-owned value through secret_scope
+    # instead, just as the security settings do. Falling through to the
+    # hostname makes every secondary advertise the same misleading identity.
+    if _profile_scoped():
+        try:
+            from agent.secret_scope import get_secret
+            name = (get_secret("A2A_AGENT_NAME") or "").strip()
+        except Exception:
+            name = ""
+    else:
+        name = os.getenv("A2A_AGENT_NAME", "").strip()
     if name:
         return name
     try:

@@ -111,19 +111,23 @@ def _return_immediately(params: dict) -> bool:
     return isinstance(cfg, dict) and bool(cfg.get("url") or (cfg.get("pushNotificationConfig") or {}).get("url"))
 
 
-def _default_agent_name() -> str:
-    # In a multiplexed gateway, os.environ contains the default profile's
-    # bridged value. Resolve the profile-owned value through secret_scope
-    # instead, just as the security settings do. Falling through to the
-    # hostname makes every secondary advertise the same misleading identity.
-    if _profile_scoped():
-        try:
-            from agent.secret_scope import get_secret
-            name = (get_secret("A2A_AGENT_NAME") or "").strip()
-        except Exception:
-            name = ""
-    else:
-        name = os.getenv("A2A_AGENT_NAME", "").strip()
+def _default_agent_name(config_name: object = "") -> str:
+    """Resolve the advertised identity, preferring non-secret config.
+
+    ``extra.agent_name`` is profile-local configuration and therefore safe to
+    read directly in a multiplexed gateway. The environment fallback is kept
+    for older installations and single-profile deployments.
+    """
+    name = str(config_name or "").strip()
+    if not name:
+        if _profile_scoped():
+            try:
+                from agent.secret_scope import get_secret
+                name = (get_secret("A2A_AGENT_NAME") or "").strip()
+            except Exception:
+                name = ""
+        else:
+            name = os.getenv("A2A_AGENT_NAME", "").strip()
     if name:
         return name
     try:
@@ -404,7 +408,7 @@ class A2AAdapter(BasePlatformAdapter):
         _port_env = None if _profile_scoped() else os.getenv("A2A_PORT")
         self.port = int(_port_env or extra.get("port", _DEFAULT_PORT))
         self.host = self._security_context.resolve_bind_host()
-        self.agent_name = _default_agent_name()
+        self.agent_name = _default_agent_name(extra.get("agent_name"))
         self._advertised_toolsets = [
             t.strip() for t in (
                 list(extra.get("advertised_toolsets") or [])

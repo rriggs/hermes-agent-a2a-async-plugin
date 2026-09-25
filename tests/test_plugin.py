@@ -73,6 +73,7 @@ def test_secondary_profile_agent_name_comes_from_secret_scope(monkeypatch):
     monkeypatch.setitem(sys.modules, "agent.secret_scope", scope)
 
     assert adapter._default_agent_name() == "kevin"
+    assert adapter._default_agent_name("config-kevin") == "config-kevin"
 
 
 def test_async_tool_handlers_reject_missing_required_arguments():

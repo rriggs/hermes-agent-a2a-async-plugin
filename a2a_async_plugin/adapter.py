@@ -12,7 +12,7 @@ Design (the #11025 insight, done as a plugin with zero core edits):
     tasks/pushNotificationConfig/delete.
   - Push notifications: config accepted inline in message/send
     (configuration.taskPushNotificationConfig) or via the create method;
-    payloads are v1.0 StreamResponse objects, HMAC-signed.
+    payloads are v1.0 StreamResponse objects.
   - Metrics at GET /metrics.
   - Each inbound task is filtered + framed (security.wrap_inbound) and routed
     into the agent's LIVE gateway session via the normal MessageEvent path, so
@@ -1338,10 +1338,7 @@ class A2AAdapter(BasePlatformAdapter):
         # Push payload uses the StreamResponse format (same as streaming).
         payload = protocol.status_update(task_id, context_id, state, (reply or "")[:2000])
 
-        signature = self._security_context.sign_push_payload(payload)
         headers = {"Content-Type": "application/json"}
-        if signature:
-            headers["X-A2A-Signature"] = signature
 
         try:
             data = json.dumps(payload).encode("utf-8")

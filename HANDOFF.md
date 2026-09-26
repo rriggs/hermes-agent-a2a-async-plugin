@@ -141,7 +141,7 @@ An isolated temporary Alex profile also verified direct authenticated SSE stream
 
 These are still open and should be addressed before calling the plugin production-complete or catalog-ready:
 
-1. Run a valid-task push notification delivery test in a temporary secondary profile. Verify callback payload, task ID/state, HMAC/signature behavior, and push metrics.
+1. Run a valid-task push notification delivery test in a temporary secondary profile. Verify callback payload, task ID/state, and push metrics. HMAC signing is intentionally not part of this plugin's callback contract.
 2. Run restart/recovery and remote-state reconciliation in a temporary secondary profile. Preserve a durable nonterminal task, restart only the temporary gateway, then verify `tasks/get`, `tasks/list`, orphan handling, and reconciliation.
 3. Expand the repository test suite beyond the current seven tests. Add focused adapter, security, TaskStore, SSE, push, restart/recovery, and loader-boundary coverage.
 4. Investigate or document the `hermes plugins validate` / `hermes_state_ids` discrepancy observed on Alex. Doctor passed, but validation previously failed in an environment whose capability subprocess could not import `hermes_state_ids`.

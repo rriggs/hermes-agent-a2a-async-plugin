@@ -1,11 +1,10 @@
 """A2A security primitives (adapter + client tools). A2A is a *network* surface: bind safety (no
 token => 127.0.0.1 only); peer identity from credentials, never the body (A2A_PEER_TOKENS
 token->name, shared A2A_BEARER_TOKEN => ip:<addr>); inbound injection filtering; outbound
-credential redaction; JSONL audit; trusted-peer allow-list; HMAC push signing; SSRF-safe URLs."""
+credential redaction; JSONL audit; trusted-peer allow-list; SSRF-safe URLs."""
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import ipaddress
 import json
@@ -68,7 +67,6 @@ class A2ASecurityContext:
     trusted_peers: frozenset[str]
     allow_all_users: bool
     requested_host: str
-    push_secret: str
 
     @classmethod
     def capture(cls) -> "A2ASecurityContext":
@@ -76,7 +74,7 @@ class A2ASecurityContext:
         return cls(bearer_token=bearer_token, peer_tokens=tuple(_parse_peer_tokens(_startup_env("A2A_PEER_TOKENS")).items()),
                    trusted_peers=_configured_trusted_peers(),
                    allow_all_users=_startup_env("A2A_ALLOW_ALL_USERS").lower() in {"1", "true", "yes"},
-                   requested_host=_startup_env("A2A_HOST") or "127.0.0.1", push_secret=_startup_env("A2A_PUSH_SECRET") or bearer_token)
+                   requested_host=_startup_env("A2A_HOST") or "127.0.0.1")
 
     def localhost_only(self) -> bool:
         return not (self.bearer_token or self.peer_tokens)
@@ -112,14 +110,6 @@ class A2ASecurityContext:
         if self.allow_all_users or self.localhost_only() or not self.trusted_peers:
             return True
         return identity in self.trusted_peers
-
-    def sign_push_payload(self, payload: dict) -> str:
-        """HMAC-SHA256 hex over the sorted-key JSON body; "" when no secret."""
-        if not self.push_secret:
-            return ""
-        body = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-        return hmac.new(self.push_secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
-
 
 def localhost_only() -> bool:
     """Fresh-context convenience for callers outside the adapter."""
@@ -254,14 +244,6 @@ def get_peer_tokens() -> dict[str, str]:
     """
     return _parse_peer_tokens(_startup_env("A2A_PEER_TOKENS"))
 
-def get_push_secret() -> str:
-    """Return the secret used for HMAC-SHA256 push notification signing.
-
-    Falls back to the bearer token if no dedicated push secret is set.
-    If neither is configured, push notifications are unsigned (localhost-only mode).
-    """
-    return A2ASecurityContext.capture().push_secret
-
 def get_trusted_peers() -> set[str]:
     """Return the configured trusted-peer allow-list (empty = no restriction).
 
@@ -291,16 +273,4 @@ def resolve_bind_host() -> str:
     """
     return A2ASecurityContext.capture().resolve_bind_host()
 
-def sign_push_payload(payload: dict) -> str:
-    """HMAC-SHA256 sign a push notification payload.
-
-    Returns hex-encoded signature. Empty string if no secret configured.
-    Receivers verify by HMAC-ing the JSON body (sorted keys) with the shared
-    secret and comparing against the X-A2A-Signature header.
-    """
-    secret = get_push_secret()
-    if not secret:
-        return ""
-    body = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
-    return hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
 # ---- END PLUGIN-COMPAT ----

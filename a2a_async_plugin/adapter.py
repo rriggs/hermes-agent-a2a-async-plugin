@@ -118,7 +118,8 @@ def _default_agent_name(config_name: object = "") -> str:
         try:
             from agent.secret_scope import get_secret
             name = (get_secret("A2A_AGENT_NAME") or "").strip()
-        except Exception:
+        except Exception as exc:
+            logger.warning("A2A: unable to resolve scoped agent name: %s", exc)
             name = ""
     else:
         name = os.getenv("A2A_AGENT_NAME", "").strip()

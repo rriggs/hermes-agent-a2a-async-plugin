@@ -64,7 +64,7 @@ def test_secondary_profile_agent_name_comes_from_secret_scope(monkeypatch):
     adapter = importlib.import_module("a2a_async_plugin.a2a_async_plugin.adapter")
 
     monkeypatch.setattr(adapter, "_profile_scoped", lambda: True)
-    monkeypatch.setattr(adapter.os, "environ", {"A2A_AGENT_NAME": "hermes-emerald"})
+    monkeypatch.setenv("A2A_AGENT_NAME", "hermes-emerald")
 
     import sys
     import types

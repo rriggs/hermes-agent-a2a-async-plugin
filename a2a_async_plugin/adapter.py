@@ -112,22 +112,18 @@ def _return_immediately(params: dict) -> bool:
 
 
 def _default_agent_name(config_name: object = "") -> str:
-    """Resolve the advertised identity, preferring non-secret config.
-
-    ``extra.agent_name`` is profile-local configuration and therefore safe to
-    read directly in a multiplexed gateway. The environment fallback is kept
-    for older installations and single-profile deployments.
-    """
-    name = str(config_name or "").strip()
+    """Resolve the advertised identity from scoped env, then config."""
+    name = ""
+    if _profile_scoped():
+        try:
+            from agent.secret_scope import get_secret
+            name = (get_secret("A2A_AGENT_NAME") or "").strip()
+        except Exception:
+            name = ""
+    else:
+        name = os.getenv("A2A_AGENT_NAME", "").strip()
     if not name:
-        if _profile_scoped():
-            try:
-                from agent.secret_scope import get_secret
-                name = (get_secret("A2A_AGENT_NAME") or "").strip()
-            except Exception:
-                name = ""
-        else:
-            name = os.getenv("A2A_AGENT_NAME", "").strip()
+        name = str(config_name or "").strip()
     if name:
         return name
     try:

@@ -73,6 +73,12 @@ def test_secondary_profile_agent_name_comes_from_secret_scope(monkeypatch):
     monkeypatch.setitem(sys.modules, "agent.secret_scope", scope)
 
     assert adapter._default_agent_name() == "kevin"
+    assert adapter._default_agent_name("config-kevin") == "kevin"
+
+    monkeypatch.setattr(adapter, "_profile_scoped", lambda: False)
+    monkeypatch.setenv("A2A_AGENT_NAME", "env-kevin")
+    assert adapter._default_agent_name("config-kevin") == "env-kevin"
+    monkeypatch.delenv("A2A_AGENT_NAME")
     assert adapter._default_agent_name("config-kevin") == "config-kevin"
 
 

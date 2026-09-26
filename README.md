@@ -36,6 +36,18 @@ Use `a2a_steer` with the `context_id` returned by an earlier A2A exchange when a
 
 Peers are configured in `config.yaml` under `a2a_agents`. Authentication and endpoint configuration remain owned by the built-in A2A integration.
 
+The inbound Agent Card identity can be set per profile under the A2A platform configuration. In a multiplexed gateway, put the name in each profile's config rather than relying on the shared process environment:
+
+```yaml
+platforms:
+  a2a:
+    extra:
+      agent_name: kevin
+      port: 9902
+```
+
+The plugin falls back to `A2A_AGENT_NAME` for older deployments, then to `hermes-<hostname>`.
+
 ## Architecture
 
 ```text

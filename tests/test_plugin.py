@@ -82,6 +82,16 @@ def test_secondary_profile_agent_name_comes_from_secret_scope(monkeypatch):
     assert adapter._default_agent_name("config-kevin") == "config-kevin"
 
 
+def test_agent_name_hostname_fallback(monkeypatch):
+    load_plugin()
+    import importlib
+    adapter = importlib.import_module("a2a_async_plugin.a2a_async_plugin.adapter")
+    monkeypatch.setattr(adapter, "_profile_scoped", lambda: False)
+    monkeypatch.delenv("A2A_AGENT_NAME", raising=False)
+    monkeypatch.setattr("socket.gethostname", lambda: "emerald")
+    assert adapter._default_agent_name() == "hermes-emerald"
+
+
 def test_async_tool_handlers_reject_missing_required_arguments():
     plugin = load_plugin()
     context = Context()

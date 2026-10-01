@@ -137,18 +137,49 @@ The default Alex gateway verified through the native A2A path:
 
 An isolated temporary Alex profile also verified direct authenticated SSE streaming, including submitted, working, artifact, completed, and terminal events.
 
+## Acceptance priorities
+
+Rob's acceptance priorities, in approximate order, are:
+
+1. Reliability, especially restart resilience, durable recovery, and reconciliation.
+2. Compatibility with Hermes' existing A2A implementation.
+3. Interoperability with at least one external implementation, preferably the official Python SDK/reference implementation.
+4. Conformance with the A2A specification, with pragmatic flexibility where the protocol version or SDK transition requires it.
+
+HMAC push signing is intentionally out of scope. The deployment does not cross trust boundaries, and A2A does not require HMAC for push callbacks.
+
 ## Open items
 
-These are still open and should be addressed before calling the plugin production-complete or catalog-ready:
+These are still open and should be addressed against the acceptance priorities above before calling the plugin production-complete:
 
-1. Run a valid-task push notification delivery test in a temporary secondary profile. Verify callback payload, task ID/state, and push metrics. HMAC signing is intentionally not part of this plugin's callback contract.
-2. Run restart/recovery and remote-state reconciliation in a temporary secondary profile. Preserve a durable nonterminal task, restart only the temporary gateway, then verify `tasks/get`, `tasks/list`, orphan handling, and reconciliation.
-3. Expand the repository test suite beyond the current seven tests. Add focused adapter, security, TaskStore, SSE, push, restart/recovery, and loader-boundary coverage.
-4. Investigate or document the `hermes plugins validate` / `hermes_state_ids` discrepancy observed on Alex. Doctor passed, but validation previously failed in an environment whose capability subprocess could not import `hermes_state_ids`.
-5. Re-run validation against a clean tagged checkout and create a release tag only after the acceptance tests pass.
-6. Re-run the full Hermes-side plugin Doctor and deployment checks after any release/tag operation.
+1. Run restart/recovery and remote-state reconciliation in a temporary secondary profile. Preserve a durable nonterminal task, restart only the temporary gateway, then verify `tasks/get`, `tasks/list`, orphan handling, and reconciliation.
+2. Verify compatibility with Hermes' existing synchronous A2A implementation and shared `a2a` toolset, including mixed synchronous/asynchronous operation in one gateway.
+3. Run an interoperability test against the official Python A2A SDK/reference implementation, covering Agent Card discovery, message send, task polling, streaming where supported, and push notification delivery where practical.
+4. Perform a focused A2A specification conformance review for the supported v1.0-shaped and legacy-compatible methods and payloads.
+5. Expand the repository test suite beyond the current seven tests. Add focused adapter, security, TaskStore, SSE, push, restart/recovery, and loader-boundary coverage.
+6. Investigate or document the `hermes plugins validate` / `hermes_state_ids` discrepancy observed on Alex. Doctor passed, but validation previously failed in an environment whose capability subprocess could not import `hermes_state_ids`.
+7. Re-run validation against a clean tagged checkout and create a release tag only after the acceptance tests pass.
+8. Re-run the full Hermes-side plugin Doctor and deployment checks after any release/tag operation.
 
-The plugin is usable and deployed, but it is not yet catalog-ready because push delivery, restart/recovery, expanded acceptance coverage, and clean tagged-checkout verification remain incomplete.
+The plugin is usable and deployed, but it is not yet production-complete because restart/recovery, Hermes compatibility, external interoperability, expanded acceptance coverage, and clean tagged-checkout verification remain incomplete.
+
+## Known gap: cancellation does not stop execution
+
+Cancellation is spec-compliant but best-effort in the weakest sense. Per A2A
+v1.0 §3.1.5, the server "will attempt to cancel the task, but success is not
+guaranteed"; the task lifecycle (`TASK_STATE_*`) is the entire contract and the
+protocol never binds what the server does behind it (opaque execution, §1.1).
+Here, `tasks/cancel` (adapter.py `_rpc_tasks_cancel`) transitions the task
+record to `CANCELED` synchronously and resolves the pending reply future, so
+the caller sees terminal state immediately. However, the inbound task was
+routed into the agent's live gateway session, and cancel does not abort that
+in-flight turn: the session keeps processing to completion, its eventual reply
+is discarded silently, and tokens/compute burn until then.
+
+Quality-of-implementation gap, not a compliance gap. A stronger
+implementation would abort the gateway turn (gateway-side interrupt by
+message/task id). Not required for conformance; flagged here so nobody
+mistakes `CANCELED` for "the work stopped."
 
 ## Operational constraints
 

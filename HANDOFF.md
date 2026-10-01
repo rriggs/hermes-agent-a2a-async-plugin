@@ -181,6 +181,32 @@ implementation would abort the gateway turn (gateway-side interrupt by
 message/task id). Not required for conformance; flagged here so nobody
 mistakes `CANCELED` for "the work stopped."
 
+Cancellation also carries no message. `CancelTaskRequest` is id-only in the
+normative proto (`a2a_cancel` sends `{"id": task_id}`); a terminal task cannot
+receive further messages (`UnsupportedOperationError`), so the protocol offers
+no "last words" channel inside a cancel. The caller-side alternative is
+steer-before-cancel (`a2a_steer` then `a2a_cancel`): it works but is a blunt
+instrument -- the steer queues a NEW turn rather than interrupting the
+in-flight one, so the peer briefly runs two tasks, and the steer's own task id
+is typically orphaned.
+
+Investigation direction (chosen): synthetic steer on cancel. Since the
+in-flight session is not aborted anyway, `_rpc_tasks_cancel` could inject a
+synthetic steering message into the live gateway session (context_id of the
+canceled task) BEFORE completing the record, giving the agent a chance to
+checkpoint/wrap up. Open questions before implementing:
+- Gateway behavior when a turn is enqueued for a context whose A2A task
+  record is already `CANCELED` (queue injection path, turn accounting).
+- Race between the synthetic steer and the original in-flight turn --
+  ordering guarantees in the gateway queue.
+- Whether the steer task should be recorded (ownership/direction metadata)
+  and who polls its response.
+- Cost tradeoff: this deliberately spends tokens to elicit a clean
+  checkpoint; make it conditional (config flag) if a caller wants hard-stop
+  semantics.
+- Rejection semantics: if injection fails, cancel proceeds anyway (best
+  effort per spec); log the failure to the audit trail.
+
 ## Operational constraints
 
 - All normal code work stays under `/home/hermes/.hermes/profiles/sven/workspace`.

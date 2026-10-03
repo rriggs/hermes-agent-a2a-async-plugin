@@ -326,3 +326,104 @@ is short enough that the kernel's pipe-buffer flush never
 tears a line on Linux, but a paranoid operator should wrap the
 write in ``fcntl.flock`` if they observe torn lines. Not in
 Phase 2 scope.
+
+---
+
+# Phase 3 / Task 5 + 6 + 7 follow-up notes
+
+These entries record the decisions and observations made while
+implementing ``tests/recovery/test_restart_contract.py``,
+``test_caller_restart.py``, and ``test_callee_restart.py``
+(Phase 3 / Tasks 5, 6, 7). Phase 3 is allowed to modify
+``a2a_async_plugin/*.py`` when a test proves current behaviour
+is incorrect for restart semantics; in this round no source
+changes were required — the existing ``_recover_from_db`` policy
+matches the contract documented in
+``docs/restart-recovery-contract.md``.
+
+## 17. The contract doc distinguishes on-disk vs API state
+
+The matrix row 7 originally asserted the FAILED-with-marker
+transition happens in the database. NOTES #15 already documents
+that ``_recover_from_db`` updates the in-memory ``self._tasks``
+dict but does NOT re-persist the FAILED transition. Phase 3
+makes this distinction explicit in
+``docs/restart-recovery-contract.md``:
+
+* **API state** (what ``TaskStore.get`` returns in the restarted
+  process): FAILED + marker + completed_at — observable.
+* **On-disk state** (what the next ``sqlite3.connect`` reads
+  from the same DB): the persisted WORKING + empty reply —
+  unchanged.
+
+The in-memory API is the operator-facing signal (it drives
+``/metrics`` and the A2A ``GetTask`` JSON-RPC). The on-disk row
+is the durability-of-truth (it survives a hard kill without
+the in-memory conversion). Both are observable surfaces, and
+both are tested in ``test_restart_contract.py::test_contract_matrix_row_7_inbound_nonterminal_policy_in_subprocess_restart``.
+
+## 18. ``fail_orphans`` reads the in-memory ``created_at``
+
+The watchdog's ``TaskStore.fail_orphans`` (protocol.py:983) reads
+``rec["created_at"]`` from the in-memory ``_tasks`` dict, NOT
+from the SQLite column. Tests that need to exercise the age
+filter must backdate the in-memory dict (under
+``store._lock``); the SQL ``created_at`` doesn't affect the
+watchdog's decision but we keep both surfaces consistent for
+clarity.
+
+## 19. Caller subprocess path uses inline worker script
+
+``test_caller_hardkill_outbound_task_remains_queryable_and_nonterminal``
+drives the outbound caller from a real subprocess (Python
+script written to ``tmp_path`` and SIGKILL'd by the test). The
+worker inlines the SendMessage wire call and the
+``TaskStore.create`` invocation so it doesn't depend on the
+``tools._task_store`` factory's config-lookup side effects.
+The worker adds the plugin repo and Hermes source tree to
+``sys.path`` explicitly because the parent pytest's
+``PYTHONPATH`` doesn't always include them.
+
+## 20. ``A2AAdapter`` requires ``gateway.config.PlatformConfig``
+
+The Phase 1 launcher constructs the adapter against a
+``PlatformConfig(enabled=True, extra={"port": port, ...})``.
+``test_callee_restart.py::test_clean_disconnect_resolves_all_pending_futures_and_clears_pending``
+uses the same construction shape in-process so the watchdog
+thread + ``_pending`` plumbing are real. The plan allows driving
+public methods (even underscore-prefixed ones) on a real adapter
+instance.
+
+## 21. ``test_callee_restart.py`` does not exercise a live SSE
+HTTP waiter
+
+The plan calls for "restart while an HTTP waiter (SSE/long-poll
+GetTask) is present." The Phase 1 launcher has no agent loop to
+hold an inbound task in WORKING (NOTES #8), and the adapter's
+``_prepare_task`` returns the FAILED terminal immediately when
+``self._loop is None or self._message_handler is None`` — no
+``_pending`` entry is created. We cannot exercise a live SSE
+HTTP waiter through the harness.
+
+The watchdog-protected-live-waiter behaviour (W1, W2) is
+exercised via the ``fail_orphans(protected=...)`` public entry
+point instead, with the test directly controlling whether the
+task_id is in the protected set. This is the same code path the
+real adapter's watchdog thread takes
+(``adapter._watchdog_loop`` line 545-549); the only difference
+is the source of the protected set (we drive it directly
+instead of going through ``_pending``). A real production
+gateway with an agent loop would exercise the full path; the
+test does not regress the contract.
+
+## 22. No source code changes were needed in Phase 3
+
+Phase 3's hard requirement ("a caller restart alone NEVER
+creates a '[gateway restarted]' failure on an OUTBOUND record")
+was already satisfied by the existing ``_recover_from_db``
+policy in ``protocol.py:729-734`` (gated on
+``rec["direction"] == "inbound"``). The contract doc captures
+this as the chosen policy; the tests pin it down. If a future
+change to ``_recover_from_db`` regresses this invariant, the
+Phase 3 tests will fail with a clear contract-violation
+message.

@@ -688,3 +688,106 @@ test 3) reads its own card-building code at
 ``adapter._build_card`` → ``protocol.build_agent_card``; that
 code path correctly produces the v1.0 ``supported_interfaces``
 shape. The two surfaces line up.
+
+---
+
+# Phase 6 / Task 13 follow-up notes
+
+These entries record the decisions and observations made while
+building ``docs/a2a-conformance.md`` and
+``tests/conformance/test_a2a_conformance.py`` (Phase 6 / Task 13).
+Phase 6 is documentation-and-evidence only — no source changes
+were required, but the conformance audit surfaced two real
+MUST-level gaps (see G1 and G2 in the doc §11) and four
+deliberate deviations. The audit's row count is 87; the gap
+list is 10 items, two of which (G7, G8) are opt-outs
+correctly handled by the plugin's own capability advertisement.
+
+## 35. The conformance test must reuse the recovery harness, not duplicate it
+
+The Phase 1 launcher harness (``gateway`` / ``isolated_profile`` /
+``free_port``) is the single source of truth for the
+A2A-gateway-subprocess lifecycle. Phase 6 needs the same
+fixtures from a sibling directory (``tests/conformance/``);
+pytest's auto-discovery walks the tree DOWNWARD, so a
+conftest in ``tests/recovery/`` is not visible to tests in
+``tests/conformance/``.
+
+**Decision.** Add a tiny ``tests/conftest.py`` that imports
+``tests/recovery/conftest.py`` via ``importlib.util`` and
+re-exports the three fixture objects by reference. Pytest's
+auto-discovery then picks them up for every test below
+``tests/`` (including the conformance sibling). A
+``pytest_plugins = ["tests.recovery.conftest"]`` approach was
+rejected because pytest auto-discovers the recovery
+conftest when it walks the recovery directory, causing
+"Plugin already registered under a different name" on
+collection.
+
+**Side effect.** ``tests/__init__.py`` was added so that
+``tests`` is a regular Python package (the import path
+``tests.recovery.conftest`` requires it). The existing
+``pytest.ini --ignore=__init__.py`` flag still prevents the
+file from being collected as a test module.
+
+## 36. The recovery harness's env teardown leaks across test directories
+
+**Observation.** ``isolated_profile`` (in
+``tests/recovery/conftest.py`` line 196-202) does
+``os.environ.pop("HERMES_HOME", None)`` in its teardown. The
+recovery suite doesn't notice because every test in that
+suite also goes through ``isolated_profile`` (which re-sets
+``HERMES_HOME`` for the subprocess env). The integration
+suite (``tests/integration/test_hermes_compatibility.py``)
+does NOT touch ``HERMES_HOME`` directly — it relies on the
+integration conftest's ``pytest_configure`` to set it once
+at session start.
+
+**Failure mode.** Once the conformance suite (which uses the
+recovery harness) runs before the integration suite (alphabetical
+collection order: ``conformance`` < ``integration``), the
+recovery teardown pops ``HERMES_HOME``, and the next
+integration test sees a missing HERMES_HOME. The operator's
+sven-profile ``a2a_agents`` config is keyed off ``HERMES_HOME``;
+without it, ``_resolve_peer("dev-a")`` returns ``None`` and
+the test fails with "unknown agent 'dev-a'."
+
+**Fix.** A function-scoped autouse fixture in
+``tests/conformance/conftest.py`` saves ``HERMES_HOME`` at
+the start of every conformance test and re-installs it
+after. The integration tests see the restored value.
+
+**General principle.** The recovery harness's env mutation
+is a known leak in the cross-directory test ordering. A
+cleaner long-term fix would be to make the recovery
+``isolated_profile`` fixture save-and-restore the entire
+env, not just pop the four keys. Out of scope for Phase 6
+(Task 13 only); flagged here so a future tightening pass
+can address it without rediscovering the issue.
+
+## 37. Two real MUST-level gaps surfaced, both unreachable from a well-behaved v1.0 SDK
+
+The conformance audit found two MUST-level gaps that an
+official `a2a-sdk` 1.1.2 client would never hit in
+practice but that a strict v1.0 conformance validator
+would fail on:
+
+* **G1 (Low)**: ``SubscribeToTask`` on a terminal task MUST
+  return ``UnsupportedOperationError`` (-32004). The
+  plugin's ``_rpc_tasks_subscribe`` line 1177-1179 silently
+  emits ``: done`` and closes the SSE stream instead. The
+  SDK's subscribe client surfaces this as a normal
+  stream-closure; a hand-rolled v1.0 conformance test
+  would fail.
+* **G2 (Low)**: ``A2A-Version: 0.x`` (anything not "1.0"
+  or "1.0.0") MUST return ``VersionNotSupportedError``
+  (-32009). The plugin returns ``ERR_INVALID_PARAMS``
+  (-32602) with a descriptive message. The SDK's
+  ``JsonRpcTransport`` always emits "1.0" so the SDK
+  client never hits the gap.
+
+Both gaps are documented honestly in
+``docs/a2a-conformance.md`` §11. The release decision
+belongs to Rob; if the deployment ever expects
+non-SDK v1.0 strict peers, both gaps need a one-line
+fix in the adapter.

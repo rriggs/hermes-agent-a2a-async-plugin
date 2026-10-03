@@ -92,32 +92,45 @@ if _recovery is not None:
 
 
 # ──────────────────────────────────────────────────────────────────
-# Per-test env restoration. See tests/recovery/NOTES.md #36.
+# Per-test env restoration. See tests/recovery/NOTES.md #36 and #38.
 # ──────────────────────────────────────────────────────────────────
 
 import pytest  # imported after the module-level fixture re-exports
 import os as _os  # local alias to keep the import block tidy
 
+# Env keys the recovery teardown pops and test configs may set
+# process-wide. Restored around every test (review finding: the
+# restore previously covered only HERMES_HOME while credential keys
+# stayed asymmetric and latent).
+_RESTORED_ENV_KEYS = ("HERMES_HOME", "A2A_BEARER_TOKEN", "A2A_PEER_TOKENS")
+
 
 @pytest.fixture(autouse=True)
 def _restore_hermes_home_per_test():
-    """Snap HERMES_HOME back to the pre-test value after each
-    test in this ``tests/`` tree runs.
+    """Snap the session-shaping env keys back to their pre-test
+    values after each test in this ``tests/`` tree runs.
 
-    The recovery-harness teardown (in ``isolated_profile``)
-    pops ``HERMES_HOME`` from ``os.environ``. Without this
-    restore, a sibling-directory test that runs after a
-    recovery test sees a missing HERMES_HOME and the
-    operator's peer config doesn't resolve. The session-start
-    integration conftest only sets HERMES_HOME once; it does
-    not re-set after the recovery tests pop it.
+    The recovery-harness teardown (in ``isolated_profile``) pops
+    ``HERMES_HOME`` from ``os.environ``. Without this restore, a
+    sibling-directory test that runs after a recovery test sees a
+    missing HERMES_HOME and the operator's peer config doesn't
+    resolve. The session-start integration conftest only sets
+    HERMES_HOME once; it does not re-set after the recovery tests
+    pop it. ``A2A_BEARER_TOKEN`` / ``A2A_PEER_TOKENS`` are restored
+    for symmetry: today only the integration conftest sets them,
+    but a future test that does so must not leak into neighbors.
 
-    Because this is an autouse fixture at the ``tests/``
-    level (not the conformance-only level), it covers every
-    test in every subdirectory that pytest auto-discovers
-    below this conftest.
+    Because this is an autouse fixture at the ``tests/`` level (not
+    the conformance-only level), it covers every test in every
+    subdirectory that pytest auto-discovers below this conftest.
     """
-    saved = _os.environ.get("HERMES_HOME", "")
+    saved = {key: _os.environ.get(key, "") for key in _RESTORED_ENV_KEYS}
     yield
-    if saved and "HERMES_HOME" not in _os.environ:
-        _os.environ["HERMES_HOME"] = saved
+    for key, value in saved.items():
+        if value and key not in _os.environ:
+            _os.environ[key] = value
+        elif not value and key in _os.environ:
+            # Pre-test state was "absent" (e.g. recovery teardown or
+            # a closed live-peer gate) -- keep it absent instead of
+            # letting a prior test's set leak forward.
+            _os.environ.pop(key, None)

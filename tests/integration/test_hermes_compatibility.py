@@ -66,7 +66,7 @@ import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-HERMES_TREE = Path("/home/hermes/.hermes/hermes-agent")
+HERMES_TREE = Path(os.environ.get("A2A_HERMES_TREE", "/home/hermes/.hermes/hermes-agent"))
 HERMES_PYTHON = HERMES_TREE / ".venv/bin/python"
 HERMES_HERMES_CLI = HERMES_TREE / ".venv/bin/hermes"
 
@@ -362,11 +362,16 @@ def _hermes_plugins_list_output() -> tuple[bool, str, str, int]:
     # does, and pytest will spawn that later.
     env = {k: v for k, v in os.environ.items()
            if k not in ("PYTHONPATH",)}
-    env["PATH"] = "/usr/bin:/bin:/home/hermes/.hermes/hermes-agent/.venv/bin"
-    # Propagate the sven-profile HOME so (c) can find the dev-a peer.
-    sven_home = "/home/hermes/.hermes/profiles/sven"
-    if os.path.isdir(sven_home) and env.get("HERMES_HOME", "") in ("", os.path.expanduser("~/.hermes")):
-        env["HERMES_HOME"] = sven_home
+    venv_bin = str(HERMES_TREE / ".venv" / "bin")
+    env["PATH"] = os.pathsep.join([venv_bin, "/usr/bin", "/bin"])
+    # Adopt the gated live-peer profile only when the operator opened
+    # the gate explicitly (A2A_LIVE_PEER_PROFILE); see conftest.py.
+    # A plain "the profile happens to exist" is NOT an opt-in.
+    session_home = os.environ.get("A2A_LIVE_PEER_PROFILE", "")
+    if session_home:
+        current = env.get("HERMES_HOME", "")
+        if current in ("", os.path.expanduser("~/.hermes")):
+            env["HERMES_HOME"] = os.path.abspath(os.path.expanduser(session_home))
     try:
         proc = subprocess.run(
             [str(HERMES_HERMES_CLI), "plugins", "list", "--json"],
@@ -522,6 +527,25 @@ def _live_peer_auth_configured() -> bool:
     return bool(os.environ.get("A2A_BEARER_TOKEN") or os.environ.get("A2A_PEER_TOKENS"))
 
 
+def _live_gate_open() -> tuple[bool, str]:
+    """(c) tests run ONLY when the operator opened the explicit gate:
+    A2A_LIVE_PEER_PROFILE set to a usable profile home. Anything else
+    (unset, empty, or pointing at a non-directory) is a skip. This is
+    the portability fix for the review finding in area B: the suite
+    must never silently adopt a host profile's peer configuration.
+    """
+    gate = os.environ.get("A2A_LIVE_PEER_PROFILE", "").strip()
+    if not gate:
+        return False, (
+            "A2A_LIVE_PEER_PROFILE is not set; live-peer tests are opt-in "
+            "to avoid adopting an ambient profile's peer config"
+        )
+    home = os.path.abspath(os.path.expanduser(gate))
+    if not os.path.isdir(home):
+        return False, f"A2A_LIVE_PEER_PROFILE={gate!r} is not a usable profile home"
+    return True, home
+
+
 def test_real_peer_sync_via_a2a_call():
     """(c, part 1) Plugin client -> dev-a, synchronous shape.
 
@@ -532,6 +556,9 @@ def test_real_peer_sync_via_a2a_call():
     registered as ``a2a_call`` works against a real peer running the
     SAME async plugin as its inbound adapter.
     """
+    gate_ok, gate = _live_gate_open()
+    if not gate_ok:
+        pytest.skip(f"live-peer gate closed: {gate}")
     ok, reason = _live_peer_reachable()
     if not ok:
         # 401 / timeout = connectivity finding worth reporting.
@@ -581,6 +608,9 @@ def test_real_peer_async_via_a2a_submit_then_get_task():
     ``working`` -> ``completed`` transitions faithfully through
     ``a2a_get_task``.
     """
+    gate_ok, gate = _live_gate_open()
+    if not gate_ok:
+        pytest.skip(f"live-peer gate closed: {gate}")
     ok, reason = _live_peer_reachable()
     if not ok:
         pytest.skip(f"dev-a peer unreachable: {reason}")

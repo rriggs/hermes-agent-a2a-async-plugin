@@ -791,3 +791,33 @@ Both gaps are documented honestly in
 belongs to Rob; if the deployment ever expects
 non-SDK v1.0 strict peers, both gaps need a one-line
 fix in the adapter.
+
+## 39. Review fixes land in tests/, not the operator's config (2026-10-03)
+
+Post-review cleanup (Amy verdict SHIP WITH CHANGES, areas B and E):
+
+- **B (portability gate).** `tests/integration/conftest.py` no longer
+  redirects HERMES_HOME to an authoring-host profile and no longer
+  forwards its bearer token by default. The live-peer (c) tests are
+  opt-in through `A2A_LIVE_PEER_PROFILE` (absolute profile-home
+  path). Credential channels when the gate is open:
+  operator-exported `A2A_BEARER_TOKEN`/`A2A_PEER_TOKENS` win;
+  otherwise the operator-created `tests/integration/.a2a_live_token`
+  (still the only token file, still git-excluded). The
+  `hermes plugins list` subprocess env build in
+  `test_hermes_compatibility.py` adopts the gated profile the same
+  way, and its PATH override is derived from `HERMES_TREE` (itself
+  overridable via `A2A_HERMES_TREE`) instead of hardcoding machine
+  paths. `tests/conftest.py` autouse restore now covers
+  `A2A_BEARER_TOKEN`/`A2A_PEER_TOKENS` symmetrically with
+  HERMES_HOME, including restoring "absent" state.
+- **E (contract P4 contradiction).** `restart-recovery-contract.md`
+  §7 P4 rewritten to the shipped semantics (schema-shaped SELECT
+  OperationalError re-raised; transient connection-level errors
+  still caught; message-string matching documented as a known
+  deviation pending errorcode-based tightening); traceability rows
+  added for P3 and P4. The doc and the code now agree.
+- The message-sniff -> `sqlite_errorcode` conversion in protocol.py
+  is a real improvement (review area A) but is behavior-affecting
+  source work, so it is queued with the other pre-tag fixes rather
+  than slipped into this docs/tests-only pass.

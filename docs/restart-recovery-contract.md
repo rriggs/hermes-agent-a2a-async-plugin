@@ -202,12 +202,19 @@ HTTP waiter / live `_pending` future
   `RuntimeError` from `TaskStore.__init__`. Tested in
   `test_taskstore_restart.py::test_newer_schema_version_raises_runtime_error`.
 * **P4.** A malformed row in SQLite (column-rename, etc.) does not
-  silently come up empty. Currently the SELECT `OperationalError` is
-  caught by the blanket `except Exception` in `_recover_from_db` —
-  this is the known gap `tests/recovery/NOTES.md` #11 documents.
-  Phase 3 may tighten this; the contract reserves the right to
-  require "loud failure" rather than "silent empty store" if a future
-  tightening test asserts it.
+  silently come up empty. **Shipped semantics (Phase 4, commit
+  `90c4a66`):** the recovery `SELECT`'s `OperationalError` is
+  re-raised when the error is schema-shaped — the message contains
+  "no such column", "no such table", or "schema" — replacing the
+  earlier blanket catch that produced a silent empty store
+  (`NOTES.md` #11, tightened in #24). Transient connection-level
+  errors (`database is locked`, `unable to open`) remain caught, so
+  a wedged file does not block first boot. Known deviation, held
+  for a future tightening: the schema-shaped gate is matched on the
+  SQLite message string, not `sqlite_errorcode` — a transient error
+  whose phrasing ever contained "schema" would be misclassified
+  loud. Asserted by
+  `tests/recovery/test_storage_failures.py::test_storage_schema_drift_select_raises_operational_error`.
 
 ## 8. What this contract does NOT cover
 
@@ -237,6 +244,8 @@ HTTP waiter / live `_pending` future
 | W1               | `test_callee_restart.py::test_watchdog_protects_live_waiter_via_fail_orphans` |
 | W2               | `test_callee_restart.py::test_watchdog_after_waiter_disconnects_fails_orphan` |
 | P1               | `test_taskstore_restart.py::test_sqlite_integrity_check_passes_after_round_trip` |
+| P3               | `test_taskstore_restart.py::test_newer_schema_version_raises_runtime_error` |
+| P4               | `test_storage_failures.py::test_storage_schema_drift_select_raises_operational_error` |
 
 ## 10. Change policy
 

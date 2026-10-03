@@ -171,10 +171,15 @@ Status: complete (Tasks 11 and 12 from
 Pytest: `103 passed, 2 skipped` from a clean checkout run
 (`PYTHONPATH=/home/hermes/.hermes/hermes-agent
 /home/hermes/.hermes/hermes-agent/.venv/bin/python -m pytest -q`).
-The 2 skips are the live-peer (c) tests — the conftest looks for an
-auth token at `tests/integration/.a2a_live_token`; on hosts without
-the sven profile's dev-a peer, those tests skip cleanly with the
-plan's "skip if the peer probe is unreachable or not authed" guard.
+The 2 skips are the live-peer (c) tests — those tests are **opt-in**
+through an explicit gate: set `A2A_LIVE_PEER_PROFILE` to a usable
+profile home and the conftest forwards that profile's identity (and,
+optionally, a token from `tests/integration/.a2a_live_token` or the
+operator's own `A2A_BEARER_TOKEN`). On hosts without the gate the
+tests skip cleanly with the plan's "skip if the peer probe is
+unreachable or not authed" guard. The gate exists so the suite can
+never silently adopt an ambient profile's peer configuration
+(review finding, Amy, 2026-10-03, area B).
 
 ### Task 11 — Mixed Hermes A2A compatibility (`tests/integration/test_hermes_compatibility.py`)
 
@@ -220,11 +225,14 @@ plan's "skip if the peer probe is unreachable or not authed" guard.
   plugin's own outbound client (`a2a_call`, `a2a_submit`,
   `a2a_get_task`) at dev-a (a real Hermes agent on this host that
   runs the SAME async plugin as its inbound adapter). Skip guard
-  (TCP probe + auth check) prevents 401s/connect-refused from
-  failing the run. When the sven-profile `A2A_BEARER_TOKEN` is in
-  the test env (drop a token into `tests/integration/.a2a_live_token`
-  — excluded from version control), the tests pass and record the
-  exact task id, state, and timing in the test log.
+  (profile gate + TCP probe + auth check) prevents 401s and
+  connect-refused from failing the run, and prevents silent
+  adoption of an ambient profile (see the Phase 5 section above
+  for the `A2A_LIVE_PEER_PROFILE` gate). When the gate is open and
+  a token is present (drop it into `tests/integration/.a2a_live_token`
+  — excluded from version control — or export `A2A_BEARER_TOKEN`
+  yourself), the tests pass and record the exact task id, state, and
+  timing in the test log.
 
 #### Scope correction rationale
 

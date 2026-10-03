@@ -219,3 +219,14 @@ __marimo__/
 
 # Profile-local Hermes artifacts (plans, cache)
 .hermes/
+
+# Phase 5 / Task 11 — integration test scratch
+# A narrowly-scoped file the operator may populate with a bearer token
+# to enable the live-peer (c) tests. Never commit.
+tests/integration/.a2a_live_token
+
+# Phase 5 / Task 12 — SDK venv (managed by setup_sdk_env.sh)
+tests/interoperability/.venv-sdk/
+
+# Phase 5 / Task 12 — SDK test scratch
+tests/interoperability/.tmp/

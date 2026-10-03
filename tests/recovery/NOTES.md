@@ -542,3 +542,149 @@ surface. The extensions are opt-in via ``set_fault_mode``;
 the default ``fault_mode={}`` preserves every Phase 1-3
 behaviour (verified by re-running the full pytest suite —
 97 passed, 0 skipped).
+
+---
+
+# Phase 5 / Task 11 + 12 follow-up notes
+
+These entries record the decisions and observations made while
+implementing ``tests/integration/test_hermes_compatibility.py``
+(Phase 5 / Task 11) and ``tests/interoperability/test_a2a_python_sdk.py``
+(Phase 5 / Task 12). Phase 5 is allowed to modify
+``a2a_async_plugin/*.py`` when a test proves current behaviour is
+incorrect for compatibility / interop; in this round no source
+changes were required.
+
+## 26. ``a2a_send_task`` / ``_rpc_request`` are the right entrypoints
+for cross-implementation interop tests
+
+The plan's instruction "plugin's outbound client engine (tools.py
+entrypoint, NOT a hand-rolled curl)" is satisfied by driving
+``a2a_async_plugin.tools._send_task`` (synchronous path used by
+``a2a_call``) and ``a2a_async_plugin.tools._rpc_request`` (raw
+JSON-RPC used by ``a2a_submit`` / ``a2a_get_task`` / ``a2a_cancel``).
+Both are the same code paths the public tools emit, so the
+interoperability test exercises the production wire surface
+without re-implementing it. The test is the cross-impl proof, not
+a re-derivation of the wire format.
+
+## 27. SDK 1.1.2's ``JsonRpcTransport`` always emits v1.0 ``SendMessage``
+
+The SDK's high-level client (``ClientFactory.create_from_url``)
+reads the card's ``supported_interfaces`` and emits the v1.0
+``SendMessage`` PascalCase method whenever the card advertises a
+v1.0 entry. To exercise the legacy ``message/send`` alias the
+interoperability test drops down to raw ``httpx`` and emits the
+exact JSON-RPC envelope the adapter's legacy branch expects.
+This is the only way to drive both method names against a single
+card that advertises v1.0 (the SDK's high-level surface
+deliberately prefers the v1.0 method per the protocol version
+negotiation contract).
+
+## 28. SDK 1.1.2 ``TaskState`` is a protobuf enum, ``str()`` is the int
+
+The SDK's ``TaskState`` field is a protobuf ``EnumTypeWrapper``,
+not a plain Python ``enum.IntEnum``. Calling ``str(task.status.state)``
+on a parsed task returns the integer value (``"4"`` for
+``TASK_STATE_WORKING``), not the enum name. The interoperability
+test's SDK sub-script looks up the canonical name via
+``TaskState.Name(value)`` before serialising the result on stdout
+so the parent pytest assertion can compare against the string
+labels the plugin emits (``"TASK_STATE_WORKING"`` etc.).
+
+## 29. SDK 1.1.2 server's ``AgentCard`` schema: no top-level ``url`` or ``protocol_version``
+
+The SDK 1.1.2 ``AgentCard`` schema dropped both the legacy
+top-level ``url`` field and the ``protocol_version`` field. The
+RPC URL is now in ``supported_interfaces[].url`` and the protocol
+version is per-interface (``AgentInterface.protocol_version``).
+The minimal SDK echo server builds the card accordingly. The
+plugin's adapter is the consumer that *serves* the card, not the
+producer of the v1.1.2 SDK card — its own card-building code
+(``protocol.build_agent_card``) is correct for the plugin's
+A2A v1.0 surface.
+
+## 30. The hermes runtime venv leaks into subagent PYTHONPATH and
+breaks the SDK's pydantic_core ABI
+
+When the SDK venv's ``pip`` runs in a subagent shell, the
+parent's ``PYTHONPATH`` may carry ``/home/hermes/.hermes/installs/``
+(a Python 3.14 venv). The SDK venv is Python 3.13, and Python 3.13's
+``pydantic_core`` C extension is incompatible with the 3.14 ABI;
+the resulting import failure surfaces as
+``ModuleNotFoundError: No module named 'pydantic_core._pydantic_core'``
+at the SDK module's first protobuf import.
+
+``setup_sdk_env.sh`` strips every PYTHONPATH entry matching
+``/home/hermes/.hermes/installs/`` or ``/home/hermes/.local/``
+before every ``pip`` invocation. The same sanitisation is
+necessary for the SDK sub-scripts (``sdk_client_v1.py``,
+``sdk_client_legacy.py``) — the test harness runs them with a
+cleaned env (``{"PATH", "HOME", "LANG"}`` only). The pytest parent
+process is unaffected because it does not import the SDK; only
+the SDK venv's python sees the leak.
+
+The reproduction recipe (kept here so future operators do not have
+to rediscover it): ``PYTHONPATH=/home/hermes/.hermes/installs/.../venv/lib/python3.14/site-packages
+./tests/interoperability/.venv-sdk/bin/python -c 'import a2a'`` fails
+with the pydantic_core ABI error. Run with a clean env and it
+imports cleanly.
+
+## 31. Hermes ``plugins list --json`` is the right surface for a
+machine-readable installation check
+
+The plan's (b) "verify a2a-async installed/enabled" check has two
+plausible surfaces: the rich-table text (default ``hermes
+plugins list``) and the JSON variant (``--json``). The JSON
+surface is stable across recent Hermes versions and parses
+without a table-rendering regex. The test prefers ``--json`` and
+falls back to a regex search on the rich-table text only if the
+JSON parse fails. The recorded a2a-async row (name, status,
+version, source, description) is captured into the test's
+``__notes__`` for the post-run report.
+
+## 32. Live peer (c) auth lives in a narrowly-scoped test-local
+file, not the test code
+
+The plan's (c) "use the deferred a2a tools" reads naturally for a
+subagent that has those tools in its MCP context. Pytest does
+not have that context. The conftest at
+``tests/integration/conftest.py`` reads a bearer token from a
+narrowly-scoped file ``tests/integration/.a2a_live_token`` (added
+to ``.gitignore``) and exports it under the standard
+``A2A_BEARER_TOKEN`` name. The conftest never invents a token —
+the file is operator-supplied; without it, (c) skips with the
+plan's "skip if the peer probe is unreachable or not authed"
+guard. This keeps secrets out of test code, out of HANDOFF.md,
+and out of the test report.
+
+## 33. The SDK's ``AgentExecutor.execute`` must enqueue a Task
+before any ``TaskStatusUpdateEvent``
+
+The SDK 1.1.2 ``active_task`` consumer validates the event stream
+and raises ``InvalidAgentResponseError("Agent should enqueue
+Task before TaskStatusUpdateEvent event")`` if the executor
+emits a status update before the initial Task object. The
+``sdk_echo_server.py`` follows the SDK's own helloworld sample
+exactly: check ``context.current_task``; if absent, call
+``new_task_from_user_message(context.message)`` and
+``await event_queue.enqueue_event(task)`` BEFORE any
+``TaskUpdater.update_status(...)`` call. This is documented in
+``a2a.server.agent_execution.AgentExecutor.execute``'s docstring
+but easy to miss; the failure mode is a hard protocol error from
+the SDK consumer, not a hang.
+
+## 34. The SDK 1.1.2 server requires a v1.0 ``supported_interfaces``
+entry; the legacy ``url`` field is rejected
+
+``a2a.types.AgentCard`` in 1.1.2 does NOT expose a top-level
+``url`` field (see #29). Constructing an AgentCard with
+``url=...`` raises ``ValueError: Protocol message AgentCard has
+no "url" field.`` The ``sdk_echo_server.py`` builds the card
+with ``supported_interfaces=[AgentInterface(url=..., protocol_binding="JSONRPC", protocol_version="1.0")]``
+and omits the legacy top-level ``url``. The plugin's adapter
+(which is the *consumer* in test 1 and test 2, the *producer* in
+test 3) reads its own card-building code at
+``adapter._build_card`` → ``protocol.build_agent_card``; that
+code path correctly produces the v1.0 ``supported_interfaces``
+shape. The two surfaces line up.

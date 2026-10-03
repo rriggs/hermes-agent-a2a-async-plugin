@@ -380,6 +380,21 @@ checkpoint/wrap up. Open questions before implementing:
 - Rejection semantics: if injection fails, cancel proceeds anyway (best
   effort per spec); log the failure to the audit trail.
 
+## Known gap: historyLength > 0 does not truncate history
+
+A2A v1.0 §3.2.4: `historyLength: 0` MUST omit the history field
+(honored), and `historyLength > 0` MUST return at most N most recent
+messages. The plugin honors only `0`; `> 0` is parsed but the history
+field is left absent (`protocol.py` `TaskStore.to_task`). The plugin's
+conversation persistence is file-based (JSONL per context), not a
+`Task.history` array; `load_conversation(context_id)` exposes it to the
+outbound `a2a_history` client tool, but `GetTask`/`ListTasks` JSON-RPC
+responses carry no `history`. Conformance checklist row: G6 (Medium) in
+`docs/a2a-conformance.md` §11. A v1.0 client depending on
+`task.history` will not get one; callers in our fleet use
+`a2a_history`/`a2a_get_task` instead, so this is latent for our trust
+model but visible to strict external peers.
+
 ## Operational constraints
 
 - All normal code work stays under `/home/hermes/.hermes/profiles/sven/workspace`.

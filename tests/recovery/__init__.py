@@ -1,0 +1,1 @@
+"""Phase 1 recovery tests — package marker so ``from .fake_peer`` works."""

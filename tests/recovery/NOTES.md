@@ -188,3 +188,141 @@ something explodes; we keep stderr in `subprocess.PIPE` and surface it
 in `RuntimeError` messages when the subprocess dies unexpectedly. The
 8-KB cap on `subprocess.PIPE` is fine because the launcher only logs
 to the file in normal operation.
+
+---
+
+# Phase 2 / Task 3 + Task 4 follow-up notes
+
+These entries record decisions and observations made while writing
+``tests/recovery/test_taskstore_restart.py`` and
+``tests/recovery/test_session_restart.py`` (Phase 2). Phase 2's
+rules are stricter: we may only modify
+``a2a_async_plugin/protocol.py`` or ``tools.py`` when a test
+proves the CURRENT behaviour is actually incorrect for
+terminal-row or session durability; the non-terminal inbound
+restart-to-FAILED semantics must remain untouched.
+
+## 11. Schema-drift SELECT (OperationalError) is silently swallowed
+
+**Uncertainty.** ``TaskStore._recover_from_db`` previously caught
+the transition log-level ``Exception`` blanket. That swallowed two
+distinct failure modes:
+
+* ``RuntimeError`` from ``_ensure_db`` when the DB's
+  ``user_version`` is newer than ``A2A_TASK_SCHEMA_VERSION`` —
+  this was the documented "fail loudly" path but in practice
+  the recovery loop's catch hid the failure.
+* ``sqlite3.OperationalError`` from the SELECT statement when a
+  column has been renamed or removed — silently coming up
+  empty is data loss from the operator's perspective.
+
+**Choice.** The Phase 2 / Task 3 test
+``test_newer_schema_version_raises_runtime_error`` proves the
+RuntimeError path was incorrect — fixing it is in-scope per the
+plan's "modify only if behaviour is incorrect" rule.
+
+**Fix applied (minimal).** In ``protocol._recover_from_db``:
+
+* Re-raise ``RuntimeError`` explicitly (the future-schema case).
+* Wrap the per-row unpacking in ``try / except
+  (IndexError, TypeError, ValueError)`` so a single malformed row
+  logs and continues — "bounded error, no silent discard of the
+  rest".
+
+The blanket ``except Exception`` is preserved for transient I/O
+errors (locked DB, permission) so first boot does not block on a
+wedged file.
+
+**Remaining gap.** An ``OperationalError`` from the SELECT
+(rename/drop of a column) still falls into the
+``except Exception`` branch — the store comes up empty. That is
+silent data loss for the operator, and the Phase 3 follow-up
+should either re-raise ``OperationalError`` or alert. The Task 3
+test ``test_renamed_schema_column_fails_safely`` documents this
+gap and skips until Phase 3 tightens it; the Phase 2 contract is
+"terminal rows survive, future schema fails loudly" and that is
+locked in.
+
+## 12. in-process ``protocol._conv_dir()`` ignores the harness env
+
+**Observation.** The ``isolated_profile`` fixture in
+``tests/recovery/conftest.py`` sets ``HERMES_HOME`` in the env
+dict that is passed to the gateway subprocess — but it does NOT
+update ``os.environ["HERMES_HOME"]`` in the test process. So
+when the test process calls ``protocol.persist_message`` /
+``protocol.load_conversation`` directly (as Phase 2 / Task 4
+does), those calls resolve ``HERMES_HOME`` to the platform
+default (``~/.hermes``).
+
+**Impact.** Without explicit redirection in the test, in-process
+persistence writes land in the operator's real
+``~/.hermes/a2a_conversations/`` — observable as accumulated test
+records in production files after a failure run.
+
+**Choice.** Phase 2 / Task 4 subprocess tests use
+``monkeypatch.setenv("HERMES_HOME", gateway.profile_home)`` to
+mirror the subprocess's hermetic home into the test process.
+Without this the test silently pollutes the operator's
+directory.
+
+**Future harness improvement.** The ``isolated_profile``
+fixture should also ``monkeypatch.setenv("HERMES_HOME", ...)``
+in the test process by default; that is a one-line change but
+out of Phase 2 scope (it would touch ``conftest.py``, which
+the plan only allows Phase 1 to do).
+
+##  14. ``_safe_name`` collapses distinct unsafe-char contexts
+
+**Observation.** ``protocol._safe_name`` rewrites
+non-alphanumeric characters to ``_``. Two context_ids that
+differ only in unsafe characters (e.g. ``ctx/alpha`` vs.
+``ctx_alpha``) end up in the same ``.jsonl`` file. This is
+documented behaviour, not a bug; callers are expected to use
+safe context IDs.
+
+**Test impact.** ``test_unsafe_chars_in_context_id_are_sanitized``
+locks in the distinct-safe-name case and asserts the loader
+returns per-context messages, not merged ones.
+
+##  15. ``_recover_from_db`` does not re-persist inbound non-terminal rows
+
+**Observation.** When a non-terminal inbound row is converted
+to ``STATE_FAILED`` with the marker ``[gateway restarted before
+task completed]`` on reopen, the change is only made in the
+in-memory ``self._tasks`` dict — ``_persist`` is not called.
+A subsequent restart will re-read the same row from SQLite,
+re-mark it FAILED, and overwrite the in-memory ``completed_at``
+again. The on-disk ``reply`` is unchanged (still empty), so the
+behaviour is bounded — the row stays identifiable as a restart
+failure — but ``completed_at`` is not stable across multiple
+restarts.
+
+**Impact.** Not a bug per the plan: "Phase 2 locks in
+terminal-row behaviour and documents the rest." Phase 3 may
+choose to write the FAILED state back to disk on first
+recovery so subsequent restarts see the terminal state.
+
+## 16. Conversation persistence is file-based, not SQLite
+
+**Observation.** ``protocol.persist_message`` /
+``protocol.load_conversation`` write to
+``$HERMES_HOME/a2a_conversations/<safe_name>.jsonl``, not to
+SQLite. The plan acknowledges this explicitly in Task 4: "If
+conversation persistence lives in files rather than SQLite,
+test the file round-trip plus restart behavior explicitly."
+
+Phase 2 / Task 4 exercises that path: append-only JSONL,
+no concurrent writers (the plugin's HTTP request handlers are
+serialized through Python's threading.Lock in ``_send_task``
+and ``A2ARequestHandler``), and the on-disk bytes are the
+authoritative record (not the in-memory cache — there isn't
+one).
+
+**Concurrency note.** ``protocol.persist_message`` opens the
+file in append mode without an explicit ``flock``. Concurrent
+writes from many HTTP request threads could interleave at the
+POSIX level; in practice the line-buffered JSON+newline output
+is short enough that the kernel's pipe-buffer flush never
+tears a line on Linux, but a paranoid operator should wrap the
+write in ``fcntl.flock`` if they observe torn lines. Not in
+Phase 2 scope.

@@ -670,7 +670,17 @@ class TaskStore:
             raise
 
     def _recover_from_db(self) -> None:
-        """Load persisted terminal tasks; fail non-terminal ones (restart)."""
+        """Load persisted terminal tasks; fail non-terminal inbound ones (restart).
+
+        Per Phase 2 / Task 3 acceptance: a database at a newer
+        ``A2A_TASK_SCHEMA_VERSION`` (or one whose schema drifted
+        mid-row) must fail loudly — not silently come up empty. The
+        previous blanket ``except Exception`` swallowed both
+        ``RuntimeError`` from ``_ensure_db`` and ``OperationalError``
+        from a mismatched ``SELECT``. We let those propagate while
+        keeping transient I/O errors (locked DB, permission error)
+        silent so a wedged file does not block first boot.
+        """
         if not self._db_path:
             return
         try:
@@ -689,20 +699,31 @@ class TaskStore:
                 ).fetchall()
             finally:
                 con.close()
+        except RuntimeError:
+            # Future schema / version mismatch — let the operator see it.
+            raise
         except Exception:
+            # Transient I/O (locked DB, permission); we choose to come up
+            # empty rather than block startup. The SQLite file is unchanged.
             logger.debug("A2A: task-store recovery failed", exc_info=True)
             return
 
         recovered = 0
         restarted = 0
         for row in rows:
-            rec = {
-                "task_id": row[0], "context_id": row[1], "peer": row[2],
-                "agent_slug": row[3], "tenant": row[4], "state": row[5],
-                "reply": row[6], "created_at": row[7], "created_iso": row[8],
-                "push_url": "", "push_config_id": "",
-                "direction": row[10], "ownership": row[11], "remote_state": row[12],
-            }
+            try:
+                rec = {
+                    "task_id": row[0], "context_id": row[1], "peer": row[2],
+                    "agent_slug": row[3], "tenant": row[4], "state": row[5],
+                    "reply": row[6], "created_at": row[7], "created_iso": row[8],
+                    "push_url": "", "push_config_id": "",
+                    "direction": row[10], "ownership": row[11], "remote_state": row[12],
+                }
+            except (IndexError, TypeError, ValueError) as exc:
+                # One malformed row must not discard the rest of the
+                # recovered set — bounded error, log and continue.
+                logger.debug("A2A: skipped malformed task row (%s)", exc)
+                continue
             if row[9] is not None:
                 rec["completed_at"] = row[9]
             if rec["state"] not in TERMINAL_STATES and rec["direction"] == "inbound":

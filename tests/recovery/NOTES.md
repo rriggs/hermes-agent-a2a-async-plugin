@@ -427,3 +427,118 @@ this as the chosen policy; the tests pin it down. If a future
 change to ``_recover_from_db`` regresses this invariant, the
 Phase 3 tests will fail with a clear contract-violation
 message.
+
+---
+
+# Phase 4 / Task 8, 9, 10 follow-up notes
+
+These entries record the decisions and observations made while
+implementing ``tests/recovery/test_reconciliation.py``,
+``test_terminal_races.py``, and ``test_storage_failures.py``
+(Phase 4). Phase 4 is allowed to modify
+``a2a_async_plugin/*.py`` when a test proves current behaviour
+is actually incorrect for the restart / race / storage-failure
+semantics; in this round one source change was applied
+(tightening ``_recover_from_db`` to re-raise the schema-drift
+SELECT ``OperationalError``), and one source-facing gap was
+documented honestly (no outbound retry / backoff — bounded
+single-attempt per call, by design).
+
+## 23. The outbound engine has no retry / backoff loop
+
+**Observation.** ``a2a_async_plugin/tools.py`` has no retry or
+backoff on any of the outbound client paths
+(``a2a_call``, ``a2a_submit``, ``a2a_get_task``,
+``a2a_await``, ``a2a_cancel``, ``a2a_steer``). Each call is
+one synchronous HTTP request. Transient failures
+(``HTTPError``, connection refused, timeout) surface as a
+bounded ``"Error: ..."`` string returned to the caller; the
+local TaskStore is not mutated by the failure.
+
+**Phase 4 plan guidance.** "if none exists, document that in
+NOTES rather than inventing one."
+
+**Decision.** Document honestly. The
+``test_reconcile_peer_permanently_unavailable_no_unbounded_retry``
+test asserts that N successive calls against an unreachable
+peer each return a bounded error within the per-call HTTP
+timeout window, and that the local row is never advanced as
+a side effect. There is no unbounded retry loop to regress.
+
+**Impact.** Callers that need retry semantics (e.g. for a
+flaky network) must implement them at the application layer
+above the A2A tools. The plan reserves the right to add
+backoff in a future phase if production telemetry shows the
+absence is a real reliability problem.
+
+## 24. Schema-drift SELECT now re-raises (closes Phase 2 skip #11)
+
+**Observation.** ``_recover_from_db`` previously caught
+``RuntimeError`` and ``OperationalError`` from the recovery
+SELECT in a blanket ``except Exception`` block, swallowing
+the schema-drift case as a silent-empty store. The Phase 2
+``test_renamed_schema_column_fails_safely`` documented the
+gap with a ``pytest.skip``; the Phase 3 contract
+(``docs/restart-recovery-contract.md`` §7 P4) reserved the
+right to tighten this to a loud failure.
+
+**Decision.** Tighten. Phase 4 / Task 10 closes the skip.
+The new handling in ``protocol._recover_from_db`` (around
+line 716) re-raises ``OperationalError`` AND ``RuntimeError``
+when the error message contains "no such column", "no such
+table", or "schema" — those are the schema-drift signatures.
+Connection-level errors (database is locked, unable to open)
+carry different messages and stay in the transient-I/O
+branch.
+
+**Source change (one-line scope).**
+``a2a_async_plugin/protocol.py`` only:
+
+* Added ``import sys`` (needed by ``sys.exc_info()``).
+* Added the (RuntimeError, OperationalError) branch in
+  ``_recover_from_db`` that re-raises for schema-shaped
+  messages.
+
+**Test impact.** The Phase 2
+``test_renamed_schema_column_fails_safely`` still passes (it
+accepts either a raise or a skip; the new code takes the
+raise path). The new
+``test_storage_schema_drift_select_raises_operational_error``
+asserts the loud path explicitly. No Phase 1-3 test
+regressed.
+
+## 25. Fake peer extended with fault-injection knobs
+
+**Observation.** The Phase 1 ``fake_peer.py`` had a
+delayed-completion control surface (``complete`` / ``fail``
+/ ``cancel`` / ``hold``) but no fault-injection surface for
+malformed responses, 5xx errors, or timed-out replies. The
+plan required the Phase 4 / Task 8 tests to "extend the
+fake peer ONLY if a needed fault mode is missing (note the
+extension in NOTES)."
+
+**Extensions applied (minimal).** Three additions to
+``tests/recovery/fake_peer.py``:
+
+1. ``FakePeer.fault_mode: dict`` attribute (default ``{}``)
+   + ``set_fault_mode(mode)`` method to replace it
+   wholesale. Replaced atomically so reads from the HTTP
+   handler thread are race-free without a separate lock.
+2. ``_handle_get`` checks ``fault_mode`` first and short-
+   circuits to: ``delay_get`` (sleep N seconds),
+   ``malformed_get_garbage`` (non-JSON body),
+   ``malformed_get_wrong_shape`` (valid JSON, result is a
+   list), ``malformed_get_missing_fields`` (task dict
+   without ``status`` / ``state``), ``http_500`` (HTTP 500).
+3. ``_handle_send`` checks for the matching
+   ``malformed_send_*`` / ``http_500_send`` kinds. The
+   ``__ctrl__/cancel`` control command was also added so
+   tests can drive a peer-side cancellation without going
+   through the JSON-RPC ``CancelTask`` op.
+
+**No production-impact change.** ``fake_peer.py`` lives in
+``tests/recovery/`` and is not part of the plugin's runtime
+surface. The extensions are opt-in via ``set_fault_mode``;
+the default ``fault_mode={}`` preserves every Phase 1-3
+behaviour (verified by re-running the full pytest suite —
+97 passed, 0 skipped).

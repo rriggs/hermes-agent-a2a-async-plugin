@@ -440,6 +440,29 @@ class _PeerHandler(BaseHTTPRequestHandler):
     # ── RPC dispatch ──────────────────────────────────────────────────────
 
     def _handle_send(self, req_id: Any, params: dict) -> None:
+        # SendMessage fault injection: same as _handle_get — only the kind
+        # names differ so a test can fault a particular RPC op without
+        # touching the others.
+        fault = self.peer.fault_mode
+        if fault.get("kind") == "malformed_send_garbage":
+            body = b"<not json>"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if fault.get("kind") == "malformed_send_wrong_shape":
+            # Valid JSON, result is a string instead of {task: ...}.
+            self._json(200, _jsonrpc_result(req_id, "this is not a task"))
+            return
+        if fault.get("kind") == "http_500_send":
+            self.send_response(500)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "21")
+            self.end_headers()
+            self.wfile.write(b"internal server error")
+            return
         msg = params.get("message") or {}
         context_id = str(msg.get("contextId") or params.get("contextId") or
                           ("ctx-" + uuid.uuid4().hex[:16]))
@@ -455,6 +478,38 @@ class _PeerHandler(BaseHTTPRequestHandler):
         self._json(200, _jsonrpc_result(req_id, {"task": rec.to_task()}))
 
     def _handle_get(self, req_id: Any, params: dict) -> None:
+        # Fault injection hooks (Phase 4 / Task 8). See FakePeer.set_fault_mode.
+        fault = self.peer.fault_mode
+        if fault.get("kind") == "delay_get":
+            time.sleep(float(fault.get("seconds", 1.0)))
+        if fault.get("kind") == "malformed_get_garbage":
+            # Garbage JSON — the caller's json.loads will raise.
+            body = b"this is not json {{"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if fault.get("kind") == "malformed_get_wrong_shape":
+            # Valid JSON, wrong shape — the caller's accessor chain falls through
+            # to the empty/None path. We return a result with the wrong top-level
+            # type so the caller's ``isinstance(payload, dict)`` branch takes the
+            # malformed-reply code path.
+            self._json(200, {"jsonrpc": "2.0", "id": req_id, "result": ["not", "a", "dict"]})
+            return
+        if fault.get("kind") == "malformed_get_missing_fields":
+            # Valid JSON-RPC result wrapper, but the task payload is missing the
+            # ``status`` / ``state`` fields the caller expects.
+            self._json(200, _jsonrpc_result(req_id, {"id": "task-missing", "contextId": "ctx-missing"}))
+            return
+        if fault.get("kind") == "http_500":
+            self.send_response(500)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", "21")
+            self.end_headers()
+            self.wfile.write(b"internal server error")
+            return
         task_id = str(params.get("id") or params.get("taskId") or "")
         rec = self.peer.store.get(task_id)
         if rec is None:
@@ -523,6 +578,14 @@ class _PeerHandler(BaseHTTPRequestHandler):
                 return
             self._json(409, {"error": f"task already terminal: {rec.state}"})
             return
+        if cmd == "cancel":
+            # Force the task to CANCELED regardless of current state.
+            rec = self.peer.store.cancel(body["task_id"])
+            if rec is None:
+                self._json(404, {"error": "task not found"})
+                return
+            self._json(200, {"task": rec.to_task()})
+            return
         if cmd == "shutdown":
             # 200 first, then ask the server loop to stop.
             self._json(200, {"stopping": True})
@@ -565,6 +628,29 @@ class FakePeer:
         self.control_port = control_port
         self._server: Optional[_PeerServer] = None
         self._thread: Optional[threading.Thread] = None
+        # Fault injection (Phase 4 / Task 8). Default: no fault. Tests call
+        # ``set_fault_mode({"kind": "..."})`` to drive the malformed-response
+        # / delay / 5xx code paths in the caller. The dict is replaced
+        # wholesale, never mutated in place, so reads from the HTTP thread
+        # are race-free without a separate lock.
+        self.fault_mode: dict = {}
+
+    def set_fault_mode(self, mode: dict) -> None:
+        """Replace the active fault mode. Pass ``{}`` to clear.
+
+        Supported kinds (see ``_handle_get`` for implementation):
+
+        * ``{"kind": "delay_get", "seconds": N}`` — sleep N seconds before
+          responding to GetTask. Used to force the caller's polling loop
+          to time out.
+        * ``{"kind": "malformed_get_garbage"}`` — return non-JSON body.
+        * ``{"kind": "malformed_get_wrong_shape"}`` — return valid JSON
+          whose ``result`` is not a dict.
+        * ``{"kind": "malformed_get_missing_fields"}`` — return a
+          task-shaped dict with no ``status`` / ``state`` fields.
+        * ``{"kind": "http_500"}`` — return HTTP 500.
+        """
+        self.fault_mode = dict(mode or {})
 
     # ── lifecycle ────────────────────────────────────────────────────────
 

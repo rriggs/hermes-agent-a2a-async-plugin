@@ -25,6 +25,7 @@ import copy
 import logging
 import os
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -680,6 +681,14 @@ class TaskStore:
         from a mismatched ``SELECT``. We let those propagate while
         keeping transient I/O errors (locked DB, permission error)
         silent so a wedged file does not block first boot.
+
+        Phase 4 / Task 10 (NOTES #24): ``sqlite3.OperationalError``
+        raised by the recovery SELECT is re-raised alongside
+        ``RuntimeError`` so a schema-drift SELECT failure (column
+        rename / drop) is loud. Connection-level ``OperationalError``
+        (``database is locked``, ``unable to open``) is still caught
+        by the blanket branch — those are transient I/O and the
+        store must come up empty rather than block first boot.
         """
         if not self._db_path:
             return
@@ -692,6 +701,11 @@ class TaskStore:
             con = self._open_db()
             try:
                 self._ensure_db(con)
+                # The SELECT is the loud-failure boundary: a schema
+                # drift surfaces here as ``no such column: state``.
+                # Other OperationalErrors (locked DB, etc.) are
+                # raised at the connection level above and caught
+                # by the blanket branch.
                 rows = con.execute(
                     "SELECT task_id, context_id, peer, agent_slug, tenant, state,"
                     " reply, created_at, created_iso, completed_at, direction,"
@@ -699,9 +713,31 @@ class TaskStore:
                 ).fetchall()
             finally:
                 con.close()
-        except RuntimeError:
-            # Future schema / version mismatch — let the operator see it.
-            raise
+        except (RuntimeError, sqlite3.OperationalError):
+            # ``_ensure_db`` raises ``RuntimeError`` for a too-new
+            # schema; the SELECT raises ``OperationalError`` for a
+            # column-rename that broke the recovery query. Both are
+            # silent-data-loss bugs; let the operator see them.
+            # See contract §7 P3 + P4.
+            #
+            # Note: connection-level OperationalErrors (database
+            # locked, unable to open database file) are not raised
+            # here — they're raised by ``_open_db`` and caught by
+            # the blanket branch below as transient I/O.
+            err = sys.exc_info()[1]
+            msg = str(err) if err else ""
+            # Re-raise ONLY if the error message looks like a schema
+            # issue (column / table / no such). Connection-level
+            # errors (database is locked, unable to open, etc.)
+            # carry different messages and stay transient.
+            if (
+                "no such column" in msg.lower()
+                or "no such table" in msg.lower()
+                or "schema" in msg.lower()
+            ):
+                raise
+            logger.debug("A2A: task-store recovery failed", exc_info=True)
+            return
         except Exception:
             # Transient I/O (locked DB, permission); we choose to come up
             # empty rather than block startup. The SQLite file is unchanged.

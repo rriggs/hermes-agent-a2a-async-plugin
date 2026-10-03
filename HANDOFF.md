@@ -395,6 +395,79 @@ responses carry no `history`. Conformance checklist row: G6 (Medium) in
 `a2a_history`/`a2a_get_task` instead, so this is latent for our trust
 model but visible to strict external peers.
 
+## Phase 6: Conformance checklist and clean-checkout acceptance run (Task 13, Task 14)
+
+### Task 13 -- conformance checklist
+
+`docs/a2a-conformance.md`: 87 evidence-backed rows mapping every
+implemented operation and Agent Card field to A2A v1.0 normative
+sections, with implementation locations, test evidence, and status
+(conformant / conformant-with-deviation / legacy-labeled / unsupported).
+Asserted against the real adapter by `tests/conformance/
+test_a2a_conformance.py` (21 tests).
+
+MUST-level gaps, honestly listed (full detail in §11 of the checklist):
+
+- G1 [Low]: `SubscribeToTask` on a terminal task must return
+  UnsupportedOperationError (-32004); plugin instead emits the SSE
+  `: done` termination (unreachable from the SDK client).
+- G2 [Low]: non-1.0 `A2A-Version` header must return
+  VersionNotSupportedError (-32009); plugin returns ERR_INVALID_PARAMS
+  with a descriptive message.
+- G4 [Low]: ListTasks pagination uses a numeric offset pageToken
+  instead of a spec-style cursor.
+- G5 [Low]: ListTasks sorts by `created_at` instead of
+  `status.timestamp` desc.
+- G6 [Medium]: `historyLength > 0` does not truncate/present
+  `task.history` (only `0` is honored). Recorded as its own known-gap
+  section above.
+- G9 [Low]: error responses lack `data` (google.rpc ErrorInfo shape).
+- G3 [Dormant]: ERR_PUSH_NOT_SUPPORTED declared but never emitted
+  (push is advertised and supported).
+
+All are explained against the single-trust-domain, bearer-auth
+deployment model; none block fleet-scale use.
+
+### Task 14 -- acceptance battery (exact outputs, 2026-10-03)
+
+Development tree, full suite:
+
+```text
+PYTHONPATH=/home/hermes/.hermes/hermes-agent \
+/home/hermes/.hermes/hermes-agent/.venv/bin/python -m pytest -q
+126 passed in 62.80s
+```
+
+Acceptance directories only (recovery, integration, interoperability,
+conformance):
+
+```text
+119 passed in 62.19s
+python -m compileall -q a2a_async_plugin  # OK
+git diff --check                          # clean
+```
+
+Clean checkout of `main` (fresh clone at HEAD `5e20030`):
+
+```text
+123 passed, 3 skipped in 62.35s
+```
+
+The 3 skips are the designed environment guards: the two live-peer
+tests (no auth-token file in the clean clone) and the SDK interoperability
+module (`.venv-sdk/` not set up there). Both skip paths are documented
+above.
+
+Plugin Doctor on the clean checkout:
+
+```text
+Plugin Doctor: <clean-checkout-path>
+  manifest: a2a-async 0.1.6 (platform)
+  OK: runtime discovery, manifest parsing, import, and registration passed
+  registrations: 10 tool(s), 0 hook(s)
+exit=0 (--ci)
+```
+
 ## Operational constraints
 
 - All normal code work stays under `/home/hermes/.hermes/profiles/sven/workspace`.

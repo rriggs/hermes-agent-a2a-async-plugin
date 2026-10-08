@@ -594,15 +594,16 @@ def a2a_list(args: dict | None = None, **_: Any) -> str:
     if direction_filter not in ("all", "inbound", "outbound"):
         return "Error: 'direction' must be one of: all, inbound, outbound."
     lines = []
-    if kind in ("all", "peers") and peers:
-        lines.append(f"Configured peers ({len(peers)}):")
-        for name, entry in peers.items():
-            auth = (entry.get("auth") or {}).get("type", "none")
-            caps = entry.get("capabilities", [])
-            cap_str = f" caps: {', '.join(caps)}" if caps else ""
-            lines.append(f"  - {name}: {entry.get('url', '?')} (auth: {auth}){cap_str}")
-    else:
-        lines.append("No peers configured. Add them under 'a2a_agents' in config.yaml.")
+    if kind in ("all", "peers"):
+        if peers:
+            lines.append(f"Configured peers ({len(peers)}):")
+            for name, entry in peers.items():
+                auth = (entry.get("auth") or {}).get("type", "none")
+                caps = entry.get("capabilities", [])
+                cap_str = f" caps: {', '.join(caps)}" if caps else ""
+                lines.append(f"  - {name}: {entry.get('url', '?')} (auth: {auth}){cap_str}")
+        else:
+            lines.append("No peers configured. Add them under 'a2a_agents' in config.yaml.")
 
     if kind == "peers":
         return "\n".join(lines) if lines else "No peers configured. Add them under 'a2a_agents' in config.yaml."

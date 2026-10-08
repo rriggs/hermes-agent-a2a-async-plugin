@@ -87,3 +87,18 @@ def test_get_task_returns_remote_state(monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_a2a_list_kind_tasks_does_not_claim_no_peers(monkeypatch):
+    """kind='tasks'/'conversations' skips the peer block without falsely
+    reporting 'No peers configured' when peers are actually configured."""
+    monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {"sven": {"url": "http://127.0.0.1:9901"}}})
+    out = tools.a2a_list({"kind": "tasks"})
+    assert "No peers configured" not in out
+
+
+def test_a2a_list_no_peers_reports_missing_config(monkeypatch):
+    """When peers genuinely are unconfigured, the guidance still shows."""
+    monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {}})
+    out = tools.a2a_list({"kind": "all"})
+    assert "No peers configured" in out

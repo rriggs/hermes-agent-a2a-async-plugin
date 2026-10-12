@@ -542,6 +542,7 @@ class Metrics:
         self.push_failed = 0
         self.tasks_completed = 0
         self.tasks_failed = 0
+        self.tasks_canceled = 0
         self.anti_loop_triggers = 0
         self.rate_limit_triggers = 0
         self._start_time = time.time()
@@ -567,6 +568,7 @@ class Metrics:
             "push_failed": self.push_failed,
             "tasks_completed": self.tasks_completed,
             "tasks_failed": self.tasks_failed,
+            "tasks_canceled": self.tasks_canceled,
             "anti_loop_triggers": self.anti_loop_triggers,
             "rate_limit_triggers": self.rate_limit_triggers,
             "avg_latency_ms": round(self.avg_latency() * 1000, 1),

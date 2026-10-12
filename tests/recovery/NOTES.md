@@ -284,29 +284,23 @@ safe context IDs.
 locks in the distinct-safe-name case and asserts the loader
 returns per-context messages, not merged ones.
 
-##  15. ``_recover_from_db`` persistence of inbound non-terminal rows
+##  15. ``_recover_from_db`` does not re-persist inbound non-terminal rows
 
-**Observation (v0.1.x).** When a non-terminal inbound row is converted
+**Observation.** When a non-terminal inbound row is converted
 to ``STATE_FAILED`` with the marker ``[gateway restarted before
-task completed]`` on reopen, the change was only made in the
-in-memory ``self._tasks`` dict — ``_persist`` was not called.
-A subsequent restart re-read the same row from SQLite,
-re-marked it FAILED, and overwrite the in-memory ``completed_at``
-again. The on-disk ``reply`` stayed empty, so the
-behaviour was bounded — the row stayed identifiable as a restart
-failure — but ``completed_at`` was not stable across multiple
+task completed]`` on reopen, the change is only made in the
+in-memory ``self._tasks`` dict — ``_persist`` is not called.
+A subsequent restart will re-read the same row from SQLite,
+re-mark it FAILED, and overwrite the in-memory ``completed_at``
+again. The on-disk ``reply`` is unchanged (still empty), so the
+behaviour is bounded — the row stays identifiable as a restart
+failure — but ``completed_at`` is not stable across multiple
 restarts.
 
-**Amended as of v0.2.0 (GitHub issue #2).** In production on the
-amy gateway this exact behavior produced a WORKING zombie
-(``task-58d08f2d``) that survived five restarts: peers polling
-``GetTask`` saw ``WORKING`` forever, and every boot re-failed the
-same row (five identical "(1 failed by restart)" counters).
-``_recover_from_db`` now calls ``_persist`` for restart-converted
-rows: the FAILED + marker + ``completed_at`` conversion is durable,
-and later boots see the terminal on-disk row without a re-fail loop.
-The contract doc (§C4/C5, rows 7/8) and the terminal-race tests
-encode the amended behavior.
+**Impact.** Not a bug per the plan: "Phase 2 locks in
+terminal-row behaviour and documents the rest." Phase 3 may
+choose to write the FAILED state back to disk on first
+recovery so subsequent restarts see the terminal state.
 
 ## 16. Conversation persistence is file-based, not SQLite
 
@@ -350,21 +344,23 @@ matches the contract documented in
 ## 17. The contract doc distinguishes on-disk vs API state
 
 The matrix row 7 originally asserted the FAILED-with-marker
-transition happens in the database. NOTES #15 documents the
-v0.1.x behavior where ``_recover_from_db`` updated the in-memory
-``self._tasks`` dict but did NOT re-persist the FAILED transition.
-Phase 3 made that distinction explicit in
+transition happens in the database. NOTES #15 already documents
+that ``_recover_from_db`` updates the in-memory ``self._tasks``
+dict but does NOT re-persist the FAILED transition. Phase 3
+makes this distinction explicit in
 ``docs/restart-recovery-contract.md``:
 
 * **API state** (what ``TaskStore.get`` returns in the restarted
   process): FAILED + marker + completed_at — observable.
 * **On-disk state** (what the next ``sqlite3.connect`` reads
-  from the same DB): as of v0.2.0 (GitHub issue #2) the conversion
-  IS persisted — the on-disk row is terminal after the first
-  reopen, and later reopens perform no rewrite.
+  from the same DB): the persisted WORKING + empty reply —
+  unchanged.
 
-Both surfaces are observable and both are tested in
-``test_restart_contract.py::test_contract_matrix_row_7_inbound_nonterminal_policy_in_subprocess_restart``.
+The in-memory API is the operator-facing signal (it drives
+``/metrics`` and the A2A ``GetTask`` JSON-RPC). The on-disk row
+is the durability-of-truth (it survives a hard kill without
+the in-memory conversion). Both are observable surfaces, and
+both are tested in ``test_restart_contract.py::test_contract_matrix_row_7_inbound_nonterminal_policy_in_subprocess_restart``.
 
 ## 18. ``fail_orphans`` reads the in-memory ``created_at``
 

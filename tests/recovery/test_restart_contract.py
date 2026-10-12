@@ -310,30 +310,27 @@ def test_contract_matrix_row_7_inbound_nonterminal_policy_in_subprocess_restart(
         except Exception:
             pass
 
-    # Contract clause 4, AS AMENDED BY GitHub issue #2: the plugin's
-    # policy for non-terminal inbound at restart is FAILED + the explicit
-    # marker reply, and the conversion is DURABLE — recovery persists it
-    # so the row cannot re-appear WORKING on later boots (the old
-    # in-memory-only behavior left the DB stale, five identical
-    # "(1 failed by restart)" counters on the amy gateway).
-    # The durable conversion is observable both on disk and via
-    # ``TaskStore.get`` in the restarted process.
+    # Contract clause 4: the plugin's chosen policy for non-terminal
+    # inbound at restart is FAILED + the explicit marker reply, but
+    # the conversion is IN-MEMORY ONLY — the on-disk SQLite row keeps
+    # its persisted state/reply (see §C5 and NOTES.md #15). The
+    # in-memory conversion is observable via ``TaskStore.get`` in the
+    # restarted process; the on-disk row is unchanged.
 
-    # First, the on-disk SQLite row: durably terminal after the restart
-    # (GitHub issue #2 — recovery persists the FAILED conversion).
+    # First, the on-disk SQLite row: it is unchanged across the restart.
     on_disk = _read_db_row(db_path, "contract-in-mid")
     assert on_disk is not None, "non-terminal inbound row vanished across restart"
-    assert on_disk["state"] == STATE_FAILED, (
-        f"issue #2: on-disk state must be durable terminal across restart: {on_disk['state']!r}"
+    assert on_disk["state"] == STATE_WORKING, (
+        f"contract §C5 violation: on-disk state changed across restart: {on_disk['state']!r}"
     )
-    assert on_disk["reply"] == "[gateway restarted before task completed]", (
-        f"issue #2: on-disk marker reply missing: {on_disk['reply']!r}"
+    assert on_disk["reply"] == "", (
+        f"contract §C5 violation: on-disk reply was rewritten across restart: {on_disk['reply']!r}"
     )
     assert on_disk["direction"] == "inbound"
     assert on_disk["ownership"] == "local"
     assert on_disk["remote_state"] == ""
-    # `completed_at` is backfilled on the on-disk row by the durable conversion.
-    assert on_disk["completed_at"] is not None
+    # `completed_at` is NOT backfilled on the on-disk row.
+    assert on_disk["completed_at"] is None
 
     # Second, the API state (a fresh TaskStore against the same DB
     # mirrors what the restarted gateway subprocess sees at boot):

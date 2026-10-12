@@ -764,16 +764,13 @@ class TaskStore:
                 rec["completed_at"] = row[9]
             if rec["state"] not in TERMINAL_STATES and rec["direction"] == "inbound":
                 # Gateway died mid-task; nobody is coming to finish it.
+                # Conversion is IN-MEMORY ONLY (contract §C5 / NOTES #15):
+                # the on-disk row keeps its persisted state/reply. Issue #2
+                # was retracted (NOT_PLANNED) — this is the contracted
+                # behavior; see the issue's retraction comment.
                 rec["state"] = STATE_FAILED
                 rec["reply"] = "[gateway restarted before task completed]"
                 rec["completed_at"] = time.time()
-                # Write the terminal state back to SQLite. Without this the
-                # DB row stays WORKING: every subsequent boot re-reads the
-                # stale row and "fails" it again, while any peer polling
-                # GetTask after a fresh process start (before recovery ran)
-                # still sees WORKING. The zombie survives restarts forever.
-                # See GitHub issue #2.
-                self._persist(rec)
                 restarted += 1
             with self._lock:
                 if rec["task_id"] not in self._tasks:

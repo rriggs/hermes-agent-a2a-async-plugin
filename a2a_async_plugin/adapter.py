@@ -1098,11 +1098,18 @@ class A2AAdapter(BasePlatformAdapter):
     def _client_alive_check(handler):
         """Keepalive probe for the PLAIN (non-SSE) blocking send path.
 
-        Uses ``select`` + a non-blocking MSG_PEEK recv on the request socket:
-        a client that closed its side of a keep-alive socket shows READABLE
-        with EOF (recv returns b''). EAGAIN means alive-and-idle. Raises
-        RuntimeError on disconnect so _await_reply's keepalive contract fires.
+        Uses ``select`` + a ``MSG_PEEK`` recv on the request socket put
+        into NON-BLOCKING MODE ONCE (``setblocking(False)``): a client that
+        closed its side shows READABLE with EOF (recv returns b''); an idle
+        keep-alive socket that is readable because a follow-up request
+        arrived just shows data (left unconsumed, still alive). Never
+        pattern-flag MSG_DONTWAIT: it does not exist on Windows and makes
+        the probe misclassify live keep-alive traffic. Raises RuntimeError
+        on disconnect so _await_reply's keepalive contract fires.
         Best-effort: a stub handler without a real socket never raises.
+        Portability note (Windows): there is no MSG_DONTWAIT there, so the
+        setblocking route is mandatory; a missing constant must degrade to
+        'keep waiting', never to a probe failure.
         """
         import select as _select
         import socket as _socket
@@ -1115,15 +1122,28 @@ class A2AAdapter(BasePlatformAdapter):
                 readable, _, _ = _select.select([sock], [], [], 0)
                 if not readable:
                     return
-                data = sock.recv(1, _socket.MSG_PEEK | _socket.MSG_DONTWAIT)
+                data = sock.recv(1, _socket.MSG_PEEK)
                 if data == b"":
                     raise RuntimeError("client disconnected (EOF on request socket)")
-                # A pending byte on the socket: still connected; do not consume.
+                # A pending byte (a legal keep-alive follow-up): still
+                # connected; do not consume, do not cancel.
             except BlockingIOError:
-                return  # spurious readable: no data yet; alive
+                return  # no data buffered: alive and idle
+            except ValueError:
+                # select()/recv on a closed Python socket object (fd −1).
+                raise RuntimeError("client socket no longer usable (closed)")
             except OSError as exc:
                 # EBADF / ENOTSOCK / ECONNRESET: connection gone or unusable.
                 raise RuntimeError(f"client socket no longer usable: {exc}") from exc
+
+        # Put the socket into non-blocking mode ONCE at probe creation, not
+        # per tick: MSG_PEEK on a blockable socket would block the waiter.
+        try:
+            sock = getattr(handler, "connection", None)
+            if sock is not None and hasattr(sock, "setblocking"):
+                sock.setblocking(False)
+        except OSError:
+            pass  # probe degrades to the per-call OSError path below
 
         return _check
 
@@ -1164,16 +1184,16 @@ class A2AAdapter(BasePlatformAdapter):
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     if keepalive:
-                        return (protocol.STATE_CANCELED, "[blocked send abandoned: reply timeout expired]")
-                    return (protocol.STATE_CANCELED, "[agent did not reply in time; task canceled by caller]")
+                        return (protocol.STATE_CANCELED, "[canceled by caller: blocked send abandoned, reply timeout expired]")
+                    return (protocol.STATE_CANCELED, "[canceled by caller: reply timeout expired]")
                 wait = remaining if wait is None else min(wait, remaining)
             try:
                 return fut.result(timeout=wait)
             except FuturesTimeout:
                 if deadline is not None and time.time() >= deadline:
                     if keepalive:
-                        return (protocol.STATE_CANCELED, "[blocked send abandoned: reply timeout expired]")
-                    return (protocol.STATE_CANCELED, "[agent did not reply in time; task canceled by caller]")
+                        return (protocol.STATE_CANCELED, "[canceled by caller: blocked send abandoned, reply timeout expired]")
+                    return (protocol.STATE_CANCELED, "[canceled by caller: reply timeout expired]")
                 if keepalive:
                     try:
                         keepalive()

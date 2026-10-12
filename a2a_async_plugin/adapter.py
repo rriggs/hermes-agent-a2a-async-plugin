@@ -67,12 +67,39 @@ _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaus
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
 
 
-def _reply_timeout() -> float:
-    """Seconds to wait for the agent to answer an inbound task."""
+def _reply_timeout() -> Optional[float]:
+    """Optional cap for blocking reply waits, in seconds.
+
+    Unset (default) means NO artificial cap: A2A v1.0 §3.2.2 requires a
+    blocking ``message/send`` to wait until the task reaches a terminal
+    (or interrupted) state before returning. A capped waiter that returns
+    FAILED while the agent is still healthy produces a false, uncorrectable
+    terminal record (GitHub issue #1).
+
+    ``A2A_REPLY_TIMEOUT`` opts into a cap. When the cap expires, the task
+    is CANCELED (not FAILED) — the record asserts what actually happened
+    (we stopped waiting and withdrew the task), and the late real reply
+    resolves no waiter and is dropped instead of arriving into a
+    contradicted terminal record.
+    """
+    raw = os.getenv("A2A_REPLY_TIMEOUT", "").strip()
+    if not raw:
+        return None
     try:
-        return max(1.0, float(os.getenv("A2A_REPLY_TIMEOUT", "300")))
+        return max(1.0, float(raw))
     except (ValueError, TypeError):
-        return 300.0
+        return None
+
+
+def _dispatch_timeout() -> float:
+    """Hard timeout for the profile-forward CLI subprocess (seconds).
+
+    Unlike the blocking waiter, a subprocess MUST be bounded: expiry kills
+    the child process, which genuinely cancels the work, so a FAILED
+    outcome here is truthful. Default 300s; ``A2A_REPLY_TIMEOUT`` overrides.
+    """
+    cap = _reply_timeout()
+    return cap if cap is not None else 300.0
 
 
 def _failed_profile_reply(reply: str) -> bool:
@@ -672,7 +699,7 @@ class A2AAdapter(BasePlatformAdapter):
                 "name": str(val.get("name") or f"Hermes {slug}"),
                 "description": str(val.get("description") or f"Hermes profile '{profile or slug}' exposed over A2A."),
                 "advertised_toolsets": list(toolsets or []),
-                "timeout": int(val.get("timeout") or _reply_timeout()),
+                "timeout": int(val.get("timeout") or _dispatch_timeout()),
             }
         return agents
 
@@ -984,7 +1011,7 @@ class A2AAdapter(BasePlatformAdapter):
         safe_ctx = _safe_context_slug(context_id)
         session_title = f"a2a-{slug}-{safe_ctx}"
         key = (profile or "default", slug, safe_ctx)
-        timeout = int(agent.get("timeout") or _reply_timeout())
+        timeout = int(agent.get("timeout") or _dispatch_timeout())
 
         lock = self._forward_lock(key)
         with lock:
@@ -1059,25 +1086,49 @@ class A2AAdapter(BasePlatformAdapter):
         return state, reply
 
     def _await_reply(self, pending: dict, keepalive=None) -> tuple[str, str]:
-        """Block until the task's future resolves (or times out).
+        """Block until the task's future resolves (A2A v1.0 §3.2.2).
+
+        Blocking ``message/send`` MUST wait until the task reaches a
+        terminal or interrupted state — so by default there is NO
+        artificial cap (GitHub issue #1: a 300s cap false-FAILED healthy
+        long-running tasks into uncorrectable terminal records).
+
+        ``A2A_REPLY_TIMEOUT`` opts into a cap; on expiry the task is
+        CANCELED (not FAILED) — see :func:`_reply_timeout`. Without a cap
+        the wait is bounded only by connection lifetime: SSE paths detect
+        disconnect via ``keepalive`` raising, and gateway shutdown fails
+        every pending future.
 
         ``keepalive`` is an optional zero-arg callable invoked every
-        _SSE_KEEPALIVE seconds while waiting (used by the SSE paths); if it
-        raises, the client is gone and we stop waiting.
+        _SSE_KEEPALIVE seconds while waiting; if it raises, the client is
+        gone and we stop waiting.
         """
         fut: Future = pending["future"]
-        deadline = pending["started"] + _reply_timeout()
+        cap = _reply_timeout()
+        deadline: Optional[float] = (
+            None if cap is None else pending["started"] + cap
+        )
         while True:
+            wait = _SSE_KEEPALIVE if keepalive else None
+            if deadline is not None:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    if keepalive:
+                        return (protocol.STATE_CANCELED, "[blocked send abandoned: reply timeout expired]")
+                    return (protocol.STATE_CANCELED, "[agent did not reply in time]")
+                wait = remaining if wait is None else min(wait, remaining)
             try:
-                return fut.result(timeout=_SSE_KEEPALIVE if keepalive else max(0.0, deadline - time.time()))
+                return fut.result(timeout=wait)
             except FuturesTimeout:
-                if time.time() >= deadline:
-                    return (protocol.STATE_FAILED, "[agent did not reply in time]")
+                if deadline is not None and time.time() >= deadline:
+                    if keepalive:
+                        return (protocol.STATE_CANCELED, "[blocked send abandoned: reply timeout expired]")
+                    return (protocol.STATE_CANCELED, "[agent did not reply in time]")
                 if keepalive:
                     try:
                         keepalive()
                     except Exception:
-                        return (protocol.STATE_FAILED, "[client disconnected]")
+                        return (protocol.STATE_CANCELED, "[client disconnected]")
             except Exception:
                 return (protocol.STATE_FAILED, "[agent did not reply in time]")
 

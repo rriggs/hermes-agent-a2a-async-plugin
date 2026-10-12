@@ -380,7 +380,18 @@ def a2a_get_task(args: dict, **_: Any) -> str:
     except Exception as e:
         return f"Error: GetTask on '{agent}' failed — {e}."
     if "error" in resp:
-        _task_store().complete(task_id, protocol.STATE_FAILED, _peer_rpc_error(resp, agent))
+        # Any JSON-RPC error object is an RPC-level failure, NOT evidence
+        # that the peer's task failed. -32601 MethodNotFound (v0.3 peers
+        # speak tasks/get), -32001 TaskNotFound (peer GC'd the task or has
+        # not yet persisted it), internal errors and future codes all land
+        # here. Terminalizing the local row FAILED from this branch
+        # poisoned the record permanently (complete() is idempotent-on-
+        # terminal), so a later successful poll could never reconcile it —
+        # violating the restart-recovery contract (§2 row 5: non-terminal
+        # outbound rows reconcile via subsequent GetTask). Leave the state
+        # untouched and let reconciliation settle it. Mirrors a2a_poll's
+        # error path (tools.py:438), which already returns without
+        # terminalizing. See GitHub issue #4.
         return _peer_rpc_error(resp, agent)
     payload = resp.get("result", {})
     if not isinstance(payload, dict):

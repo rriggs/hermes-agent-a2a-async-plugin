@@ -1073,12 +1073,19 @@ def _safe_name(context_id: str) -> str:
     return safe[:120] or "default"
 
 
-def persist_message(context_id: str, role: str, text: str, task_id: str = "") -> None:
-    """Append one message to the context's on-disk conversation log."""
+def persist_message(context_id: str, role: str, text: str, task_id: str = "", peer: str = "") -> None:
+    """Append one message to the context's on-disk conversation log.
+
+    ``peer`` is recorded for inbound turns so a2a_history can frame the
+    replay as untrusted remote content (GitHub issue #5). Outbound/agent
+    turns leave it empty.
+    """
     try:
         d = _conv_dir()
         d.mkdir(parents=True, exist_ok=True)
         rec = {"ts": time.time(), "role": role, "text": text, "task_id": task_id}
+        if peer:
+            rec["peer"] = peer
         with (d / f"{_safe_name(context_id)}.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:

@@ -680,7 +680,21 @@ def a2a_history(args: dict, **_: Any) -> str:
         text = (m.get("text") or "").strip()
         if len(text) > 1000:
             text = text[:1000] + " …[truncated]"
-        lines.append(f"[{role}] {text}")
+        if role == "user" and m.get("peer"):
+            # Replay inbound peer turns WITH the untrusted-content frame:
+            # this transcript was persisted at dispatch time, stripped of
+            # the live PRIVACY_PREFIX that wrap_inbound applies, so the
+            # recall path must re-frame it or the peer's text re-enters
+            # model context as if it were trusted conversation history.
+            # GitHub issue #5.
+            lines.append(f"[peer:{m['peer']} · untrusted remote content] {text}")
+        elif role == "user":
+            # Inbound turn persisted before issue #5 shipped — no peer
+            # recorded. Still frame it: any [user] turn in an A2A
+            # transcript is remote content by construction.
+            lines.append(f"[peer:unknown · untrusted remote content] {text}")
+        else:
+            lines.append(f"[{role}] {text}")
     return "\n".join(lines)
 
 

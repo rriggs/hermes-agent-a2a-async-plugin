@@ -810,7 +810,12 @@ class A2AAdapter(BasePlatformAdapter):
 
         framed = security.wrap_inbound(peer, text)
         security.audit("inbound", peer, task_id, text)
-        protocol.persist_message(context_id, "user", text, task_id)
+        # Persist the FILTERED text, not the raw payload: a2a_history replays
+        # this transcript back into model context later, and raw injection
+        # markers surviving on disk give a peer's payload a second, cleaner
+        # delivery channel on every recall. The raw text is already recorded
+        # for audit fidelity by security.audit() above. See GitHub issue #5.
+        protocol.persist_message(context_id, "user", security.filter_inbound(text), task_id, peer=peer)
         protocol.metrics.inbound_total += 1
 
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))

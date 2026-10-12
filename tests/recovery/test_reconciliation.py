@@ -391,12 +391,14 @@ def test_reconcile_remote_cancellation_via_get_task(
 # ──────────────────────────────────────────────────────────────────
 
 
-def test_reconcile_remote_task_not_found_marks_failed_with_peer_specific_reply(
+def test_reconcile_remote_task_not_found_does_not_terminalize(
     monkeypatch, tmp_path
 ):
-    """If the peer says the task is not found (JSON-RPC ``-32001``),
-    the local row is marked FAILED with a peer-specific reply that
-    is distinguishable from the `[gateway restarted]` marker.
+    """Issue #4 contract: a peer JSON-RPC ``-32001`` (not found) does
+    NOT terminalize the local row. The error is reported to the caller
+    only; the row stays non-terminal for reconciliation (renamed from
+    ..._marks_failed_with_peer_specific_reply, which described the
+    pre-issue-#4 behavior).
     """
     _isolated_hermes_home(monkeypatch, tmp_path)
     db_path = Path(os.environ["A2A_TASKS_DB"])

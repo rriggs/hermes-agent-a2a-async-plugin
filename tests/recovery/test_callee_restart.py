@@ -472,6 +472,55 @@ def test_watchdog_after_waiter_disconnects_fails_orphan(monkeypatch, tmp_path):
     assert on_disk["reply"] == "[task orphaned — no reply produced]"
 
 
+def test_watchdog_exempt_outbound_remote_rows(monkeypatch, tmp_path):
+    """Review finding 3 (amy, v0.1.9): the orphan watchdog must NOT
+    terminalize outbound/remote rows. A recovered outbound row is the
+    caller's window on a REMOTE task that may legitimately still be
+    running peer-side (slow job, long poll interval); a local timer
+    asserting FAILED is the same poisoning class as issue #4 and breaks
+    reconciliation. Peer state, not the watchdog, settles outbound rows.
+
+    The pre-existing inbound watchdog semantics (the two tests above)
+    are unchanged.
+    """
+    home = _isolated_hermes_home(monkeypatch, tmp_path)
+    db_path = home / "a2a_tasks.db"
+    store = TaskStore(db_path=str(db_path))
+    rec = store.create(
+        "watchdog-outbound", "ctx-wo", peer="peer-remote-agent",
+        direction="outbound", ownership="remote",
+        remote_state=STATE_WORKING,
+    )
+    store.set_state(rec["task_id"], STATE_WORKING)
+    old = time.time() - 7200  # far past any orphan timeout
+    with store._lock:
+        store._tasks[rec["task_id"]]["created_at"] = old
+    con = sqlite3.connect(str(db_path))
+    try:
+        con.execute(
+            "UPDATE a2a_tasks SET created_at = ? WHERE task_id = ?",
+            (old, rec["task_id"]),
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    failed = store.fail_orphans(timeout_seconds=60, protected=set())
+    assert failed == [], f"outbound remote row was failed by the watchdog: {failed}"
+    after = store.get(rec["task_id"])
+    assert after["state"] == STATE_WORKING, (
+        f"outbound remote row terminalized locally: {after['state']!r}"
+    )
+
+    # And reconciliation still works on the exempted row: a peer-reported
+    # terminal finalizes it normally.
+    out = store.complete(rec["task_id"], STATE_COMPLETED, "peer finished late")
+    assert out is not None
+    on_disk = _read_db_row(db_path, "watchdog-outbound")
+    assert on_disk["state"] == STATE_COMPLETED
+    assert on_disk["reply"] == "peer finished late"
+
+
 # ──────────────────────────────────────────────────────────────────
 # Task 7.E — clean disconnect: every pending future is resolved
 # with [agent shutting down] and _pending is cleared (W3). This

@@ -1008,7 +1008,18 @@ class TaskStore:
 
     def fail_orphans(self, timeout_seconds: int = 300,
                      protected: Optional["set[str]"] = None) -> list[str]:
-        """Fail non-terminal tasks older than ``timeout_seconds``.
+        """Fail non-terminal LOCAL-INBOUND tasks older than ``timeout_seconds``.
+
+        Only inbound/local rows are eligible: on the callee side a pending
+        task with no waiter and no progress is genuinely orphaned — nobody
+        is coming to finish it. Outbound/remote rows are EXEMPT (review
+        finding 3, issue #4 follow-through): a recovered outbound row is the
+        caller's window on a REMOTE task that may still be running peer-side
+        with a slow or long-running job; terminalizing it locally asserts a
+        failure that did not happen and breaks reconciliation — the same
+        poisoning class as issue #4. Callers poll outbound rows with
+        a2a_get_task/a2a_await; the peer's actual state, not a local timer,
+        settles them.
 
         ``protected`` is a set of task ids with a live waiter (blocking HTTP
         thread or async background finalizer). Those are exempt: the caller
@@ -1023,6 +1034,8 @@ class TaskStore:
                 tid for tid, rec in self._tasks.items()
                 if rec["state"] not in TERMINAL_STATES
                 and tid not in protected
+                and rec.get("direction", "inbound") == "inbound"
+                and rec.get("ownership", "local") == "local"
                 and now - rec["created_at"] > timeout_seconds
             ]
         failed = []
@@ -1078,18 +1091,6 @@ def _conv_dir() -> Path:
     return base / "a2a_conversations"
 
 
-def set_conversations_dir_override(path: str) -> None:
-    """DEPRECATED alias kept for one release. Issue #3 now routes the
-    adapter's captured dir through explicit dir= parameters instead of a
-    process global (a process global leaked across multiplex profiles)."""
-    global _ADAPTER_CONV_DIR
-    _ADAPTER_CONV_DIR = str(path)
-
-
-# Kept only for the deprecated setter above.
-_ADAPTER_CONV_DIR: Optional[str] = None
-
-
 def _safe_name(context_id: str) -> str:
     raw = context_id or "default"
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in raw)
@@ -1097,34 +1098,42 @@ def _safe_name(context_id: str) -> str:
 
 
 def persist_message(context_id: str, role: str, text: str, task_id: str = "", peer: str = "",
-                    dir: Optional["os.PathLike[str]"] = None) -> None:
+                    conv_dir: Optional["os.PathLike[str]"] = None) -> None:
     """Append one message to the context's on-disk conversation log.
 
-    ``peer`` is recorded for inbound turns so a2a_history can frame the
-    replay as untrusted remote content (GitHub issue #5). Outbound/agent
-    turns leave it empty. ``dir`` (issue #3): the caller's resolved
-    conversation dir — the inbound adapter passes the profile-scoped dir
-    it captured at init, because HTTP worker threads cannot resolve
+    ``peer`` is recorded for REMOTE (peer-generated) turns so a2a_history
+    can frame the replay as untrusted remote content (GitHub issue #5):
+    inbound turns on the callee side AND peer replies on the caller side
+    both pass peer=<name>. Locally-generated turns (our outbound sends on
+    the caller side, our replies on the callee side) leave peer empty.
+    ``conv_dir`` (issue #3): the caller's resolved conversation dir — the
+    inbound adapter and the caller tools pass the profile-scoped dir,
+    because HTTP worker threads / other profiles cannot resolve
     get_hermes_home() correctly themselves.
     """
     try:
-        d = Path(dir) if dir is not None else _conv_dir()
+        d = Path(conv_dir) if conv_dir is not None else _conv_dir()
         d.mkdir(parents=True, exist_ok=True)
         rec = {"ts": time.time(), "role": role, "text": text, "task_id": task_id}
         if peer:
             rec["peer"] = peer
+        else:
+            # Explicit origin marker for locally-generated turns: lets the
+            # replay path distinguish them from legacy records written
+            # before the peer field existed (review finding 1).
+            rec["origin"] = "local"
         with (d / f"{_safe_name(context_id)}.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
 
-def load_conversation(context_id: str, limit: int = 50, dir: Optional["os.PathLike[str]"] = None) -> list[dict]:
+def load_conversation(context_id: str, limit: int = 50, conv_dir: Optional["os.PathLike[str]"] = None) -> list[dict]:
     """Load the last *limit* messages for a context (empty list if none).
 
-    ``dir`` (issue #3): caller's resolved conversation dir override.
+    ``conv_dir`` (issue #3): caller's resolved conversation dir override.
     """
-    base = Path(dir) if dir is not None else _conv_dir()
+    base = Path(conv_dir) if conv_dir is not None else _conv_dir()
     path = base / f"{_safe_name(context_id)}.jsonl"
     if not path.exists():
         return []
@@ -1144,12 +1153,12 @@ def load_conversation(context_id: str, limit: int = 50, dir: Optional["os.PathLi
     return out[-limit:]
 
 
-def list_conversations(dir: Optional["os.PathLike[str]"] = None) -> list[str]:
+def list_conversations(conv_dir: Optional["os.PathLike[str]"] = None) -> list[str]:
     """Return known context-ids that have persisted conversations.
 
-    ``dir`` (issue #3): caller's resolved conversation dir override.
+    ``conv_dir`` (issue #3): caller's resolved conversation dir override.
     """
-    d = Path(dir) if dir is not None else _conv_dir()
+    d = Path(conv_dir) if conv_dir is not None else _conv_dir()
     if not d.exists():
         return []
     return sorted(p.stem for p in d.glob("*.jsonl"))

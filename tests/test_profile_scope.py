@@ -16,8 +16,8 @@ Locked in here:
    HERMES_HOME before pinning to ~/.hermes (the old fallback ignored
    the env var entirely).
 3. persist_message/load_conversation/list_conversations accept an
-   explicit dir= override; the adapter captures the profile-scoped dir
-   at init and passes it on the inbound path — no process global (a
+   explicit conv_dir= override; the adapter captures the profile-scoped
+   dir at init and passes it on the inbound path — no process global (a
    global pin leaked across multiplex profiles and across tests).
 """
 
@@ -71,13 +71,13 @@ def test_explicit_dir_parameter_overrides_resolution(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_HOME", raising=False)
     d = tmp_path / "adapter_captured" / "a2a_conversations"
     d.mkdir(parents=True)
-    protocol.persist_message("ctx-explicit", "user", "hello", "task-1", peer="dean", dir=d)
+    protocol.persist_message("ctx-explicit", "user", "hello", "task-1", peer="dean", conv_dir=d)
     # The default resolution wrote nothing anywhere else.
     assert protocol.load_conversation("ctx-explicit") == []
     assert "ctx-explicit" not in protocol.list_conversations()
     assert (d / "ctx-explicit.jsonl").exists()
-    assert protocol.load_conversation("ctx-explicit", dir=d)[0]["peer"] == "dean"
-    assert "ctx-explicit" in protocol.list_conversations(dir=d)
+    assert protocol.load_conversation("ctx-explicit", conv_dir=d)[0]["peer"] == "dean"
+    assert "ctx-explicit" in protocol.list_conversations(conv_dir=d)
 
 
 def test_fallback_reads_hermes_home_env_when_constants_missing(monkeypatch, tmp_path):

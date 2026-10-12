@@ -186,6 +186,8 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
         rpc_body["params"]["tenant"] = tenant
 
     security.audit("outbound", agent_label, rpc_body["id"], safe_message)
+    # Locally-generated turn: no peer attribution (GitHub issue #5 review
+    # finding 1 — our outbound sends must NOT replay as untrusted content).
     protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
     protocol.metrics.outbound_total += 1
 
@@ -201,7 +203,11 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     if isinstance(payload, dict):
         reply_ctx = payload.get("contextId", ctx)
         state = (payload.get("status") or {}).get("state", "")
-    protocol.persist_message(reply_ctx, "agent", reply, rpc_body["id"])
+    # Peer-generated content: filter + attribute (issue #5, caller side).
+    # The reply is the peer's text — the same injection channel the callee
+    # side closed; persist it filtered with the peer's name.
+    protocol.persist_message(reply_ctx, "agent", security.filter_inbound(reply), rpc_body["id"],
+                             peer=agent_label)
     protocol.metrics.inbound_total += 1
     return reply, reply_ctx, state
 
@@ -293,7 +299,7 @@ def a2a_steer(args: dict, **_: Any) -> str:
         return f"Error: peer '{agent}' accepted the steering message but returned no task id."
     _task_store().create(task_id, reply_ctx, agent, direction="outbound", ownership="remote",
                          remote_state=state or protocol.STATE_SUBMITTED)
-    protocol.persist_message(reply_ctx, "user", safe_message, task_id)
+    protocol.persist_message(reply_ctx, "user", safe_message, task_id)  # local turn, no peer
     protocol.metrics.outbound_total += 1
     return (f"[{agent} · steering task {task_id} · context {reply_ctx} · "
             f"{_short_state(state) or 'submitted'}]\nSteering queued. Poll with "
@@ -356,7 +362,7 @@ def a2a_submit(args: dict, **_: Any) -> str:
         task_id, reply_ctx, agent, direction="outbound", ownership="remote",
         remote_state=state or protocol.STATE_SUBMITTED,
     )
-    protocol.persist_message(reply_ctx, "user", safe_message, task_id)
+    protocol.persist_message(reply_ctx, "user", safe_message, task_id)  # local turn, no peer
     protocol.metrics.outbound_total += 1
     return (
         f"[{agent} · task {task_id} · context {reply_ctx} · "
@@ -462,6 +468,15 @@ def a2a_await(args: dict, **_: Any) -> str:
                     _task_store().complete(task_id, state, text)
                 else:
                     _task_store().set_state(task_id, state)
+                # Persist the terminal peer reply: filtered + peer-attributed
+                # (issue #5 caller side — review finding 1). Without this the
+                # a2a_await result never reached the transcript, and the peer's
+                # text would enter later context only via the tool result,
+                # unframed.
+                reply_ctx = str(payload.get("contextId", "")) if isinstance(payload, dict) else ""
+                if reply_ctx and text:
+                    protocol.persist_message(reply_ctx, "agent", security.filter_inbound(text),
+                                             task_id, peer=agent)
                 header = f"[{agent} · task {payload.get('id', task_id)} · {short}]"
                 body = text
                 if short == "input-required":
@@ -660,9 +675,11 @@ def a2a_list(args: dict | None = None, **_: Any) -> str:
 def a2a_history(args: dict, **_: Any) -> str:
     """Recall a persisted A2A conversation by context_id.
 
-    This is how prior A2A exchanges survive compaction/restarts: every turn is
-    written to ~/.hermes/a2a_conversations/<context>.jsonl and can be reloaded
-    here.
+    This is how prior A2A exchanges survive compaction/restarts: every
+    turn is written to the profile-scoped a2a_conversations/<context>.jsonl
+    and can be reloaded here. Peer-generated turns are framed as untrusted
+    remote content on replay (GitHub issue #5); locally-generated turns
+    (our own sends and replies) replay unframed.
     """
     context_id = str(args.get("context_id") or args.get("contextId") or "").strip()
     if not context_id:
@@ -680,20 +697,25 @@ def a2a_history(args: dict, **_: Any) -> str:
         text = (m.get("text") or "").strip()
         if len(text) > 1000:
             text = text[:1000] + " …[truncated]"
-        if role == "user" and m.get("peer"):
-            # Replay inbound peer turns WITH the untrusted-content frame:
-            # this transcript was persisted at dispatch time, stripped of
-            # the live PRIVACY_PREFIX that wrap_inbound applies, so the
-            # recall path must re-frame it or the peer's text re-enters
-            # model context as if it were trusted conversation history.
-            # GitHub issue #5.
+        if m.get("peer"):
+            # Remote turn (peer explicit): frame it. Applies to inbound
+            # callee turns AND peer replies on the caller side — the peer
+            # field is the source of truth for origin, not the role.
+            # GitHub issue #5 + review finding 1.
             lines.append(f"[peer:{m['peer']} · untrusted remote content] {text}")
+        elif m.get("origin") == "local":
+            # Locally-generated turn (our outbound sends on the caller
+            # side, our replies on the callee side): replay unframed.
+            lines.append(f"[{role}] {text}")
         elif role == "user":
-            # Inbound turn persisted before issue #5 shipped — no peer
-            # recorded. Still frame it: any [user] turn in an A2A
-            # transcript is remote content by construction.
+            # Legacy callee-side inbound record persisted before issue #5
+            # shipped — no origin marker, no peer. In A2A sessions the
+            # only [user] turns the callee adapter writes are remote by
+            # construction; frame with an unknown peer (fail-safe).
             lines.append(f"[peer:unknown · untrusted remote content] {text}")
         else:
+            # Legacy [agent] record: callee replies were locally generated
+            # by construction; replay unframed.
             lines.append(f"[{role}] {text}")
     return "\n".join(lines)
 

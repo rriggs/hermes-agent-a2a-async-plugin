@@ -58,9 +58,9 @@ what the plugin MUST do on each restart scenario.
 | 3 | Non-terminal outbound task, caller clean restart | `outbound` / `remote` | **`state` and `remote_state` unchanged.** `reply` empty. `completed_at` not backfilled. Caller can re-query the peer and reconcile. |
 | 4 | Non-terminal outbound task, caller hard-kill restart | `outbound` / `remote` | Same as row 3. A hard kill must not be distinguishable in DB rows. |
 | 5 | Non-terminal outbound task, caller restart, peer completes while caller is down | `outbound` / `remote` | DB row unchanged at restart moment; subsequent `GetTask`/`a2a_get_task`/`a2a_await` reconciles to terminal.** |
-| 7 | Non-terminal inbound task, callee clean restart | `inbound` / `local` | API state (`TaskStore.get` in the restarted process) returns `state = TASK_STATE_FAILED`, `reply = "[gateway restarted before task completed]"`, `completed_at` set. **The on-disk SQLite row keeps its persisted state/reply** (the conversion is in-memory only — `tests/recovery/NOTES.md` #15). **No silent recovery; the restart reason is explicit in the in-memory API.** |
+| 7 | Non-terminal inbound task, callee clean restart | `inbound` / `local` | API state (`TaskStore.get` in the restarted process) returns `state = TASK_STATE_FAILED`, `reply = "[gateway restarted before task completed]"`, `completed_at` set. **The conversion is durable as of v0.2.0 (GitHub issue #2): `_recover_from_db` writes the FAILED state back to the on-disk SQLite row, so peers polling `GetTask` never see `WORKING` from a stale record, and later boots do not re-fail the same row.** **No silent recovery; the restart reason is explicit in the API and on disk.** |
 | 8 | Non-terminal inbound task, callee hard-kill restart | `inbound` / `local` | Same as row 7 (hard-kill is indistinguishable from clean restart for non-terminal inbound rows). |
-| 9 | Remote task disappears (peer says "not found") | `outbound` / `remote` | Local row marked `TASK_STATE_FAILED` with a peer-specific reply; NOT the `[gateway restarted]` marker. |
+| 9 | Remote task disappears (peer says "not found") | `outbound` / `remote` | **As of v0.2.0 (GitHub issue #4): the local row is NOT terminalized.** Any JSON-RPC error from `GetTask` (`-32001` not-found, `-32601` method-not-found against v0.3 peers, transport) is an RPC-level failure, not task failure: the error is returned to the caller and the row stays non-terminal for reconciliation. A peer-reported terminal state settles the row later. The orphan watchdog also exempts outbound/remote rows (review finding 3) — local timers never assert remote failures. |
 | 10 | Repeated `finalize` attempts on an already-terminal record | any | Compare-and-set: the second attempt is a no-op; no DB drift, no metric drift, no watcher leak. |
 | 11 | Caller restart AFTER peer remote completion | `outbound` / `remote` | The prior terminal state survives reopen; a caller restart CANNOT overwrite a prior terminal. |
 
@@ -84,9 +84,12 @@ RPC and:
   via `TaskStore.complete` (terminal compare-and-set: once terminal,
   the row cannot be overwritten by a later attempt).
 
-If the peer says "task not found" (`-32001`), the local row is
-transitioned to `TASK_STATE_FAILED` with a peer-specific reply
-distinguishable from `[gateway restarted]`.
+If the peer says "task not found" (`-32001`), the error is returned to
+the caller WITHOUT a state change (GitHub issue #4, v0.2.0): RPC-level
+errors do not carry evidence of task failure, and terminalizing on
+them would poison the row permanently (compare-and-set). Reconciliation
+continues on subsequent polls; the orphan watchdog leaves outbound
+rows to the peer's actual state.
 
 ## 4. Callee-side restart policy (chosen)
 
@@ -95,8 +98,8 @@ chosen policy is **fail with explicit restart reason**, not silent
 recovery. Concretely:
 
 * `state` becomes `TASK_STATE_FAILED`
-* `reply` becomes `[gateway restarted before task completed]` (in-memory only; the on-disk row keeps its persisted `reply` — see §C5)
-* `completed_at` is set in-memory to the wall-clock time at reopen (NOT persisted)
+* `reply` becomes `[gateway restarted before task completed]` — durable as of v0.2.0 (GitHub issue #2): the conversion is persisted to the on-disk row on the reopen that performs it, and later reopens see the terminal on-disk row unchanged (no re-fail loop)
+* `completed_at` is set to the wall-clock time at reopen and persisted with the conversion (v0.2.0)
 * All other durable fields (`task_id`, `context_id`, `peer`,
   `agent_slug`, `tenant`, `direction`, `ownership`, `remote_state`,
   `created_at`, `created_iso`) are preserved
@@ -159,12 +162,13 @@ The following rules apply to ALL transitions, inbound or outbound:
   overwrite. The `_recover_from_db` path treats persisted terminal
   rows as ground truth.
 * **C5.** A non-terminal inbound reopen converts the row to FAILED
-  with the restart marker ONCE per reopen (per-process). The
-  conversion updates the in-memory record but does not re-persist;
-  the on-disk `reply` field is NOT rewritten by subsequent reopens.
-  (This is a known gap — `tests/recovery/NOTES.md` #15 — and is
-  acceptable because the marker is identifiable regardless of which
-  reopen wrote the in-memory copy.)
+  with the restart marker ONCE, and—as of v0.2.0 (GitHub issue #2)—
+  persists the conversion: the on-disk row becomes terminal
+  (`state`/`reply`/`completed_at`) on the reopen that performed it.
+  Subsequent reopens observe the terminal on-disk row and perform no
+  rewrite (no churn, no re-fail loop). This amends the v0.1.x
+  in-memory-only behavior NOTES.md #15 described; see issue #2 for the
+  zombie-loop evidence that motivated the amendment.
 
 ## 6. Watchdog / orphan-protection rules
 
@@ -172,6 +176,13 @@ The adapter runs a background watchdog that fails tasks older than
 `a2a_async_plugin.adapter._ORPHAN_TIMEOUT` (300 s) that have no live
 HTTP waiter / live `_pending` future
 (`adapter._watchdog_loop` calling `TaskStore.fail_orphans`).
+
+As of v0.2.0 (review finding 3): the watchdog exempts
+`outbound`/`remote` rows — only `inbound`/`local` rows are eligible.
+A remote task's lifetime is owned by the peer, not by a local timer;
+local timers asserting remote failures poison reconciliation (the
+issue #4 failure class). Outbound rows settle exclusively via
+peer-reported state through `a2a_get_task`/`a2a_await` reconciliation.
 
 * **W1.** A task with a live HTTP waiter (the caller's blocking HTTP
   thread is still in `_pending[task_id]`) is PROTECTED. The watchdog

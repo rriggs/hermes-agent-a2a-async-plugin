@@ -856,7 +856,7 @@ class A2AAdapter(BasePlatformAdapter):
         # markers surviving on disk give a peer's payload a second, cleaner
         # delivery channel on every recall. The raw text is already recorded
         # for audit fidelity by security.audit() above. See GitHub issue #5.
-        protocol.persist_message(context_id, "user", security.filter_inbound(text), task_id, peer=peer, dir=self._conversations_dir)
+        protocol.persist_message(context_id, "user", security.filter_inbound(text), task_id, peer=peer, conv_dir=self._conversations_dir)
         protocol.metrics.inbound_total += 1
 
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
@@ -865,7 +865,7 @@ class A2AAdapter(BasePlatformAdapter):
         if not agent.get("local", True):
             reply, state = self._forward_to_profile(agent, peer, context_id, framed)
             self.tasks.complete(task_id, state, reply)
-            protocol.persist_message(context_id, "agent", reply, task_id, dir=self._conversations_dir)
+            protocol.persist_message(context_id, "agent", reply, task_id, conv_dir=self._conversations_dir)
             security.audit("outbound", peer, task_id, reply)
             if state == protocol.STATE_COMPLETED:
                 protocol.metrics.outbound_total += 1
@@ -1044,7 +1044,7 @@ class A2AAdapter(BasePlatformAdapter):
                 state = protocol.STATE_INPUT_REQUIRED
                 reply = stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
 
-        protocol.persist_message(context_id, "agent", reply, task_id, dir=self._conversations_dir)
+        protocol.persist_message(context_id, "agent", reply, task_id, conv_dir=self._conversations_dir)
         security.audit("outbound", peer, task_id, reply)
 
         if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):

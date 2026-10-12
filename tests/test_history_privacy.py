@@ -59,11 +59,25 @@ def test_a2a_history_frames_peer_turns(isolated_hermes_home, monkeypatch):
     monkeypatch.setattr(a2a_tools, "_load_config", lambda: {"a2a_agents": {}})
     protocol.persist_message("ctx-framed-2", "user", "inbound text", "task-2", peer="dean")
     protocol.persist_message("ctx-framed-2", "agent", "outbound reply", "task-2")
-    # Legacy record persisted before issue #5 shipped: no peer field.
+    # Legacy record persisted before issue #5 shipped: NO peer field and
+    # NO origin marker (current persist_message stamps origin=local on
+    # local turns, so true legacy records must be written directly to the
+    # jsonl the way the old code did).
     protocol.persist_message("ctx-framed-2", "user", "legacy inbound", "task-3")
+    # Rewrite the last record without the origin marker — simulating a
+    # v0.1.8-era jsonl line.
+    jsonl = protocol._conv_dir() / "ctx-framed-2.jsonl"
+    lines = jsonl.read_text(encoding="utf-8").splitlines()
+    rec = json.loads(lines[-1])
+    rec.pop("origin", None)
+    rec.pop("peer", None)
+    lines[-1] = json.dumps(rec, ensure_ascii=False)
+    jsonl.write_text("\n".join(lines) + "\n", encoding="utf-8")
     out = a2a_tools.a2a_history({"context_id": "ctx-framed-2"})
     assert "[peer:dean · untrusted remote content] inbound text" in out
     assert "[agent] outbound reply" in out
+    # True legacy [user] record: framed fail-safe (remote by construction
+    # on a callee transcript).
     assert "[peer:unknown · untrusted remote content] legacy inbound" in out
     # No bare [user] replays remain — every inbound turn is framed.
     assert "[user]" not in out
@@ -90,3 +104,44 @@ def test_filter_inbound_defangs_system_tags():
     filtered = security.filter_inbound(_INJECTION_PAYLOAD)
     assert "<system>" not in filtered
     assert security.filter_inbound("") == ""
+
+
+# ---------------------------------------------------------------------------
+# Review finding 1 (amy, v0.1.9): caller-side framing.
+# The caller tools persist OUR sends as locally-generated turns (no peer)
+# and the PEER's replies as remote turns (peer=<name>, filtered). Replay
+# must frame the peer's replies, not our own sends.
+# ---------------------------------------------------------------------------
+
+
+def test_caller_side_turns_local_vs_remote(isolated_hermes_home):
+    """Mirror tools._send_task's persist calls: local send (no peer) +
+    peer reply (peer-attributed, filtered)."""
+    protocol.persist_message("ctx-caller-1", "user", "our outbound ask", "t-1")
+    peer_reply = security.filter_inbound(_INJECTION_PAYLOAD)
+    protocol.persist_message("ctx-caller-1", "agent", peer_reply, "t-1", peer="dean")
+    msgs = protocol.load_conversation("ctx-caller-1", limit=10)
+    assert len(msgs) == 2
+    # Our send: no peer field — locally generated.
+    assert "peer" not in msgs[0]
+    # The peer's reply: peer-attributed.
+    assert msgs[1].get("peer") == "dean"
+
+
+def test_a2a_history_framing_on_caller_context(isolated_hermes_home, monkeypatch):
+    """On a caller context, replay MUST frame the peer's reply and must
+    NOT frame our own send. Pre-finding-1 code inverted both."""
+    monkeypatch.setattr(a2a_tools, "_load_config", lambda: {"a2a_agents": {}})
+    protocol.persist_message("ctx-caller-2", "user", "our outbound ask", "t-2")
+    protocol.persist_message("ctx-caller-2", "agent",
+                             security.filter_inbound(_INJECTION_PAYLOAD),
+                             "t-2", peer="dean")
+    out = a2a_tools.a2a_history({"context_id": "ctx-caller-2"})
+    # Peer's reply framed.
+    assert "[peer:dean · untrusted remote content]" in out
+    assert "<system>" not in out
+    # Our own send NOT framed as peer content.
+    assert "our outbound ask" in out
+    our_send_line = [l for l in out.splitlines() if "our outbound ask" in l][0]
+    assert "[peer:" not in our_send_line, f"our own send framed as peer content: {our_send_line!r}"
+    assert our_send_line.startswith("[user] "), our_send_line

@@ -767,6 +767,13 @@ class TaskStore:
                 rec["state"] = STATE_FAILED
                 rec["reply"] = "[gateway restarted before task completed]"
                 rec["completed_at"] = time.time()
+                # Write the terminal state back to SQLite. Without this the
+                # DB row stays WORKING: every subsequent boot re-reads the
+                # stale row and "fails" it again, while any peer polling
+                # GetTask after a fresh process start (before recovery ran)
+                # still sees WORKING. The zombie survives restarts forever.
+                # See GitHub issue #2.
+                self._persist(rec)
                 restarted += 1
             with self._lock:
                 if rec["task_id"] not in self._tasks:

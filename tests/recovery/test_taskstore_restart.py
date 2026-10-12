@@ -243,6 +243,65 @@ def test_nonterminal_inbound_marked_failed_on_reopen(tmp_path):
         )
 
 
+def test_nonterminal_inbound_failed_on_reopen_persisted_to_db(tmp_path):
+    """GitHub issue #2: the restart-FAILED mutation must reach SQLite.
+
+    The in-memory conversion was correct from day one; the bug was that
+    `_recover_from_db` never wrote the FAILED state back to the DB, so the
+    row stayed WORKING on disk. Every later boot re-read the stale row and
+    "failed" it again (five identical "(1 failed by restart)" counters on
+    the amy gateway), and a peer polling GetTask against the persisted
+    state saw WORKING forever.
+
+    The critical assertions are against the DATABASE, not the store's
+    memory: a memory-only assertion passed even while the DB stayed stale.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "tasks.db"
+    store1 = TaskStore(db_path=str(db_path))
+    rec = store1.create(
+        "task-zombie", "ctx-zombie", peer="dean",
+        agent_slug="", tenant="", direction="inbound",
+        ownership="local", remote_state="",
+    )
+    store1.set_state(rec["task_id"], STATE_WORKING)
+    del store1
+
+    # Reopen: recovery must convert AND persist the terminal state.
+    store2 = TaskStore(db_path=str(db_path))
+    assert store2.get("task-zombie")["state"] == STATE_FAILED
+
+    con = sqlite3.connect(db_path)
+    try:
+        row = con.execute(
+            "SELECT state, reply, completed_at FROM a2a_tasks WHERE task_id = 'task-zombie'"
+        ).fetchone()
+    finally:
+        con.close()
+    assert row is not None, "task row vanished from DB"
+    assert row[0] == STATE_FAILED, (
+        f"DB row stayed non-terminal after recovery: state={row[0]!r}"
+    )
+    assert row[1] == "[gateway restarted before task completed]"
+    assert row[2] is not None, "DB completed_at stayed NULL after recovery"
+
+    # And a THIRD boot must not retry the row: the "(1 failed by restart)"
+    # counter must stay 0 once the row is terminal on disk.
+    del store2
+    store3 = TaskStore(db_path=str(db_path))
+    assert store3.get("task-zombie")["state"] == STATE_FAILED
+    con = sqlite3.connect(db_path)
+    try:
+        row = con.execute(
+            "SELECT state, completed_at FROM a2a_tasks WHERE task_id = 'task-zombie'"
+        ).fetchone()
+    finally:
+        con.close()
+    assert row[0] == STATE_FAILED
+    assert row[1] is not None
+
+
 def test_nonterminal_outbound_survives_reopen_untouched(tmp_path):
     """Outbound non-terminal rows are NOT subject to the
     inbound-FAILED restart policy. A caller gateway may legitimately

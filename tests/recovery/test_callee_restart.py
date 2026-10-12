@@ -197,9 +197,9 @@ def test_callee_clean_restart_inbound_nonterminal_becomes_failed_with_marker(
     non-terminal inbound row into the live DB while the gateway
     subprocess is running, then clean-stop + restart.
 
-    The on-disk row stays WORKING (the conversion is in-memory
-    only — §C5). The API state (``TaskStore.get`` in the restarted
-    process) is FAILED + marker.
+    The on-disk row is rewritten to FAILED + marker (GitHub issue #2:
+    the conversion must be durable — the old in-memory-only conversion
+    left the DB stale and every later boot re-failed the same row).
     """
     db_path = isolated_profile.tasks_db
     gateway.start()
@@ -233,13 +233,14 @@ def test_callee_clean_restart_inbound_nonterminal_becomes_failed_with_marker(
         except Exception:
             pass
 
-    # On-disk: state and reply are unchanged (NOTES #15 / §C5).
+    # On-disk: durable terminal state (GitHub issue #2 fix).
     on_disk = _read_db_row(db_path, "callee-clean-mid")
     assert on_disk is not None
-    assert on_disk["state"] == STATE_WORKING, (
-        f"contract §C5 violation: on-disk state changed across restart: {on_disk['state']!r}"
+    assert on_disk["state"] == STATE_FAILED, (
+        f"issue #2: on-disk state must be durable terminal after restart: {on_disk['state']!r}"
     )
-    assert on_disk["reply"] == ""
+    assert on_disk["reply"] == "[gateway restarted before task completed]"
+    assert on_disk["completed_at"] is not None
 
     # API state: a fresh TaskStore against the same DB applies the
     # in-memory FAILED + marker policy (mirrors what the restarted
@@ -650,9 +651,10 @@ def test_callee_hardkill_does_not_lose_on_disk_inbound_state(
     gateway, isolated_profile
 ):
     """W4 + matrix row 8: a SIGKILL of the gateway leaves the
-    on-disk inbound row in its persisted state. The next process
-    that opens the DB applies the in-memory FAILED policy, but the
-    on-disk row is the source of truth and is unchanged.
+    on-disk inbound row recoverable. The next process that opens
+    the DB applies the FAILED policy AND persists it (GitHub issue
+    #2: the recovery conversion is durable). The non-key fields
+    (direction/agent_slug/tenant) are untouched by the conversion.
     """
     db_path = isolated_profile.tasks_db
     gateway.start()
@@ -679,11 +681,12 @@ def test_callee_hardkill_does_not_lose_on_disk_inbound_state(
         except Exception:
             pass
 
-    # On-disk state is unchanged (C5).
+    # On-disk state is durably terminal (issue #2 fix), non-key fields intact.
     on_disk = _read_db_row(db_path, "hk-on-disk")
     assert on_disk is not None
-    assert on_disk["state"] == STATE_WORKING
-    assert on_disk["reply"] == ""
+    assert on_disk["state"] == STATE_FAILED
+    assert on_disk["reply"] == "[gateway restarted before task completed]"
+    assert on_disk["completed_at"] is not None
     assert on_disk["direction"] == "inbound"
     assert on_disk["agent_slug"] == "agent-hk"
     assert on_disk["tenant"] == "tenant-hk"

@@ -82,6 +82,12 @@ python -m py_compile a2a_async/*.py
 
 The plugin is intended to be tested through Hermes' real plugin discovery path with a temporary `HERMES_HOME`. Do not run it alongside another plugin that registers the same async tool names.
 
+## Conversation transcripts
+
+Inbound and outbound turns are persisted as JSONL under `a2a_conversations/` inside the active profile's Hermes home, next to the profile-scoped task DB (`a2a_tasks.db`). The directory is resolved once at adapter initialization and pinned via the `A2A_CONVERSATIONS_DIR` environment override, so HTTP worker threads never re-resolve the Hermes home themselves. Set `A2A_CONVERSATIONS_DIR` explicitly to relocate the transcripts.
+
+`a2a_history` replays transcript turns for an agent's own context. Every inbound ([peer]) turn is framed as untrusted remote content on replay, and prompt-injection markers are filtered before persistence; the raw text is kept only in the plugin's own audit log. Transcripts written before v0.1.9 lack the peer attribution frame and are not migrated — their replay is framed as untrusted with `peer:unknown`, but content persisted under an older version in the wrong root (for example, under the default home on multiplexed gateways) is not relocated. Those older artifacts are accepted as lost; re-point a2a_history at the profile-scoped directory only for transcripts captured after this version.
+
 ## Safety
 
 - Remote endpoints must be explicitly configured.

@@ -460,12 +460,13 @@ def test_terminal_race_fail_orphans_vs_late_completion(
 def test_terminal_race_repeated_reopen_does_not_rewrite_on_disk_reply(
     monkeypatch, tmp_path
 ):
-    """C5: a non-terminal inbound row is converted to FAILED + marker
-    in-memory on every reopen. The on-disk ``reply`` is NOT rewritten
-    (the persistence layer's _recover_from_db does not call _persist
-    on the in-memory conversion). Subsequent reopens see the same
-    on-disk ``reply``. The in-memory marker is per-process, the
-    on-disk state is durable.
+    """C5, as amended by GitHub issue #2: a non-terminal inbound row is
+    converted to FAILED + marker on the FIRST reopen and that terminal
+    state is PERSISTED to the DB (the old behavior left the DB stale,
+    so every boot re-failed the same row and polled peers saw WORKING
+    forever). Subsequent reopens see the terminal on-disk row unchanged
+    — the on-disk reply is NOT churned; it stays the marker from the
+    first conversion.
     """
     _isolated_hermes_home(monkeypatch, tmp_path)
     db_path = Path(os.environ["A2A_TASKS_DB"])
@@ -479,14 +480,20 @@ def test_terminal_race_repeated_reopen_does_not_rewrite_on_disk_reply(
     s1.set_state(rec["task_id"], STATE_WORKING)
     del s1
 
-    # First reopen: API state is FAILED + marker, but the on-disk
-    # reply stays empty (per NOTES #15 / §C5).
+    # First reopen: API state is FAILED + marker, and the on-disk row
+    # is NOW terminal (issue #2 fix) with the marker reply.
     s2 = TaskStore(db_path=str(db_path))
     after_first = s2.get(rec["task_id"])
     assert after_first["state"] == STATE_FAILED
     assert after_first["reply"] == "[gateway restarted before task completed]"
 
     on_disk_after_first = _read_db_row(db_path, rec["task_id"])
+    assert on_disk_after_first["state"] == STATE_FAILED, (
+        f"issue #2: on-disk state must be terminal after the first reopen: "
+        f"{on_disk_after_first['state']!r}"
+    )
+    assert on_disk_after_first["reply"] == "[gateway restarted before task completed]"
+    assert on_disk_after_first["completed_at"] is not None
     on_disk_state_1 = on_disk_after_first["state"]
     on_disk_reply_1 = on_disk_after_first["reply"]
 
@@ -506,10 +513,10 @@ def test_terminal_race_repeated_reopen_does_not_rewrite_on_disk_reply(
         f"first={on_disk_reply_1!r} second={on_disk_after_second['reply']!r}"
     )
 
-    # Sanity: the on-disk reply is the persisted one (empty), NOT the
-    # marker. The marker is the in-memory view only.
-    assert on_disk_after_second["reply"] == "", (
-        f"on-disk reply was rewritten to the marker: {on_disk_after_second['reply']!r}"
+    # Sanity: the on-disk reply IS the marker now — durable, not
+    # in-memory-only. Reopens must simply not rewrite it further.
+    assert on_disk_after_second["reply"] == "[gateway restarted before task completed]", (
+        f"on-disk reply was rewritten: {on_disk_after_second['reply']!r}"
     )
 
 
@@ -618,12 +625,12 @@ def test_terminal_race_concurrent_reopens_are_consistent(
             f"thread {i} missing the marker: {snap['reply']!r}"
         )
 
-    # The on-disk row is unchanged across all reopens.
+    # The on-disk row is durably terminal (issue #2 fix), identical across
+    # the concurrent reopens — no interleaved rewrite churn.
     on_disk_after = _read_db_row(db_path, rec["task_id"])
-    assert on_disk_after["state"] == on_disk_before["state"]
-    assert on_disk_after["reply"] == on_disk_before["reply"]
-    assert on_disk_after["state"] == STATE_WORKING
-    assert on_disk_after["reply"] == ""
+    assert on_disk_after["state"] == STATE_FAILED
+    assert on_disk_after["reply"] == "[gateway restarted before task completed]"
+    assert on_disk_after["completed_at"] is not None
 
 
 # ──────────────────────────────────────────────────────────────────

@@ -1059,12 +1059,35 @@ class TaskStore:
 # --------------------------------------------------------------------------
 
 def _conv_dir() -> Path:
+    # Issue #3: a deployment can pin the dir explicitly; otherwise the
+    # caller-supplied dir (adapter) or the context-aware Hermes home
+    # resolution applies. Worker threads must not rely on the bare
+    # fallback: the adapter passes its captured dir explicitly.
+    override = os.getenv("A2A_CONVERSATIONS_DIR", "").strip()
+    if override:
+        return Path(override)
     try:
         from hermes_constants import get_hermes_home
         base = Path(get_hermes_home())
     except Exception:
-        base = Path(os.path.expanduser("~/.hermes"))
+        # hermes_constants unavailable: mirror get_process_hermes_home()'s
+        # fallback chain (HERMES_HOME env, then platform default) instead
+        # of silently pinning to ~/.hermes — a failed import would
+        # otherwise ignore HERMES_HOME entirely (issue #3's fallback).
+        base = Path(os.getenv("HERMES_HOME", "").strip() or "~/.hermes").expanduser()
     return base / "a2a_conversations"
+
+
+def set_conversations_dir_override(path: str) -> None:
+    """DEPRECATED alias kept for one release. Issue #3 now routes the
+    adapter's captured dir through explicit dir= parameters instead of a
+    process global (a process global leaked across multiplex profiles)."""
+    global _ADAPTER_CONV_DIR
+    _ADAPTER_CONV_DIR = str(path)
+
+
+# Kept only for the deprecated setter above.
+_ADAPTER_CONV_DIR: Optional[str] = None
 
 
 def _safe_name(context_id: str) -> str:
@@ -1073,15 +1096,19 @@ def _safe_name(context_id: str) -> str:
     return safe[:120] or "default"
 
 
-def persist_message(context_id: str, role: str, text: str, task_id: str = "", peer: str = "") -> None:
+def persist_message(context_id: str, role: str, text: str, task_id: str = "", peer: str = "",
+                    dir: Optional["os.PathLike[str]"] = None) -> None:
     """Append one message to the context's on-disk conversation log.
 
     ``peer`` is recorded for inbound turns so a2a_history can frame the
     replay as untrusted remote content (GitHub issue #5). Outbound/agent
-    turns leave it empty.
+    turns leave it empty. ``dir`` (issue #3): the caller's resolved
+    conversation dir — the inbound adapter passes the profile-scoped dir
+    it captured at init, because HTTP worker threads cannot resolve
+    get_hermes_home() correctly themselves.
     """
     try:
-        d = _conv_dir()
+        d = Path(dir) if dir is not None else _conv_dir()
         d.mkdir(parents=True, exist_ok=True)
         rec = {"ts": time.time(), "role": role, "text": text, "task_id": task_id}
         if peer:
@@ -1092,9 +1119,13 @@ def persist_message(context_id: str, role: str, text: str, task_id: str = "", pe
         pass
 
 
-def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
-    """Load the last *limit* messages for a context (empty list if none)."""
-    path = _conv_dir() / f"{_safe_name(context_id)}.jsonl"
+def load_conversation(context_id: str, limit: int = 50, dir: Optional["os.PathLike[str]"] = None) -> list[dict]:
+    """Load the last *limit* messages for a context (empty list if none).
+
+    ``dir`` (issue #3): caller's resolved conversation dir override.
+    """
+    base = Path(dir) if dir is not None else _conv_dir()
+    path = base / f"{_safe_name(context_id)}.jsonl"
     if not path.exists():
         return []
     out: list[dict] = []
@@ -1113,9 +1144,12 @@ def load_conversation(context_id: str, limit: int = 50) -> list[dict]:
     return out[-limit:]
 
 
-def list_conversations() -> list[str]:
-    """Return known context-ids that have persisted conversations."""
-    d = _conv_dir()
+def list_conversations(dir: Optional["os.PathLike[str]"] = None) -> list[str]:
+    """Return known context-ids that have persisted conversations.
+
+    ``dir`` (issue #3): caller's resolved conversation dir override.
+    """
+    d = Path(dir) if dir is not None else _conv_dir()
     if not d.exists():
         return []
     return sorted(p.stem for p in d.glob("*.jsonl"))

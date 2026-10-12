@@ -615,11 +615,20 @@ def test_remote_task_not_found_does_not_get_restart_marker(
             # ``Error: peer '...' returned <code>: <message>``.
             assert out.startswith("Error:"), f"unexpected reply: {out!r}"
 
-            # The local DB row was marked FAILED.
+            # Issue #4 contract: a JSON-RPC error (including -32001
+            # TaskNotFound) is an RPC-level failure, NOT task failure. The
+            # local row must stay non-terminal so a later successful poll
+            # reconciles it. (The pre-issue-#4 contract terminalized here;
+            # that poisoned outbound rows against peers that GC tasks or
+            # spell the method differently.)
             db_path = Path(os.environ["A2A_TASKS_DB"])
             on_disk = _read_db_row(db_path, task_id)
             assert on_disk is not None
-            assert on_disk["state"] == STATE_FAILED
+            assert on_disk["state"] not in (
+                "TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED",
+            ), (
+                f"not-found error terminalized the outbound row: {on_disk['state']!r}"
+            )
             assert "[gateway restarted" not in (on_disk.get("reply") or ""), (
                 f"on-disk reply was labelled with the restart marker for an "
                 f"outbound not-found failure: {on_disk['reply']!r}"

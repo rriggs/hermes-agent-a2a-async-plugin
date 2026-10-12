@@ -428,19 +428,17 @@ def test_reconcile_remote_task_not_found_marks_failed_with_peer_specific_reply(
                 f"unexpected reply from a2a_get_task: {out!r}"
             )
 
+            # Issue #4 contract: an RPC-level error (even -32001) does NOT
+            # terminalize the local row. The row stays non-terminal for
+            # later reconciliation; the error is only reported to the
+            # caller. (Pre-issue-#4 behavior terminalized with the peer's
+            # error message; that permanently poisoned outbound rows.)
             post = _read_db_row(db_path, task_id)
             assert post is not None
-            assert post["state"] == STATE_FAILED
-            # The contract's hard requirement: NOT the restart marker.
-            assert "[gateway restarted" not in (post["reply"] or ""), (
-                f"not-found was labelled with the [gateway restarted] marker: "
-                f"{post['reply']!r}"
-            )
-            # Peer-specific: the error format is "Error: peer 'X'
-            # returned <code>: <message>". The peer's message in this
-            # test is the fake peer's "task not found: <id>" string.
-            assert "task not found" in post["reply"], (
-                f"reply is not peer-specific: {post['reply']!r}"
+            assert post["state"] not in (
+                "TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED",
+            ), (
+                f"not-found error terminalized the local row: {post['state']!r}"
             )
         finally:
             empty_peer.stop()

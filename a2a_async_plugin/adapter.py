@@ -38,6 +38,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+from pathlib import Path
 import urllib.parse
 import urllib.request
 from collections import deque
@@ -156,6 +157,37 @@ def _active_profile_name() -> str:
         return get_active_profile_name() or "default"
     except Exception:
         return os.getenv("HERMES_PROFILE", "default") or "default"
+
+
+def _profile_scoped_conversations_dir() -> Path:
+    """Resolve the A2A conversation dir, in a profile-aware context.
+
+    GitHub issue #3: the task DB resolves at adapter init (profile-scoped
+    on multiplexed gateways) while a plain ``get_hermes_home()`` call from
+    the plugin's HTTP worker threads saw the DEFAULT hermes home (those
+    threads carry no profile ContextVar) — the artifacts split across two
+    roots and a2a_history/a2a_list found nothing.
+
+    The adapter calls this ONCE at __init__ — init runs inside the
+    profile's runtime scope (gateway/run_adapters.py
+    _start_one_profile_adapters), where get_hermes_home() resolves to the
+    profile home via the ContextVar override — and passes the captured
+    dir explicitly to every persist/load/list call on the inbound path.
+    ``A2A_CONVERSATIONS_DIR`` (highest precedence) is the explicit deploy
+    knob; the HERMES_HOME fallback-chain mirrors get_process_hermes_home().
+    """
+    explicit = os.getenv("A2A_CONVERSATIONS_DIR", "").strip()
+    if explicit:
+        return Path(explicit)
+    home: Optional[str] = None
+    try:
+        from hermes_constants import get_hermes_home
+        home = str(get_hermes_home())
+    except Exception:
+        home = None
+    if not home:
+        home = os.getenv("HERMES_HOME", "").strip() or str(Path.home() / ".hermes")
+    return Path(home) / "a2a_conversations"
 
 
 def _profile_home(profile: str) -> Optional[str]:
@@ -402,6 +434,15 @@ class A2AAdapter(BasePlatformAdapter):
         # fix's PR description: open PR #98937 is actively rewriting this
         # field's None-vs-empty-list semantics.)
         self._security_context = security.A2ASecurityContext.capture()
+        # Issue #3: capture the conversation dir ONCE at init, inside the
+        # profile's runtime scope (the same context that scoped A2A_PORT
+        # and the task DB root). A get_hermes_home() call from the plugin's
+        # HTTP worker threads later would resolve the DEFAULT home (those
+        # threads carry no profile ContextVar) and split the artifacts.
+        # The captured dir is passed explicitly to every persist call on
+        # the inbound path — a process-global pin leaked across multiplex
+        # profiles, so no global is set.
+        self._conversations_dir = _profile_scoped_conversations_dir()
         _port_env = None if _profile_scoped() else os.getenv("A2A_PORT")
         self.port = int(_port_env or extra.get("port", _DEFAULT_PORT))
         self.host = self._security_context.resolve_bind_host()
@@ -815,7 +856,7 @@ class A2AAdapter(BasePlatformAdapter):
         # markers surviving on disk give a peer's payload a second, cleaner
         # delivery channel on every recall. The raw text is already recorded
         # for audit fidelity by security.audit() above. See GitHub issue #5.
-        protocol.persist_message(context_id, "user", security.filter_inbound(text), task_id, peer=peer)
+        protocol.persist_message(context_id, "user", security.filter_inbound(text), task_id, peer=peer, dir=self._conversations_dir)
         protocol.metrics.inbound_total += 1
 
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
@@ -824,7 +865,7 @@ class A2AAdapter(BasePlatformAdapter):
         if not agent.get("local", True):
             reply, state = self._forward_to_profile(agent, peer, context_id, framed)
             self.tasks.complete(task_id, state, reply)
-            protocol.persist_message(context_id, "agent", reply, task_id)
+            protocol.persist_message(context_id, "agent", reply, task_id, dir=self._conversations_dir)
             security.audit("outbound", peer, task_id, reply)
             if state == protocol.STATE_COMPLETED:
                 protocol.metrics.outbound_total += 1
@@ -1003,7 +1044,7 @@ class A2AAdapter(BasePlatformAdapter):
                 state = protocol.STATE_INPUT_REQUIRED
                 reply = stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
 
-        protocol.persist_message(context_id, "agent", reply, task_id)
+        protocol.persist_message(context_id, "agent", reply, task_id, dir=self._conversations_dir)
         security.audit("outbound", peer, task_id, reply)
 
         if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):

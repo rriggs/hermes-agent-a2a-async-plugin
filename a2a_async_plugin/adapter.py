@@ -1098,26 +1098,38 @@ class A2AAdapter(BasePlatformAdapter):
     def _client_alive_check(handler):
         """Keepalive probe for the PLAIN (non-SSE) blocking send path.
 
-        Uses ``select`` + a ``MSG_PEEK`` recv on the request socket put
-        into NON-BLOCKING MODE ONCE (``setblocking(False)``): a client that
-        closed its side shows READABLE with EOF (recv returns b''); an idle
-        keep-alive socket that is readable because a follow-up request
-        arrived just shows data (left unconsumed, still alive). Never
-        pattern-flag MSG_DONTWAIT: it does not exist on Windows and makes
-        the probe misclassify live keep-alive traffic. Raises RuntimeError
-        on disconnect so _await_reply's keepalive contract fires.
+        The probe puts the request socket into NON-BLOCKING MODE for the
+        duration of the wait and RESTORES blocking mode in ``close()``
+        (round-3 review: leaving the live HTTP handler socket non-blocking
+        truncated large unbuffered ``wfile`` responses — socketserver
+        ``wbufsize=0`` short-sends without raising — and made the NEXT
+        request's ``rfile.readline()`` see EOF, killing pooled keep-alive
+        connections; both deterministic, both parity blockers).
+
+        Per tick: ``select`` + ``MSG_PEEK`` recv. EOF (b'') → RuntimeError
+        (disconnect contract with _await_reply). A buffered byte = a legal
+        keep-alive follow-up: left unconsumed, alive. BlockingIOError =
+        alive and idle. ValueError = closed socket object (fd −1 raises
+        ValueError from select, not OSError). Never MSG_DONTWAIT: absent on
+        Windows and misclassifies keep-alive traffic.
         Best-effort: a stub handler without a real socket never raises.
-        Portability note (Windows): there is no MSG_DONTWAIT there, so the
-        setblocking route is mandatory; a missing constant must degrade to
-        'keep waiting', never to a probe failure.
         """
         import select as _select
         import socket as _socket
 
+        sock = getattr(handler, "connection", None)
+        if sock is None:
+            def _noop_probe():
+                pass  # test stub / unknown transport: no signal, keep waiting
+
+            return _noop_probe, lambda: None
+
+        try:
+            sock.setblocking(False)
+        except OSError:
+            pass  # probe degrades to the per-call error path below
+
         def _check():
-            sock = getattr(handler, "connection", None)
-            if sock is None:
-                return  # test stub / unknown transport: no signal, keep waiting
             try:
                 readable, _, _ = _select.select([sock], [], [], 0)
                 if not readable:
@@ -1136,16 +1148,15 @@ class A2AAdapter(BasePlatformAdapter):
                 # EBADF / ENOTSOCK / ECONNRESET: connection gone or unusable.
                 raise RuntimeError(f"client socket no longer usable: {exc}") from exc
 
-        # Put the socket into non-blocking mode ONCE at probe creation, not
-        # per tick: MSG_PEEK on a blockable socket would block the waiter.
-        try:
-            sock = getattr(handler, "connection", None)
-            if sock is not None and hasattr(sock, "setblocking"):
-                sock.setblocking(False)
-        except OSError:
-            pass  # probe degrades to the per-call OSError path below
+        def _close_probe():
+            # RESTORE blocking mode so the handler's own buffered
+            # send/recv after the wait behave as before the probe existed.
+            try:
+                sock.setblocking(True)
+            except OSError:
+                pass  # socket already gone; nothing to restore
 
-        return _check
+        return _check, _close_probe
 
     def _await_reply(self, pending: dict, keepalive=None) -> tuple[str, str]:
         """Block until the task's future resolves (A2A v1.0 §3.2.2).
@@ -1228,10 +1239,20 @@ class A2AAdapter(BasePlatformAdapter):
             result = protocol.send_message_response(task) if v1_response else task
             return protocol.jsonrpc_result(req_id, result)
 
-        state, reply = self._await_reply(
-            pending,
-            keepalive=self._client_alive_check(handler) if handler is not None else None,
-        )
+        # Non-SSE blocking wait. The client-alive probe returns
+        # (check, close): the wait runs with the probe installed and the
+        # probe's socket-mode restore runs in ``finally`` — the handler's
+        # socket must be back in blocking mode before the JSON-RPC response
+        # is written (round-3 review blockers: silent wfile truncation and
+        # keep-alive connection death otherwise).
+        if handler is not None:
+            check, close_probe = self._client_alive_check(handler)
+            try:
+                state, reply = self._await_reply(pending, keepalive=check)
+            finally:
+                close_probe()
+        else:
+            state, reply = self._await_reply(pending)
         state, reply = self._finalize_task(pending, state, reply)
         task = protocol.build_task(
             pending["task_id"], pending["context_id"], state, reply,

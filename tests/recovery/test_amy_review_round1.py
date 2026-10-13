@@ -272,9 +272,10 @@ def test_client_alive_check_raises_on_eof_socket(monkeypatch, tmp_path):
     conn, _ = server.accept()
 
     class _H:
-        connection = conn
+        def __init__(self, sock):
+            self.connection = sock
 
-    probe = adapter_module.A2AAdapter._client_alive_check(_H())
+    probe, close_probe = adapter_module.A2AAdapter._client_alive_check(_H(conn))
     # Alive while peer is connected (no data): no raise.
     probe()
     # Wait for the peer shutdown, then expect EOF → raise.
@@ -288,6 +289,7 @@ def test_client_alive_check_raises_on_eof_socket(monkeypatch, tmp_path):
             break
     else:
         pytest.fail("probe never detected the client EOF")
+    close_probe()
 
 
 def test_uncapped_wait_with_alive_probe_ends_on_disconnect(monkeypatch, tmp_path):
@@ -314,7 +316,8 @@ def test_uncapped_wait_with_alive_probe_ends_on_disconnect(monkeypatch, tmp_path
     conn, _ = server.accept()
 
     class _H:
-        connection = conn
+        def __init__(self, sock):
+            self.connection = sock
 
     adp = _instantiate_adapter(port=_free_port())
     orig_keepalive = adapter_module._SSE_KEEPALIVE
@@ -324,10 +327,11 @@ def test_uncapped_wait_with_alive_probe_ends_on_disconnect(monkeypatch, tmp_path
                                direction="inbound", ownership="local")
         adp.tasks.set_state(rec["task_id"], STATE_WORKING)
         pending = _pending(adp, rec["task_id"], rec["context_id"])
-        state, reply = adp._await_reply(
-            pending,
-            keepalive=adapter_module.A2AAdapter._client_alive_check(_H()),
-        )
+        check, close_probe = adapter_module.A2AAdapter._client_alive_check(_H(conn))
+        try:
+            state, reply = adp._await_reply(pending, keepalive=check)
+        finally:
+            close_probe()
         assert state == STATE_CANCELED
         t.join(timeout=3)
     finally:
@@ -342,8 +346,9 @@ def test_client_alive_check_noop_for_stub_handler():
     class _Stub:
         pass  # no .connection
 
-    probe = adapter_module.A2AAdapter._client_alive_check(_Stub())
+    probe, close_probe = adapter_module.A2AAdapter._client_alive_check(_Stub())
     probe()  # must not raise
+    close_probe()
 
 
 def test_reply_timeout_garbage_logs_error(monkeypatch, caplog):

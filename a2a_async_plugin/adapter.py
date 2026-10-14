@@ -88,6 +88,11 @@ def _reply_timeout() -> Optional[float]:
     try:
         return max(1.0, float(raw))
     except (ValueError, TypeError):
+        # Fail LOUD, not silent: a typo'd value that silently fell back to
+        # uncapped would look like 'no cap' when the operator asked for a cap.
+        logger.error(
+            "A2A: invalid A2A_REPLY_TIMEOUT=%r — ignoring it (blocking wait will be UNCAPPED). "
+            "Expected seconds as a number, e.g. 300 or 7.5", raw)
         return None
 
 
@@ -413,7 +418,7 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             return
 
         if operation == "send":
-            self._json(200, adapter._rpc_message_send(req_id, params, identity, agent=agent, v1_response=is_v1))
+            self._json(200, adapter._rpc_message_send(req_id, params, identity, agent=agent, v1_response=is_v1, handler=self))
             return
         if operation == "stream":
             adapter._rpc_message_stream(self, req_id, params, identity, agent=agent)
@@ -1078,12 +1083,80 @@ class A2AAdapter(BasePlatformAdapter):
             protocol.metrics.outbound_total += 1
             protocol.metrics.tasks_completed += 1
             protocol.metrics.record_latency(time.time() - pending["started"])
+        elif state == protocol.STATE_CANCELED:
+            # Caller-side withdrawal is not an agent failure — count it
+            # separately so tasks_failed stays an honest agent-health signal.
+            protocol.metrics.tasks_canceled += 1
         else:
             protocol.metrics.tasks_failed += 1
 
         self.tasks.complete(task_id, state, reply)
         self._send_push_notification(task_id, context_id, reply, state)
         return state, reply
+
+    @staticmethod
+    def _client_alive_check(handler):
+        """Keepalive probe for the PLAIN (non-SSE) blocking send path.
+
+        The probe puts the request socket into NON-BLOCKING MODE for the
+        duration of the wait and RESTORES blocking mode in ``close()``
+        (round-3 review: leaving the live HTTP handler socket non-blocking
+        truncated large unbuffered ``wfile`` responses — socketserver
+        ``wbufsize=0`` short-sends without raising — and made the NEXT
+        request's ``rfile.readline()`` see EOF, killing pooled keep-alive
+        connections; both deterministic, both parity blockers).
+
+        Per tick: ``select`` + ``MSG_PEEK`` recv. EOF (b'') → RuntimeError
+        (disconnect contract with _await_reply). A buffered byte = a legal
+        keep-alive follow-up: left unconsumed, alive. BlockingIOError =
+        alive and idle. ValueError = closed socket object (fd −1 raises
+        ValueError from select, not OSError). Never MSG_DONTWAIT: absent on
+        Windows and misclassifies keep-alive traffic.
+        Best-effort: a stub handler without a real socket never raises.
+        """
+        import select as _select
+        import socket as _socket
+
+        sock = getattr(handler, "connection", None)
+        if sock is None:
+            def _noop_probe():
+                pass  # test stub / unknown transport: no signal, keep waiting
+
+            return _noop_probe, lambda: None
+
+        try:
+            sock.setblocking(False)
+        except OSError:
+            pass  # probe degrades to the per-call error path below
+
+        def _check():
+            try:
+                readable, _, _ = _select.select([sock], [], [], 0)
+                if not readable:
+                    return
+                data = sock.recv(1, _socket.MSG_PEEK)
+                if data == b"":
+                    raise RuntimeError("client disconnected (EOF on request socket)")
+                # A pending byte (a legal keep-alive follow-up): still
+                # connected; do not consume, do not cancel.
+            except BlockingIOError:
+                return  # no data buffered: alive and idle
+            except ValueError:
+                # select()/recv on a closed Python socket object (fd −1).
+                raise RuntimeError("client socket no longer usable (closed)")
+            except OSError as exc:
+                # EBADF / ENOTSOCK / ECONNRESET: connection gone or unusable.
+                raise RuntimeError(f"client socket no longer usable: {exc}") from exc
+
+        def _close_probe():
+            # RESTORE blocking mode so the handler's own buffered
+            # send/recv after the wait behave as before the probe existed.
+            try:
+                sock.setblocking(True)
+            except OSError:
+                pass  # socket already gone; nothing to restore
+
+        return _check, _close_probe
 
     def _await_reply(self, pending: dict, keepalive=None) -> tuple[str, str]:
         """Block until the task's future resolves (A2A v1.0 §3.2.2).
@@ -1109,21 +1182,29 @@ class A2AAdapter(BasePlatformAdapter):
             None if cap is None else pending["started"] + cap
         )
         while True:
+            # Drain a boundary-arrived reply first: result(timeout=0) still
+            # returns immediately if the future is done, so a reply that
+            # landed exactly at the cap edge is delivered, not discarded.
+            if fut.done():
+                try:
+                    return fut.result(timeout=0)
+                except Exception:
+                    return (protocol.STATE_FAILED, "[agent did not reply in time]")
             wait = _SSE_KEEPALIVE if keepalive else None
             if deadline is not None:
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     if keepalive:
-                        return (protocol.STATE_CANCELED, "[blocked send abandoned: reply timeout expired]")
-                    return (protocol.STATE_CANCELED, "[agent did not reply in time]")
+                        return (protocol.STATE_CANCELED, "[canceled by caller: blocked send abandoned, reply timeout expired]")
+                    return (protocol.STATE_CANCELED, "[canceled by caller: reply timeout expired]")
                 wait = remaining if wait is None else min(wait, remaining)
             try:
                 return fut.result(timeout=wait)
             except FuturesTimeout:
                 if deadline is not None and time.time() >= deadline:
                     if keepalive:
-                        return (protocol.STATE_CANCELED, "[blocked send abandoned: reply timeout expired]")
-                    return (protocol.STATE_CANCELED, "[agent did not reply in time]")
+                        return (protocol.STATE_CANCELED, "[canceled by caller: blocked send abandoned, reply timeout expired]")
+                    return (protocol.STATE_CANCELED, "[canceled by caller: reply timeout expired]")
                 if keepalive:
                     try:
                         keepalive()
@@ -1132,7 +1213,7 @@ class A2AAdapter(BasePlatformAdapter):
             except Exception:
                 return (protocol.STATE_FAILED, "[agent did not reply in time]")
 
-    def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
+    def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False, handler=None) -> dict:
         terminal, pending = self._prepare_task(params, peer, agent=agent)
         if terminal is not None:
             result = protocol.send_message_response(terminal) if v1_response else terminal
@@ -1158,7 +1239,20 @@ class A2AAdapter(BasePlatformAdapter):
             result = protocol.send_message_response(task) if v1_response else task
             return protocol.jsonrpc_result(req_id, result)
 
-        state, reply = self._await_reply(pending)
+        # Non-SSE blocking wait. The client-alive probe returns
+        # (check, close): the wait runs with the probe installed and the
+        # probe's socket-mode restore runs in ``finally`` — the handler's
+        # socket must be back in blocking mode before the JSON-RPC response
+        # is written (round-3 review blockers: silent wfile truncation and
+        # keep-alive connection death otherwise).
+        if handler is not None:
+            check, close_probe = self._client_alive_check(handler)
+            try:
+                state, reply = self._await_reply(pending, keepalive=check)
+            finally:
+                close_probe()
+        else:
+            state, reply = self._await_reply(pending)
         state, reply = self._finalize_task(pending, state, reply)
         task = protocol.build_task(
             pending["task_id"], pending["context_id"], state, reply,
@@ -1274,13 +1368,18 @@ class A2AAdapter(BasePlatformAdapter):
             if fut is None:
                 self._sse_write(handler, protocol.sse_done())
                 return
-            deadline = time.time() + _reply_timeout()
+            # Cap is opt-in (issue #1 / §3.2.2): unset means no artificial
+            # deadline — the stream stays open until the task settles, the
+            # keepalive write fails (client gone), or shutdown fails the row.
+            # A capped expiry falls back to the row's current state snapshot.
+            cap = _reply_timeout()
+            deadline: Optional[float] = None if cap is None else time.time() + cap
             while True:
                 try:
                     state, reply = fut.result(timeout=_SSE_KEEPALIVE)
                     break
                 except FuturesTimeout:
-                    if time.time() >= deadline:
+                    if deadline is not None and time.time() >= deadline:
                         state, reply = rec["state"], rec.get("reply", "")
                         break
                     self._sse_write(handler, ": keepalive\n\n")

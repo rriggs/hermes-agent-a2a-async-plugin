@@ -6,7 +6,8 @@ This plugin extends the built-in A2A integration without replacing it. It contri
 
 - `a2a_submit` -- submit a task without waiting
 - `a2a_get_task` -- retrieve a task snapshot
-- `a2a_await` -- poll until a task reaches a terminal state
+- `a2a_await` -- poll until a task reaches a terminal state, or watch it in the background
+- `a2a_watch_cancel` -- stop a background watch (local polling only)
 - `a2a_cancel` -- request cancellation
 - `a2a_steer` -- queue a non-blocking continuation on an existing context
 
@@ -29,10 +30,53 @@ After installation, enable `a2a` for the relevant platform/profile if it is not 
 a2a_submit(agent="researcher", message="Investigate ...")
 # Continue useful work
 a2a_get_task(agent="researcher", task_id="...")
-a2a_await(agent="researcher", task_id="...")
+a2a_await(agent="researcher", task_id="...")            # block until done
+a2a_await(agent="researcher", task_id="...", background=true)   # or get the result later
 ```
 
 Use `a2a_steer` with the `context_id` returned by an earlier A2A exchange when a running conversation needs a correction or follow-up. It returns a distinct task ID immediately.
+
+## Background awaits
+
+`a2a_await(background=true)` returns immediately with a `watch_id`. The watch persists in the
+profile's `a2a_tasks.db`, polls the peer off-turn, and publishes the result through Hermes'
+durable plugin completion publisher (`PluginContext.capture_completion_target` /
+`publish_completion`), so the result arrives as a new turn in the session that started the work --
+after the current turn ends, never in the middle of one.
+
+```text
+a2a_await(agent="researcher", task_id="task-1", background=true)
+a2a_await(background=true, tasks=[{agent: "researcher", task_id: "task-1"},
+                                  {agent: "builder", task_id: "task-9"}])
+```
+
+Semantics:
+
+- One completion per watched task, published the moment the peer reports a terminal state
+  (`completed`, `failed`, `canceled`, `rejected`). Sibling tasks keep being watched.
+- Duplicate observations and watcher restarts do not notify twice: the event id is
+  `a2a:<watch>:<peer>:<task>:<state>` and Hermes deduplicates it per session.
+- `input-required` is not terminal. It publishes one attention-needed event and pauses that task
+  until the caller sends a follow-up (`a2a_submit` with the task's `context_id`) and starts a new
+  watch.
+- A watch is leased in SQLite before it is polled, so several processes on one profile (CLI,
+  gateway, TUI) never poll the same watch concurrently, and a crashed process's watches are
+  picked up by the next one.
+- Watches survive a restart: they are rehydrated when the plugin loads. Pending completions are
+  replayed by Hermes through its normal completion-delivery policy.
+- `a2a_watch_cancel(watch_id)` stops local polling only. The remote task keeps running;
+  `a2a_cancel(agent, task_id)` remains the separate, best-effort remote cancellation request.
+- A local watch expiry (default 7 days), cancellation, or repeated polling failure describes the
+  watcher, not the peer: it publishes a `watch-error` / `watch-expired` notice and never marks the
+  remote task failed. After 12 consecutive polling errors with exponential backoff the task is
+  given up on (still not failed).
+
+Tuning: `A2A_WATCH_INTERVAL` (seconds between polls, default 5, minimum 2) and `A2A_WATCH_TTL`
+(watch lifetime in seconds, default 604800).
+
+Requirement: background mode needs a Hermes runtime that exposes the plugin completion publisher.
+On an older runtime the tool returns a clear error instead of starting a watch that could never
+deliver; blocking `a2a_await` and `a2a_get_task` keep working there.
 
 Peers are configured in `config.yaml` under `a2a_agents`. Authentication and endpoint configuration remain owned by the built-in A2A integration.
 
@@ -68,16 +112,25 @@ The plugin uses the stdlib HTTP transport and the A2A JSON-RPC protocol. It has 
 |---|---|
 | `plugin.yaml` | Hermes plugin manifest |
 | `__init__.py` | Hermes plugin entry point; delegates to the implementation package |
-| `a2a_async/tools.py` | Async tool schemas, handlers, and registration |
-| `a2a_async/protocol.py` | A2A protocol helpers and durable task store |
-| `a2a_async/security.py` | Outbound redaction and audit helpers |
+| `a2a_async_plugin/tools.py` | Async tool schemas, handlers, and registration |
+| `a2a_async_plugin/protocol.py` | A2A protocol helpers and durable task/watch store |
+| `a2a_async_plugin/watches.py` | Background watch manager: polling, leases, completion publishing |
+| `a2a_async_plugin/security.py` | Outbound redaction and audit helpers |
 
 ## Development
 
 Run syntax checks with:
 
 ```bash
-python -m py_compile a2a_async/*.py
+python -m py_compile a2a_async_plugin/*.py
+python -m pytest tests/test_watches.py -q
+```
+
+The cross-repo test (`test_watch_publishes_through_the_real_hermes_publisher`) skips unless a
+Hermes checkout with its dependencies is importable; run it against one with:
+
+```bash
+PYTHONPATH=/path/to/hermes-agent /path/to/hermes-agent/.venv/bin/python -m pytest tests/test_watches.py -q
 ```
 
 The plugin is intended to be tested through Hermes' real plugin discovery path with a temporary `HERMES_HOME`. Do not run it alongside another plugin that registers the same async tool names.

@@ -134,7 +134,7 @@ def test_session_hooks_release_on_end_and_reclaim_with_a_note_on_start():
             self.hooks: dict = {}
             self.notes: list[str] = []
 
-        def subscribe(self, event, callback):
+        def register_hook(self, event, callback):
             self.hooks.setdefault(event, []).append(callback)
 
         def queue_context_note(self, text, key=""):
@@ -173,7 +173,7 @@ def test_resume_notes_a_lost_task_when_another_session_adopted_it():
             self.hooks: dict = {}
             self.notes: list[str] = []
 
-        def subscribe(self, event, callback):
+        def register_hook(self, event, callback):
             self.hooks.setdefault(event, []).append(callback)
 
         def queue_context_note(self, text, key=""):

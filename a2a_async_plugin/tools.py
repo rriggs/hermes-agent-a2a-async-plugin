@@ -965,8 +965,15 @@ def _on_session_end(ctx: Any, payload: dict) -> None:
 
 
 def _install_session_hooks(ctx: Any) -> None:
-    subscribe = getattr(ctx, "subscribe", None)
-    if not callable(subscribe):
+    """Register session-boundary hooks.
+
+    These are lifecycle hooks (``invoke_hook``), not plugin-bus events: ``ctx.subscribe`` listens on
+    ``ctx.emit`` traffic and never receives them, so a plugin that subscribes here would keep
+    polling for sessions that ended.
+    """
+    register = getattr(ctx, "register_hook", None)
+    if not callable(register):
+        logger.debug("A2A: runtime has no register_hook; task ownership will not auto-release")
         return
 
     def start(**payload: Any) -> None:
@@ -978,9 +985,9 @@ def _install_session_hooks(ctx: Any) -> None:
     for event, handler in (("on_session_start", start), ("on_session_end", end),
                            ("on_session_finalize", end), ("on_session_reset", end)):
         try:
-            subscribe(event, handler)
+            register(event, handler)
         except Exception:
-            logger.debug("A2A: could not subscribe to %s", event, exc_info=True)
+            logger.debug("A2A: could not register %s", event, exc_info=True)
 
 
 def a2a_cancel(args: dict, **_: Any) -> str:

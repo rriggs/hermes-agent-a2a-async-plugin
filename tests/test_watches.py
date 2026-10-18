@@ -432,6 +432,21 @@ def test_rehydration_resumes_a_persisted_watch(monkeypatch):
     assert "after restart" in published["content"]
 
 
+def test_the_watch_store_follows_the_plugins_profile_home(tmp_path, monkeypatch):
+    """A secondary profile's watcher must not write into the launch profile's database."""
+    from types import SimpleNamespace
+
+    profile_home = tmp_path / "profiles" / "secondary"
+    profile_home.mkdir(parents=True)
+
+    class ProfileCtx(FakeCtx):
+        _manager = SimpleNamespace(home_path=profile_home)
+
+    monkeypatch.setattr(tools, "_CTX", ProfileCtx())
+    manager = tools._watch_manager()
+    assert manager.store.db_path == str(profile_home / "a2a_tasks.db")
+
+
 def test_register_tools_resumes_only_when_a_watch_database_exists(tmp_path):
     ctx = FakeCtx()
     # No database yet: discovery must not create one or start a poller.

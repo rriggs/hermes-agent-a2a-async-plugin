@@ -436,12 +436,24 @@ _CTX: Any = None
 _WATCH_MANAGER: Any = None
 
 
+def _plugin_db_path(ctx: Any) -> Optional[str]:
+    """The task database of the profile this plugin was loaded for, or None for the default.
+
+    ``PluginContext._manager.home_path`` is the profile's home; the ambient ``HERMES_HOME`` of a
+    multiplexed gateway is the LAUNCH profile's, so a watcher started from a secondary profile's
+    session would otherwise write its watches into the wrong profile.
+    """
+    home = getattr(getattr(ctx, "_manager", None), "home_path", None)
+    return os.path.join(str(home), "a2a_tasks.db") if home else None
+
+
 def _watch_manager(ctx: Any = None):
     """The process-wide watch poller, created against the plugin context it was registered with."""
     global _WATCH_MANAGER
     if _WATCH_MANAGER is None:
         from . import watches
-        _WATCH_MANAGER = watches.WatchManager(ctx if ctx is not None else _CTX)
+        ctx = ctx if ctx is not None else _CTX
+        _WATCH_MANAGER = watches.WatchManager(ctx, store=watches.WatchStore(_plugin_db_path(ctx)))
     return _WATCH_MANAGER
 
 

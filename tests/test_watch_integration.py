@@ -133,18 +133,28 @@ def test_background_await_delivers_through_real_hermes(hermetic_home, peer, monk
         assert result.startswith("[watch watch_"), result
         watch_id = result.split()[1]
 
-        # The watch's own thread polls the peer and publishes through the real publisher.
+        # The watch's own thread polls the peer and publishes through the real publisher. The
+        # completion queue is process-global, so wait for THIS watch's event and leave any
+        # unrelated events (another test's completions) where they were.
         queue = process_registry.completion_queue
-        assert _wait(lambda: not queue.empty()), "the watch never published a completion"
-        events, queue_event = [], queue
-        while True:
-            try:
-                events.append(queue.get_nowait())
-            except Exception:
-                break
-        event = next(e for e in events if e.get("type") == "plugin_completion")
-        for evt in events:  # hand them back for the session drain below
-            queue_event.put(evt)
+        expected = f"a2a:{watch_id}:peer:t1:completed"
+        deadline = time.time() + 20.0
+        event, others = None, []
+        while time.time() < deadline and event is None:
+            while True:
+                try:
+                    candidate = queue.get_nowait()
+                except Exception:
+                    break
+                if candidate.get("event_id") == expected:
+                    event = candidate
+                else:
+                    others.append(candidate)
+            if event is None:
+                time.sleep(0.1)
+        assert event is not None, f"the watch never published {expected}"
+        for evt in others + [event]:  # restore the queue for the session drain below
+            queue.put(evt)
         assert event["plugin_id"] == "a2a-async"
         assert event["event_id"] == f"a2a:{watch_id}:peer:t1:completed"
         assert "peer finished t1" in event["content"]
@@ -161,13 +171,13 @@ def test_background_await_delivers_through_real_hermes(hermetic_home, peer, monk
             session_key="agent:main:telegram:dm:42",
             owns_event=lambda e: e.get("session_key") == "agent:main:telegram:dm:42")
         assert [(e.get("event_id"), text) for e, text in drained], "the completion was not drained"
-        evt, text = next((e, t) for e, t in drained if e.get("type") == "plugin_completion")
+        evt, text = next((e, t) for e, t in drained if e.get("event_id") == expected)
         assert "peer finished t1" in text and "plugin a2a-async" in text
         claim = claim_event_delivery(evt, "integration:cli")
         assert claim
         complete_event_delivery(evt, claim)
         assert pc._existing_completion(
-            "a2a-async", "agent:main:telegram:dm:42", event["event_id"])["delivery_state"] == "delivered"
+            "a2a-async", "agent:main:telegram:dm:42", expected)["delivery_state"] == "delivered"
 
         # Cancelling a watch that is still polling stops it; the remote task is untouched and no
         # remote cancellation request is sent.

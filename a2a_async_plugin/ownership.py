@@ -112,6 +112,10 @@ class OwnershipStore:
                           unowned_since=?
                     WHERE task_id=? AND owner_session_id=?""",
                 (session_id, now, now, task_id, session_id))
+            if cur.rowcount == 1:
+                # Same transaction as the ownership change: a publication cannot slip through
+                # between "released" and "its undelivered events were dropped".
+                self._drop_publications(con, task_id)
             return cur.rowcount == 1
 
     def release_all(self, session_id: str, now: Optional[float] = None) -> int:
@@ -120,12 +124,16 @@ class OwnershipStore:
             return 0
         now = time.time() if now is None else now
         with self._session() as con:
+            owned = [row["task_id"] for row in con.execute(
+                "SELECT task_id FROM a2a_tasks WHERE owner_session_id=?", (session_id,))]
             cur = con.execute(
                 """UPDATE a2a_tasks
                       SET owner_session_id='', released_by_session_id=?, released_at=?,
                           unowned_since=?
                     WHERE owner_session_id=?""",
                 (session_id, now, now, session_id))
+            for task_id in owned:
+                self._drop_publications(con, task_id)
             return cur.rowcount
 
     def reclaim(self, session_id: str, now: Optional[float] = None) -> tuple[list[str], list[str]]:
@@ -160,6 +168,14 @@ class OwnershipStore:
                     "UPDATE a2a_tasks SET released_by_session_id='' WHERE task_id=?",
                     (task_id,))
         return reclaimed, lost
+
+    @staticmethod
+    def _drop_publications(con: sqlite3.Connection, task_id: str) -> None:
+        con.execute(
+            """DELETE FROM a2a_watch_publications
+                WHERE published_at IS NULL
+                  AND json_extract(metadata_json, '$.task_id')=?""",
+            (task_id,))
 
     def owner(self, task_id: str) -> str:
         with self._session() as con:
@@ -260,20 +276,27 @@ class OwnershipStore:
                 cancel.append(rec)
         return cancel, abandon
 
-    def mark_cancel_requested(self, task_id: str, now: Optional[float] = None) -> None:
+    def mark_cancel_requested(self, task_id: str, now: Optional[float] = None) -> bool:
+        """Record the auto-cancel only if the task is STILL unowned; False means adopt happened."""
         now = time.time() if now is None else now
         with self._session() as con:
-            con.execute(
-                "UPDATE a2a_tasks SET cancel_requested_at=? WHERE task_id=?", (now, task_id))
+            cur = con.execute(
+                """UPDATE a2a_tasks SET cancel_requested_at=?
+                    WHERE task_id=? AND owner_session_id='' AND released_by_session_id!=''""",
+                (now, task_id))
+            return cur.rowcount == 1
 
-    def abandon(self, task_id: str, now: Optional[float] = None) -> None:
-        """Terminally retire an unowned task record and its queued messages."""
+    def abandon(self, task_id: str, now: Optional[float] = None) -> bool:
+        """Retire an unowned task and its backlog. False when it was adopted meanwhile."""
         now = time.time() if now is None else now
         with self._session() as con:
-            con.execute(
+            cur = con.execute(
                 """UPDATE a2a_tasks
                       SET state=?, remote_state=?, reply=?, completed_at=?
-                    WHERE task_id=?""",
+                    WHERE task_id=? AND owner_session_id='' AND released_by_session_id!=''""",
                 (protocol.STATE_CANCELED, protocol.STATE_CANCELED,
                  "abandoned after the unowned-task TTL", now, task_id))
+            if cur.rowcount != 1:
+                return False
             con.execute("DELETE FROM a2a_task_messages WHERE task_id=?", (task_id,))
+            return True

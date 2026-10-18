@@ -1030,6 +1030,10 @@ class WatchManager:
             return
         for rec in cancel:
             task_id = str(rec["task_id"])
+            # Fence first: the selection is a snapshot, and an adoption may have happened since.
+            # Claiming the action atomically is what proves the task is still unowned.
+            if not self.ownership.mark_cancel_requested(task_id, now):
+                continue
             peer_name = str(rec["peer"] or "")
             peer = tools._resolve_peer(peer_name)
             if peer and peer.get("url"):
@@ -1038,15 +1042,14 @@ class WatchManager:
                     logger.info("A2A: cancelled unowned task %s on %s", task_id, peer_name)
                 except Exception as exc:
                     logger.debug("A2A: CancelTask for unowned %s failed: %s", task_id, exc)
-            self.ownership.mark_cancel_requested(task_id, now)
             self.ownership.add_message(
                 task_id, f"auto-cancel:{int(now)}", "error",
                 "This task was unowned for longer than the auto-cancellation timeout, so the "
                 "watcher asked the peer to cancel it. Its remote state may still be working.")
         for rec in abandon:
             task_id = str(rec["task_id"])
-            self.ownership.abandon(task_id, now)
-            logger.info("A2A: abandoned unowned task %s after the TTL", task_id)
+            if self.ownership.abandon(task_id, now):
+                logger.info("A2A: abandoned unowned task %s after the TTL", task_id)
 
     def _reconcile_local_task(self, task_id: str, raw_state: str, text: str,
                               context_id: str, peer: str) -> None:

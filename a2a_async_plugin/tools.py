@@ -510,11 +510,20 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
         return (f"Error: unknown agent '{unknown[0]}'. Configure it under 'a2a_agents' in "
                 f"config.yaml or pass a full http(s):// URL.")
     # Ownership first: only unowned (or already ours) tasks may be watched. A refusal here names
-    # the task instead of starting a watch that could never deliver.
+    # the task instead of starting a watch that could never deliver. Acquisitions made by THIS
+    # call are rolled back on failure, so a refused batch does not leave half the tasks claimed.
+    acquired: list[str] = []
     for agent_name, task_id in entries:
+        was_unowned = session_id and _ownership().owner(task_id) in ("", session_id)
         ok, refusal = _acquire_task(task_id, session_id or "", agent_name)
         if not ok:
+            if acquired and session_id:
+                store = _ownership()
+                for claimed in acquired:
+                    store.release(claimed, session_id)
             return refusal
+        if session_id and was_unowned:
+            acquired.append(task_id)
     ctx = _CTX
     if not _completion_capable(ctx):
         return (

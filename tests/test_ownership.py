@@ -305,6 +305,66 @@ def test_blocking_await_returns_progress_it_consumed(monkeypatch):
     assert "done" in out
 
 
+def test_timer_actions_do_not_touch_a_task_adopted_after_selection():
+    protocol.TaskStore().create("t1", "ctx", "peer", direction="outbound",
+                                remote_state=protocol.STATE_WORKING)
+    store = _store()
+    store.acquire("t1", SESSION_A)
+    store.add_message("t1", "m1", "result", "the answer")
+    store.release_all(SESSION_A)
+
+    import time as _time
+    now = _time.time() + 86_402.0
+    cancel, abandon = store.unowned_due(now, cancel_after_s=86_400.0, ttl_s=604_800.0)
+    assert [r["task_id"] for r in cancel] == ["t1"]
+
+    store.acquire("t1", SESSION_B)  # adopted between selection and action
+
+    assert store.mark_cancel_requested("t1") is False, "no CancelTask for an owned task"
+    assert store.abandon("t1") is False, "no abandonment for an owned task"
+    assert store.owner("t1") == SESSION_B
+    assert [m["message_id"] for m in store.queued("t1")] == ["m1"], "the adopted backlog survives"
+
+
+def test_a_refused_multi_task_await_rolls_back_earlier_claims(monkeypatch):
+    _task("t1")
+    _task("t2")
+    _store().acquire("t2", SESSION_B)
+
+    class Ctx:
+        def capture_completion_target(self, *, session_id=None):
+            return {"target_id": "pct_test"}
+
+        def publish_completion(self, **kwargs):
+            return {"status": "queued"}
+
+    class Manager:
+        def start(self):
+            return self
+
+        def cancel_session(self, session_id, task_ids=None):
+            return 0
+
+        def add(self, **kwargs):
+            return {"watch_id": "watch_test"}
+
+        def ttl_s(self):
+            return 3600.0
+
+    monkeypatch.setattr(tools, "_CTX", Ctx())
+    monkeypatch.setattr(tools, "_completion_capable", lambda ctx: True)
+    monkeypatch.setattr(tools, "_watch_manager", lambda ctx=None: Manager())
+    monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": "http://peer.invalid"})
+
+    out = tools._start_background_watch(
+        {"tasks": [{"agent": "peer", "task_id": "t1"},
+                   {"agent": "peer", "task_id": "t2"}]}, SESSION_A)
+
+    assert "owned by another session" in out
+    assert _store().owner("t1") == "", "a refused batch must not leave earlier tasks claimed"
+    assert _store().owner("t2") == SESSION_B
+
+
 def test_a_list_shows_ownership_per_task(monkeypatch):
     _task("t1")
     _task("t2")

@@ -17,8 +17,23 @@ PLUGIN="${E2E_PLUGIN:-$(cd "$HERE/../.." && pwd)}"
 IMAGE="${E2E_IMAGE:-hermes-e2e:local}"
 
 mkdir -p "$DATA"
-echo "[run] image=$IMAGE data=$DATA plugin=$PLUGIN"
-rm -rf "$DATA"/*
+DATA_REAL="$(realpath -m "$DATA")"
+# This script clears its output directory. Only a dedicated e2e directory may be cleared: never
+# /, $HOME, the repository or the harness, and never a directory that holds something the script
+# did not create (marker file). A typo such as `./run-container.sh .` must fail, not delete code.
+case "$DATA_REAL" in
+  /|/home|/usr|/etc|/var|/tmp|"$HOME"|"$PLUGIN"|"$PLUGIN"/*|"$HERE"|"$HERE"/*)
+    echo "[run] refusing to use '$DATA_REAL' as an e2e data directory" >&2
+    exit 2
+    ;;
+esac
+if [ -n "$(ls -A "$DATA_REAL" 2>/dev/null)" ] && [ ! -f "$DATA_REAL/.e2e-data" ]; then
+  echo "[run] refusing to clear '$DATA_REAL': not an e2e directory (missing .e2e-data marker)" >&2
+  exit 2
+fi
+touch "$DATA_REAL/.e2e-data"
+find "$DATA_REAL" -mindepth 1 -maxdepth 1 ! -name '.e2e-data' -exec rm -rf {} +
+echo "[run] image=$IMAGE data=$DATA_REAL plugin=$PLUGIN"
 
 set +e
 podman run --rm \

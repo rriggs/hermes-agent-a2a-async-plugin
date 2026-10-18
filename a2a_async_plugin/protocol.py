@@ -38,7 +38,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "1.0"
-A2A_TASK_SCHEMA_VERSION = 3
+A2A_TASK_SCHEMA_VERSION = 4
 
 # A2A v1.0 task lifecycle states.
 STATE_SUBMITTED = "TASK_STATE_SUBMITTED"
@@ -627,7 +627,8 @@ class TaskStore:
         con.execute("PRAGMA journal_mode=WAL")
         return con
 
-    def _ensure_db(self, con: "sqlite3.Connection") -> None:
+    @staticmethod
+    def _ensure_db(con: "sqlite3.Connection") -> None:
         con.execute("BEGIN IMMEDIATE")
         try:
             version = int(con.execute("PRAGMA user_version").fetchone()[0])
@@ -660,6 +661,39 @@ class TaskStore:
             ):
                 if name not in columns:
                     con.execute(f"ALTER TABLE a2a_tasks ADD COLUMN {name} {definition}")
+            # Background watches (a2a_async_plugin/watches.py, schema v4). Additive tables only: a
+            # v3 database gains them in place, and an older plugin reading a v4 database still sees
+            # every column it knows.
+            con.execute(
+                """CREATE TABLE IF NOT EXISTS a2a_watches (
+                watch_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL DEFAULT '',
+                target_json TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                last_error TEXT NOT NULL DEFAULT '',
+                lease_owner TEXT NOT NULL DEFAULT '',
+                lease_until REAL NOT NULL DEFAULT 0
+            )"""
+            )
+            con.execute(
+                """CREATE TABLE IF NOT EXISTS a2a_watch_items (
+                watch_id TEXT NOT NULL,
+                peer TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT '',
+                short_state TEXT NOT NULL DEFAULT '',
+                published_state TEXT NOT NULL DEFAULT '',
+                context_id TEXT NOT NULL DEFAULT '',
+                errors INTEGER NOT NULL DEFAULT 0,
+                next_poll_at REAL NOT NULL DEFAULT 0,
+                completed_at REAL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (watch_id, peer, task_id)
+            )"""
+            )
             if version < A2A_TASK_SCHEMA_VERSION:
                 con.execute(f"PRAGMA user_version = {A2A_TASK_SCHEMA_VERSION}")
             elif version > A2A_TASK_SCHEMA_VERSION:

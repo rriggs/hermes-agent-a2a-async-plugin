@@ -707,6 +707,55 @@ def test_releasing_every_task_also_removes_a_multi_task_expiry_notice():
     assert manager.flush_publications(now=20_000.0) == 0
 
 
+def test_a_notice_written_after_release_is_never_published():
+    """The outbox insert and the ownership check are separate: the guard re-checks at publish."""
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)))
+    watch = _add(manager, tasks=(("peer", "t1"),))
+    assert manager.ownership.release("t1", SESSION_ID)
+
+    with _store()._session() as con:
+        con.execute(
+            "INSERT INTO a2a_watch_publications (event_id, watch_id, content, metadata_json,"
+            " created_at) VALUES ('evt-late', ?, 'result', ?, ?)",
+            (watch["watch_id"], '{"source": "a2a", "task_id": "t1", "state": "completed"}', 1.0))
+
+    assert manager.flush_publications(now=10_000.0) == 0
+    assert manager.ctx.published == []
+    assert _outbox(watch["watch_id"], pending_only=True) == []
+
+
+def test_the_backlog_replay_refuses_a_task_another_session_owns(monkeypatch):
+    ctx = FakeCtx()
+    monkeypatch.setattr(tools, "_CTX", ctx)
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)))
+    monkeypatch.setattr(tools, "_watch_manager", lambda ctx=None: manager)
+    _add(manager, tasks=(("peer", "t1"),))
+    assert manager.ownership.release("t1", SESSION_ID)
+    assert manager.ownership.acquire("t1", "sess-other")
+
+    accepted = tools._publish_queued(
+        ctx, "t1", "peer", SESSION_ID, {"target_id": "pct_test"},
+        [{"message_id": "m1", "kind": "result", "text": "secret result"}])
+
+    assert accepted == [] and ctx.published == []
+
+
+def test_history_messages_are_recorded_even_without_a_status_message(monkeypatch):
+    ctx = FakeCtx()
+    monkeypatch.setattr(tools, "_CTX", ctx)
+    payload = {
+        "status": {"state": protocol.STATE_COMPLETED},
+        "artifacts": [],
+        "history": [
+            {"messageId": "h1", "role": "agent", "parts": [{"kind": "text", "text": "halfway"}]},
+        ],
+    }
+
+    queued = tools._record_observation("t-hist", payload, "peer")
+
+    assert queued[0]["message_id"] == "h1", "history is a message stream too"
+
+
 def test_release_drops_an_aggregate_notice_naming_peer_slash_task():
     """Production expiry notices list tasks as "peer/task", not bare ids."""
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)))

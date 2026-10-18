@@ -539,16 +539,65 @@ class WatchStore:
         try:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
-                """SELECT p.*, w.target_json FROM a2a_watch_publications p
+                """SELECT p.*, w.target_json, w.session_id AS watch_session_id
+                     FROM a2a_watch_publications p
                      JOIN a2a_watches w ON w.watch_id = p.watch_id
                     WHERE p.event_id=? AND p.published_at IS NULL""",
                 (event_id,)).fetchone()
+            if row is not None and not self._publication_authorized(con, row):
+                # The task was released (and possibly adopted) after this row was written. The
+                # message stays queued for the next owner; publishing it would deliver work into
+                # the session that gave it up.
+                logger.info("A2A: dropping %s; its task left session %s", event_id,
+                            row["watch_session_id"])
+                con.execute("DELETE FROM a2a_watch_publications WHERE event_id=?", (event_id,))
+                row = None
             yield con, (dict(row) if row else None)
         except Exception:
             con.rollback()
             raise
         else:
             con.commit()
+        finally:
+            con.close()
+
+    @staticmethod
+    def _publication_authorized(con, row) -> bool:
+        """True while the session that owns the watch still owns every task the row names."""
+        session = str(row["watch_session_id"] or "")
+        task_ids: list[str] = []
+        try:
+            meta = json.loads(row["metadata_json"] or "{}")
+        except (TypeError, ValueError):
+            meta = {}
+        if meta.get("task_id"):
+            task_ids.append(str(meta["task_id"]))
+        for listed in meta.get("tasks") or []:
+            task_ids.append(str(listed).rsplit("/", 1)[-1])
+        for task_id in task_ids:
+            owner = con.execute(
+                "SELECT owner_session_id FROM a2a_tasks WHERE task_id=?", (task_id,)).fetchone()
+            if owner is not None and str(owner[0] or "") != session:
+                return False
+        return True
+
+    def publish_if_owned(self, session_id: str, task_id: str, publish) -> bool:
+        """Run one publish under the write lock, only while this session still owns the task."""
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            owner = con.execute(
+                "SELECT owner_session_id FROM a2a_tasks WHERE task_id=?", (task_id,)).fetchone()
+            current = None if owner is None else str(owner[0] or "")
+            if current and current != str(session_id or ""):
+                con.rollback()
+                return False
+            publish()
+            con.commit()
+            return True
+        except Exception:
+            con.rollback()
+            raise
         finally:
             con.close()
 
@@ -788,6 +837,10 @@ class WatchManager:
         self.start()
         return watch
 
+    def publish_if_owned(self, session_id: str, task_id: str, publish) -> bool:
+        """One publish under the store write lock, only while this session still owns the task."""
+        return self.store.publish_if_owned(session_id, task_id, publish)
+
     def cancel(self, watch_id: str, *, session_id: str = "") -> Optional[str]:
         with self._scope():
             return self.store.cancel(watch_id, session_id=session_id)
@@ -1023,6 +1076,15 @@ class WatchManager:
                               or f"artifact:{index}:{tools._digest(text)}")
             kind = "input-required" if raw_state == protocol.STATE_INPUT_REQUIRED else "result"
             self.ownership.add_message(task_id, artifact_id, kind, text)
+        # History carries messages that never appear as the current status, so ignoring it drops
+        # progress the peer did report. add_message dedupes by message id.
+        for index, message in enumerate(payload.get("history") or []):
+            text = tools._text_of_message(message)
+            if not text:
+                continue
+            message_id = str(message.get("messageId") or message.get("message_id")
+                             or f"history:{index}:{tools._digest(text)}")
+            self.ownership.add_message(task_id, message_id, "progress", text)
         if raw_state in protocol.TERMINAL_STATES and not self.ownership.has_kind(task_id, "result"):
             self.ownership.add_message(
                 task_id, f"state:{raw_state}", "result",

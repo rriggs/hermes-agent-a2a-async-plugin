@@ -604,9 +604,15 @@ def _ensure_task_record(task_id: str, peer: str, context_id: str = "",
 def _acquire_task(task_id: str, session_id: str, peer: str) -> tuple[bool, str]:
     """Acquire ``task_id`` for this session. Returns (ok, error message)."""
     _ensure_task_record(task_id, peer)
-    if not session_id:
-        return True, ""  # no bound session (one-shot caller): ownership is not tracked
     store = _ownership()
+    if not session_id:
+        # No bound session: ownership cannot be tracked, so this caller may only touch an
+        # unowned task. Its backlog belongs to the owning session until that session releases it.
+        owner = store.owner(task_id)
+        if owner:
+            return False, (f"Error: a2a task {task_id} is owned by session {owner} and this "
+                           "call has no bound session, so it cannot read its queued messages.")
+        return True, ""
     owner = store.owner(task_id)
     if owner and owner != session_id:
         return False, (f"Error: a2a task {task_id} is owned by another session. "
@@ -678,6 +684,14 @@ def _record_observation(task_id: str, payload: dict, peer: str) -> list[dict]:
             artifact_id = str(artifact.get("artifactId") or artifact.get("artifact_id")
                               or f"artifact:{index}:{_digest(text)}")
             store.add_message(task_id, artifact_id, "result", text)
+        # History carries messages that never appear as the current status.
+        for index, message in enumerate(payload.get("history") or []):
+            text = _text_of_message(message)
+            if not text:
+                continue
+            message_id = str(message.get("messageId") or message.get("message_id")
+                             or f"history:{index}:{_digest(text)}")
+            store.add_message(task_id, message_id, "progress", text)
         if state in protocol.TERMINAL_STATES and not any(
                 m["kind"] == "result" for m in store.queued(task_id)):
             store.add_message(task_id, f"state:{state}", "result",
@@ -716,12 +730,20 @@ def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: 
         kind = str(msg.get("kind") or "progress")
         content = _peer_message_content(peer, task_id, kind, text)
         try:
-            ctx.publish_completion(
-                target=target, event_id=f"a2a:{task_id}:{msg['message_id']}", content=content,
-                metadata={"source": "a2a", "peer": peer, "task_id": task_id,
-                          "state": kind, "message_id": msg["message_id"]})
+            # Serialized with release: a backlog replay must not deliver into a session that
+            # released (or lost) the task while this call was running.
+            accepted = _watch_manager(ctx).publish_if_owned(
+                session_id or "", task_id,
+                lambda: ctx.publish_completion(
+                    target=target, event_id=f"a2a:{task_id}:{msg['message_id']}",
+                    content=content,
+                    metadata={"source": "a2a", "peer": peer, "task_id": task_id,
+                              "state": kind, "message_id": msg["message_id"]}))
         except Exception as exc:
             logger.warning("A2A: could not publish %s/%s: %s", task_id, msg["message_id"], exc)
+            continue
+        if not accepted:
+            logger.info("A2A: %s no longer owns %s; its backlog stays queued", session_id, task_id)
             continue
         published.append(str(msg["message_id"]))
     return published

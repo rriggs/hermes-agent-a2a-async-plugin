@@ -436,6 +436,12 @@ _CTX: Any = None
 _WATCH_MANAGER: Any = None
 
 
+def _plugin_home(ctx: Any) -> Optional[str]:
+    """The home of the profile this plugin was loaded for (``None`` for a default profile)."""
+    home = getattr(getattr(ctx, "_manager", None), "home_path", None)
+    return str(home) if home else None
+
+
 def _plugin_db_path(ctx: Any) -> Optional[str]:
     """The task database of the profile this plugin was loaded for, or None for the default.
 
@@ -453,7 +459,9 @@ def _watch_manager(ctx: Any = None):
     if _WATCH_MANAGER is None:
         from . import watches
         ctx = ctx if ctx is not None else _CTX
-        _WATCH_MANAGER = watches.WatchManager(ctx, store=watches.WatchStore(_plugin_db_path(ctx)))
+        _WATCH_MANAGER = watches.WatchManager(
+            ctx, store=watches.WatchStore(_plugin_db_path(ctx)),
+            profile_home=_plugin_home(ctx))
     return _WATCH_MANAGER
 
 
@@ -1299,9 +1307,11 @@ def _resume_watches(ctx) -> None:
         from . import watches
         manager = _watch_manager(ctx)
         manager.ctx = ctx  # a plugin reload hands us a fresh PluginContext
-        active = manager.rehydrate()  # read-only: never creates or migrates the task database
-        if active:
-            logger.info("A2A: resumed %d background watch(es)", active)
+        # Read-only: never creates or migrates the task database. Counts live watches AND
+        # undelivered publications, because an outbox row must survive a restart too.
+        pending = manager.rehydrate()
+        if pending:
+            logger.info("A2A: resumed %d background watch/publication row(s)", pending)
         register_unload = getattr(ctx, "on_unload", None)
         if callable(register_unload):
             register_unload(manager.stop)

@@ -12,17 +12,25 @@ The rules this module enforces, and why each exists:
   something about the watcher, never about the remote task. Those outcomes publish a distinct
   ``watch-*`` event and leave the task record alone.
 * **One poller per profile.** Every process that loads the plugin can hold the same profile's
-  watches, so a watch is leased in SQLite before it is polled; a second process skips it until the
-  lease expires, and a crashed owner's lease is reclaimed by the next live process.
-* **Publish once per observation.** Each watch item records the state it last published, so a
-  restarted watcher re-observing ``completed`` does not notify twice (the core publisher also
-  de-duplicates by event id, so even a lost local record cannot double-deliver).
+  watches, so a watch is leased in SQLite before it is polled, the lease is renewed before each
+  task poll, and every state write is fenced on the lease owner. A second process skips a live
+  watch; a crashed owner's watch is reclaimed when its lease expires, and a stale owner's writes
+  are rejected instead of overwriting the new owner's.
+* **Publication is durable, not best-effort.** A publish can fail (host admission refused, the
+  profile's ledger briefly locked). The event is written to an outbox *before* the attempt and
+  removed only after the publisher accepted it, so a failure is retried on the next pass and after
+  a restart — never silently dropped with the watch closed.
+* **Publish once per observation.** The outbox row is keyed by the event id, so re-observing a
+  state cannot enqueue twice (the core publisher also de-duplicates by event id).
 * **Bounded work.** Sequential polling, bounded HTTP timeouts, per-item backoff for transient
-  failures, a finite watch lifetime (default 7 days) and a give-up threshold after repeated
-  errors. Nothing here can spin on a dead peer forever.
+  failures, a finite watch lifetime (default 7 days), a give-up threshold after repeated errors,
+  and a retention window that prunes only finished watches whose publications are all delivered.
 
-The manager never imports Hermes internals: it publishes through the ``PluginContext`` it was
-registered with, and stores state in the plugin's own database.
+The manager never imports Hermes internals for delivery: it publishes through the
+``PluginContext`` it was registered with, and stores state in the plugin's own database. It does
+bind the owning profile scope (home + secret scope) around every background operation, because a
+plain thread inherited from a multiplexed gateway carries the launch profile's ambient scope and
+would resolve peers, credentials and transcript paths against the wrong profile.
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
 from . import protocol
@@ -47,12 +56,18 @@ MAX_POLL_INTERVAL_S = 60.0
 DEFAULT_WATCH_TTL_S = 7 * 24 * 3600.0
 # A watch is leased before it is polled so two processes on one profile do not both poll it. The
 # lease is short enough that a crashed owner's watches resume quickly, long enough to cover a slow
-# GetTask round trip.
+# GetTask round trip; it is renewed before each task so a long batch cannot outlive it.
 LEASE_S = 90.0
 # Give up on a task after this many consecutive polling errors (about the 12th failed poll), with
 # exponential backoff capped at MAX_BACKOFF_S. The remote task is never marked failed by this.
 MAX_CONSECUTIVE_ERRORS = 12
 MAX_BACKOFF_S = 600.0
+# Publication retries are independent of polling: a failed publish is retried every few seconds,
+# backing off to five minutes, and survives restarts.
+PUBLICATION_BACKOFF_S = 5.0
+MAX_PUBLICATION_BACKOFF_S = 300.0
+# Finished watches and delivered outbox rows are pruned after this window (no unpublished rows).
+RETENTION_S = 7 * 24 * 3600.0
 # Keep a published completion inside the core publisher's content budget (32k chars).
 MAX_REPLY_CHARS = 24_000
 
@@ -76,11 +91,56 @@ class TransientPollError(RuntimeError):
 
 
 # --------------------------------------------------------------------------
+# Profile scope
+# --------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def profile_scope(home: Optional[str]):
+    """Run plugin work in ``home``'s profile scope (writes no state of its own).
+
+    A watcher thread started from a multiplexed gateway inherits the LAUNCH profile's ambient
+    scope. Pinning the SQLite path is not enough: peer resolution, ``.env`` secrets and transcript
+    persistence all resolve from the ambient home. Binding the home override and, when the
+    process serves several profiles, the profile's secret scope makes every resolution in the
+    block use the profile that created the watch.
+    """
+    if not home:
+        yield
+        return
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    except Exception:  # pragma: no cover - a runtime without the override helper
+        yield
+        return
+    token = set_hermes_home_override(Path(home))
+    secret_token = None
+    try:
+        try:
+            from agent.secret_scope import (
+                build_profile_secret_scope, is_multiplex_active, set_secret_scope,
+            )
+            if is_multiplex_active():
+                secret_token = set_secret_scope(
+                    build_profile_secret_scope(Path(home)), profile_home=str(home))
+        except Exception:  # older runtime: the home override is still the important half
+            secret_token = None
+        yield
+    finally:
+        if secret_token is not None:
+            try:
+                from agent.secret_scope import reset_secret_scope
+                reset_secret_scope(secret_token)
+            except Exception:  # pragma: no cover
+                logger.debug("A2A: could not reset the profile secret scope", exc_info=True)
+        reset_hermes_home_override(token)
+
+
+# --------------------------------------------------------------------------
 # Storage
 # --------------------------------------------------------------------------
 
 class WatchStore:
-    """Profile-scoped SQLite store for watches and their per-task rows.
+    """Profile-scoped SQLite store for watches, their items and the publication outbox.
 
     Shares ``a2a_tasks.db`` with :class:`protocol.TaskStore` so a watch, its task updates and the
     replies they produce live in one file (and one schema version).
@@ -168,17 +228,31 @@ class WatchStore:
         because a plugin loaded), so the probe is read-only and treats "no watch table yet" as
         "nothing to resume".
         """
+        row = self._readonly_scalar(
+            "SELECT COUNT(*) FROM a2a_watches WHERE state=?", (WATCH_ACTIVE,), "a2a_watches")
+        return row
+
+    def pending_publication_count_readonly(self) -> int:
+        """Outbox rows not yet accepted by the host, read without creating or migrating."""
+        return self._readonly_scalar(
+            "SELECT COUNT(*) FROM a2a_watch_publications WHERE published_at IS NULL",
+            (), "a2a_watch_publications")
+
+    def resumable_count_readonly(self) -> int:
+        """Work a reload must pick up: live watches plus undelivered publications."""
+        return self.active_count_readonly() + self.pending_publication_count_readonly()
+
+    def _readonly_scalar(self, sql: str, params: tuple, table: str) -> int:
         if not self.db_path or not os.path.exists(self.db_path):
             return 0
         try:
             con = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=5)
             try:
                 if con.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='a2a_watches'"
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
                 ).fetchone() is None:
                     return 0
-                row = con.execute(
-                    "SELECT COUNT(*) FROM a2a_watches WHERE state=?", (WATCH_ACTIVE,)).fetchone()
+                row = con.execute(sql, params).fetchone()
             finally:
                 con.close()
         except sqlite3.Error:
@@ -210,6 +284,17 @@ class WatchStore:
             con.commit()
             return cur.rowcount == 1
 
+    def renew(self, watch_id: str, owner: str, now: Optional[float] = None) -> bool:
+        """Extend our lease; False means another owner holds the watch (stop working on it)."""
+        now = time.time() if now is None else now
+        with self._session() as con:
+            cur = con.execute(
+                """UPDATE a2a_watches SET lease_until=?, updated_at=?
+                    WHERE watch_id=? AND state=? AND lease_owner=?""",
+                (now + LEASE_S, now, watch_id, WATCH_ACTIVE, owner))
+            con.commit()
+            return cur.rowcount == 1
+
     def release(self, watch_id: str, owner: str) -> None:
         with self._session() as con:
             con.execute(
@@ -218,28 +303,40 @@ class WatchStore:
                 (time.time(), watch_id, owner))
             con.commit()
 
+    @staticmethod
+    def _fence(owner: Optional[str]) -> tuple[str, tuple]:
+        """SQL fragment that rejects a write from a process that lost the lease."""
+        if not owner:
+            return "", ()
+        return (" AND EXISTS (SELECT 1 FROM a2a_watches w WHERE w.watch_id=a2a_watch_items.watch_id"
+                " AND w.lease_owner=?)"), (owner,)
+
     # -- item updates -----------------------------------------------------
     def record_working(self, watch_id: str, peer: str, task_id: str, state: str,
-                       context_id: str = "", next_poll_at: float = 0.0) -> None:
+                       context_id: str = "", next_poll_at: float = 0.0,
+                       owner: Optional[str] = None) -> None:
         now = time.time()
+        fence_sql, fence_params = self._fence(owner)
         with self._session() as con:
             con.execute(
-                """UPDATE a2a_watch_items
+                f"""UPDATE a2a_watch_items
                       SET state=?, context_id=COALESCE(NULLIF(?, ''), context_id),
                           errors=0, next_poll_at=?, updated_at=?
-                    WHERE watch_id=? AND peer=? AND task_id=?""",
-                (state or "", context_id or "", next_poll_at, now, watch_id, peer, task_id))
+                    WHERE watch_id=? AND peer=? AND task_id=?{fence_sql}""",
+                (state or "", context_id or "", next_poll_at, now, watch_id, peer, task_id,
+                 *fence_params))
             con.commit()
 
     def record_error(self, watch_id: str, peer: str, task_id: str, message: str,
-                     next_poll_at: float) -> int:
-        """Count a failed poll; returns the new consecutive-error count."""
+                     next_poll_at: float, owner: Optional[str] = None) -> int:
+        """Count a failed poll; returns the new consecutive-error count (0 when fenced out)."""
         now = time.time()
+        fence_sql, fence_params = self._fence(owner)
         with self._session() as con:
             con.execute(
-                """UPDATE a2a_watch_items SET errors=errors+1, next_poll_at=?, updated_at=?
-                    WHERE watch_id=? AND peer=? AND task_id=?""",
-                (next_poll_at, now, watch_id, peer, task_id))
+                f"""UPDATE a2a_watch_items SET errors=errors+1, next_poll_at=?, updated_at=?
+                    WHERE watch_id=? AND peer=? AND task_id=?{fence_sql}""",
+                (next_poll_at, now, watch_id, peer, task_id, *fence_params))
             con.execute(
                 "UPDATE a2a_watches SET last_error=?, updated_at=? WHERE watch_id=?",
                 (message[:500], now, watch_id))
@@ -251,16 +348,17 @@ class WatchStore:
         return int(row["errors"]) if row else 0
 
     def mark_item(self, watch_id: str, peer: str, task_id: str, item_state: str,
-                  published_state: str = "") -> None:
+                  published_state: str = "", owner: Optional[str] = None) -> None:
         now = time.time()
+        fence_sql, fence_params = self._fence(owner)
         with self._session() as con:
             con.execute(
-                """UPDATE a2a_watch_items
+                f"""UPDATE a2a_watch_items
                       SET state=?, published_state=CASE WHEN ?='' THEN published_state ELSE ? END,
                           errors=0, next_poll_at=?, completed_at=?, updated_at=?
-                    WHERE watch_id=? AND peer=? AND task_id=?""",
+                    WHERE watch_id=? AND peer=? AND task_id=?{fence_sql}""",
                 (item_state, published_state, published_state, now, now, now,
-                 watch_id, peer, task_id))
+                 watch_id, peer, task_id, *fence_params))
             con.commit()
 
     def settle(self, watch_id: str, now: Optional[float] = None) -> str:
@@ -319,6 +417,95 @@ class WatchStore:
             watch["items"] = [dict(r) for r in con_items(self.db_path, watch["watch_id"])]
         return expired
 
+    # -- publication outbox ----------------------------------------------
+    def enqueue_publication(self, *, watch_id: str, event_id: str, content: str,
+                            metadata: dict) -> None:
+        """Persist an event for delivery. Idempotent per event id; the row IS the retry state."""
+        now = time.time()
+        with self._session() as con:
+            con.execute(
+                """INSERT OR IGNORE INTO a2a_watch_publications
+                       (event_id, watch_id, content, metadata_json, created_at, next_attempt_at)
+                   VALUES (?, ?, ?, ?, ?, 0)""",
+                (event_id, watch_id, content, json.dumps(metadata, sort_keys=True), now))
+            con.commit()
+
+    def due_publications(self, now: Optional[float] = None) -> list[dict]:
+        now = time.time() if now is None else now
+        with self._session() as con:
+            rows = con.execute(
+                """SELECT p.*, w.target_json FROM a2a_watch_publications p
+                     JOIN a2a_watches w ON w.watch_id = p.watch_id
+                    WHERE p.published_at IS NULL AND p.next_attempt_at<=?
+                    ORDER BY p.created_at LIMIT 25""",
+                (now,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_published(self, event_id: str, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else now
+        with self._session() as con:
+            row = con.execute(
+                "SELECT watch_id, metadata_json FROM a2a_watch_publications WHERE event_id=?",
+                (event_id,)).fetchone()
+            if row is None:
+                return
+            con.execute(
+                "UPDATE a2a_watch_publications SET published_at=?, next_attempt_at=0 "
+                "WHERE event_id=?",
+                (now, event_id))
+            meta = _load_metadata(row["metadata_json"])
+            peer = str(meta.get("peer") or "")
+            task_id = str(meta.get("task_id") or "")
+            state = str(meta.get("state") or "")
+            if peer and task_id and state:
+                # Only now is the observation honestly "published": a refused publish must stay
+                # eligible on the item, not look delivered.
+                con.execute(
+                    """UPDATE a2a_watch_items SET published_state=?, updated_at=?
+                        WHERE watch_id=? AND peer=? AND task_id=?""",
+                    (state, now, row["watch_id"], peer, task_id))
+            con.commit()
+
+    def record_publication_failure(self, event_id: str, now: Optional[float] = None) -> int:
+        now = time.time() if now is None else now
+        with self._session() as con:
+            con.execute(
+                "UPDATE a2a_watch_publications SET attempts=attempts+1 WHERE event_id=?",
+                (event_id,))
+            row = con.execute(
+                "SELECT attempts FROM a2a_watch_publications WHERE event_id=?",
+                (event_id,)).fetchone()
+            attempts = int(row["attempts"]) if row else 0
+            con.execute(
+                "UPDATE a2a_watch_publications SET next_attempt_at=? WHERE event_id=?",
+                (now + _publication_backoff(attempts), event_id))
+            con.commit()
+        return attempts
+
+    def prune(self, now: Optional[float] = None) -> None:
+        """Age out delivered events and finished watches that have nothing left to publish."""
+        now = time.time() if now is None else now
+        cutoff = now - RETENTION_S
+        with self._session() as con:
+            con.execute(
+                "DELETE FROM a2a_watch_publications WHERE published_at IS NOT NULL AND published_at<?",
+                (cutoff,))
+            con.execute(
+                """DELETE FROM a2a_watch_items WHERE watch_id IN (
+                       SELECT w.watch_id FROM a2a_watches w
+                        WHERE w.state!=? AND w.updated_at<?
+                          AND NOT EXISTS (SELECT 1 FROM a2a_watch_publications p
+                                           WHERE p.watch_id=w.watch_id AND p.published_at IS NULL))""",
+                (WATCH_ACTIVE, cutoff))
+            con.execute(
+                """DELETE FROM a2a_watches
+                    WHERE state!=? AND updated_at<?
+                      AND NOT EXISTS (SELECT 1 FROM a2a_watch_publications p
+                                       WHERE p.watch_id=a2a_watches.watch_id
+                                         AND p.published_at IS NULL)""",
+                (WATCH_ACTIVE, cutoff))
+            con.commit()
+
 
 def con_items(db_path: str, watch_id: str) -> list[sqlite3.Row]:
     con = sqlite3.connect(db_path, timeout=10)
@@ -339,6 +526,14 @@ def _load_target(raw: Any) -> dict:
     if not isinstance(value, dict):
         raise WatchError("stored completion target is not a mapping")
     return value
+
+
+def _load_metadata(raw: Any) -> dict:
+    try:
+        value = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 # --------------------------------------------------------------------------
@@ -384,6 +579,8 @@ class WatchManager:
 
     ``poll`` is injectable for tests; production uses :func:`poll_task`. ``clock``/``sleeper`` are
     likewise injectable so a test can drive ``run_once`` deterministically without sleeping.
+    ``profile_home`` is the home of the profile that owns the watch store; every background
+    operation runs inside :func:`profile_scope` of it.
     """
 
     def __init__(
@@ -391,11 +588,13 @@ class WatchManager:
         poll: Callable[[str, str], dict] = poll_task,
         interval: Optional[float] = None, ttl_s: Optional[float] = None,
         clock: Callable[[], float] = time.time,
+        profile_home: Optional[str] = None,
     ) -> None:
         self.ctx = ctx
         self.store = store or WatchStore()
         self.poll = poll
         self.clock = clock
+        self.profile_home = str(profile_home) if profile_home else None
         self.interval = _env_float("A2A_WATCH_INTERVAL", interval, DEFAULT_POLL_INTERVAL_S,
                                    MIN_POLL_INTERVAL_S, MAX_POLL_INTERVAL_S)
         self.ttl_s = _env_float("A2A_WATCH_TTL", ttl_s, DEFAULT_WATCH_TTL_S, 60.0, 365 * 24 * 3600.0)
@@ -427,44 +626,84 @@ class WatchManager:
             except Exception:  # a watcher bug must not kill the poller
                 logger.exception("A2A watch manager iteration failed")
 
+    def _scope(self):
+        return profile_scope(self.profile_home)
+
     # -- operations -------------------------------------------------------
     def add(self, *, session_id: str, target: dict,
             tasks: Iterable[tuple[str, str]]) -> dict:
         """Persist a watch and start the poller; returns the watch record."""
         watch_id = "watch_" + uuid.uuid4().hex[:16]
-        self.store.create(watch_id=watch_id, session_id=session_id or "", target=target,
-                          tasks=tasks, ttl_s=self.ttl_s)
+        with self._scope():
+            self.store.create(watch_id=watch_id, session_id=session_id or "", target=target,
+                              tasks=tasks, ttl_s=self.ttl_s)
+            watch = self.store.get(watch_id) or {"watch_id": watch_id}
         self.start()
-        return self.store.get(watch_id) or {"watch_id": watch_id}
+        return watch
 
     def cancel(self, watch_id: str, *, session_id: str = "") -> Optional[str]:
-        return self.store.cancel(watch_id, session_id=session_id)
+        with self._scope():
+            return self.store.cancel(watch_id, session_id=session_id)
 
     def rehydrate(self) -> int:
-        """Resume polling persisted watches (a reload or restart); returns the active count.
+        """Resume persisted watches and undelivered publications; returns the work count.
 
         Read-only probe first: a plugin load with nothing to resume must not create or migrate the
         profile's task database as a side effect.
         """
-        active = self.store.active_count_readonly()
-        if active:
+        with self._scope():
+            pending = self.store.resumable_count_readonly()
+        if pending:
             self.start()
-        return active
+        return pending
 
     def run_once(self, now: Optional[float] = None) -> int:
-        """Poll every due watch once; returns the number of tasks polled."""
-        now = self.clock() if now is None else now
+        """Poll every due watch and drain the outbox; returns the number of tasks polled."""
         polls = 0
-        for expired in self.store.expire(now):
-            self._publish_expiry(expired)
-        for watch in self.store.due(now):
-            if not self.store.claim(watch["watch_id"], self.owner, now):
+        with self._scope():
+            now = self.clock() if now is None else now
+            for expired in self.store.expire(now):
+                self._enqueue_expiry(expired)
+            for watch in self.store.due(now):
+                if not self.store.claim(watch["watch_id"], self.owner, now):
+                    continue
+                try:
+                    polls += self._poll_watch(watch, now)
+                finally:
+                    self.store.release(watch["watch_id"], self.owner)
+            self.flush_publications(now)
+            self.store.prune(now)
+        return polls
+
+    def flush_publications(self, now: Optional[float] = None) -> int:
+        """Attempt every due outbox row; returns how many the host accepted.
+
+        Runs inside the caller's profile scope (``run_once`` opens it) and outside any watch lease:
+        a delivery must not be lost just because the watch that produced it has closed.
+        """
+        now = self.clock() if now is None else now
+        published = 0
+        for row in self.store.due_publications(now):
+            try:
+                target = _load_target(row.get("target_json"))
+            except WatchError:
+                # A corrupt target can never deliver; stop retrying it forever.
+                logger.error("A2A watch %s has an unreadable target; dropping %s",
+                             row.get("watch_id"), row.get("event_id"))
+                self.store.mark_published(str(row["event_id"]), now)
                 continue
             try:
-                polls += self._poll_watch(watch, now)
-            finally:
-                self.store.release(watch["watch_id"], self.owner)
-        return polls
+                self.ctx.publish_completion(
+                    target=target, event_id=row["event_id"], content=row["content"],
+                    metadata=_load_metadata(row.get("metadata_json")))
+            except Exception as exc:
+                attempts = self.store.record_publication_failure(str(row["event_id"]), now)
+                logger.warning("A2A watch could not publish %s (attempt %d): %s",
+                               row["event_id"], attempts, exc)
+                continue
+            self.store.mark_published(str(row["event_id"]), now)
+            published += 1
+        return published
 
     # -- internals --------------------------------------------------------
     def _poll_watch(self, watch: dict, now: float) -> int:
@@ -478,13 +717,20 @@ class WatchManager:
                 continue
             if item["next_poll_at"] > now:
                 continue
+            # Renew before each task: one lease must cover an unbounded batch, and a lost lease
+            # means another process owns this watch now -- stop rather than write stale results.
+            if not self.store.renew(watch_id, self.owner, self.clock()):
+                logger.debug("A2A watch %s lease lost before %s/%s", watch_id,
+                             item["peer"], item["task_id"])
+                return polls
             polls += 1
             try:
                 payload = self.poll(item["peer"], item["task_id"])
             except TransientPollError as exc:
                 errors = self.store.record_error(
                     watch_id, item["peer"], item["task_id"], str(exc),
-                    next_poll_at=now + _backoff(item["errors"] + 1, self.interval))
+                    next_poll_at=now + _backoff(item["errors"] + 1, self.interval),
+                    owner=self.owner)
                 if errors >= MAX_CONSECUTIVE_ERRORS:
                     self._unwatch_item(watch, item, errors, str(exc))
                 continue
@@ -492,14 +738,15 @@ class WatchManager:
                 logger.debug("A2A watch poll failed: %s", exc, exc_info=True)
                 self.store.record_error(
                     watch_id, item["peer"], item["task_id"], str(exc),
-                    next_poll_at=now + _backoff(item["errors"] + 1, self.interval))
+                    next_poll_at=now + _backoff(item["errors"] + 1, self.interval),
+                    owner=self.owner)
                 continue
             self._apply_payload(watch, item, payload, now)
         self.store.settle(watch_id, now=now)
         return polls
 
     def _apply_payload(self, watch: dict, item: dict, payload: dict, now: float) -> None:
-        """Fold one authoritative task payload into local state and publish what it means."""
+        """Fold one authoritative task payload into local state and enqueue what it means."""
         raw_state = str((payload.get("status") or {}).get("state") or "")
         short = _short_state(raw_state)
         context_id = str(payload.get("contextId") or "")
@@ -508,36 +755,31 @@ class WatchManager:
 
         if raw_state in protocol.TERMINAL_STATES:
             self._reconcile_local_task(task_id, raw_state, text, context_id, peer)
-            published = short
-            if item["published_state"] != short:
-                accepted = self._publish(
-                    watch, item, suffix=short,
-                    content=_terminal_content(peer, task_id, short, text),
-                    metadata={"source": "a2a", "peer": peer, "task_id": task_id,
-                              "watch_id": watch_id, "state": short,
-                              "context_id": context_id or item["context_id"]})
-                # Never record a publish the publisher refused: a later observation may retry it.
-                published = short if accepted else ""
-            self.store.mark_item(watch_id, peer, task_id, ITEM_DONE, published_state=published)
+            self._enqueue(
+                watch, item, suffix=short,
+                content=_terminal_content(peer, task_id, short, text),
+                metadata={"source": "a2a", "peer": peer, "task_id": task_id,
+                          "watch_id": watch_id, "state": short,
+                          "context_id": context_id or item["context_id"]})
+            self.store.mark_item(watch_id, peer, task_id, ITEM_DONE, owner=self.owner)
             return
 
         if raw_state == protocol.STATE_INPUT_REQUIRED:
             # Non-terminal by design: the peer needs a follow-up before it can finish. Report it
             # once and pause this task rather than spin on a state only the caller can resolve.
-            if item["published_state"] != "input-required":
-                self._publish(
-                    watch, item, suffix="input-required",
-                    content=_input_required_content(peer, task_id, text, context_id),
-                    metadata={"source": "a2a", "peer": peer, "task_id": task_id,
-                              "watch_id": watch_id, "state": "input-required",
-                              "context_id": context_id or item["context_id"]})
+            self._enqueue(
+                watch, item, suffix="input-required",
+                content=_input_required_content(peer, task_id, text, context_id),
+                metadata={"source": "a2a", "peer": peer, "task_id": task_id,
+                          "watch_id": watch_id, "state": "input-required",
+                          "context_id": context_id or item["context_id"]})
             self.store.record_working(watch_id, peer, task_id, raw_state, context_id,
-                                      next_poll_at=float("inf"))
-            self.store.mark_item(watch_id, peer, task_id, ITEM_PAUSED, published_state="input-required")
+                                      next_poll_at=float("inf"), owner=self.owner)
+            self.store.mark_item(watch_id, peer, task_id, ITEM_PAUSED, owner=self.owner)
             return
 
         self.store.record_working(watch_id, peer, task_id, raw_state, context_id,
-                                  next_poll_at=now + self.interval)
+                                  next_poll_at=now + self.interval, owner=self.owner)
 
     def _reconcile_local_task(self, task_id: str, raw_state: str, text: str,
                               context_id: str, peer: str) -> None:
@@ -561,9 +803,7 @@ class WatchManager:
 
     def _unwatch_item(self, watch: dict, item: dict, errors: int, message: str) -> None:
         """Stop watching a task after repeated polling failures; never call the task failed."""
-        self.store.mark_item(watch["watch_id"], item["peer"], item["task_id"], ITEM_UNWATCHED,
-                             published_state="watch-error")
-        self._publish(
+        self._enqueue(
             watch, item, suffix="watch-error",
             content=_watch_problem_content(
                 item["peer"], item["task_id"], watch["watch_id"],
@@ -572,18 +812,20 @@ class WatchManager:
             metadata={"source": "a2a", "peer": item["peer"], "task_id": item["task_id"],
                       "watch_id": watch["watch_id"], "state": "watch-error",
                       "remote_state": item["state"], "error": message[:300]})
+        self.store.mark_item(watch["watch_id"], item["peer"], item["task_id"], ITEM_UNWATCHED,
+                             owner=self.owner)
 
-    def _publish_expiry(self, watch: dict) -> None:
+    def _enqueue_expiry(self, watch: dict) -> None:
         watch_id = watch["watch_id"]
-        target = _load_target(watch.get("target_json"))
         pending = [i for i in watch.get("items", [])
                    if i.get("completed_at") is None and i.get("state") != ITEM_DONE]
         if not pending:
             return
         if len(pending) == 1:
             item = pending[0]
-            self._publish_dict(
-                target, event_id=f"a2a:{watch_id}:{item['peer']}:{item['task_id']}:watch-expired",
+            self.store.enqueue_publication(
+                watch_id=watch_id,
+                event_id=f"a2a:{watch_id}:{item['peer']}:{item['task_id']}:watch-expired",
                 content=_watch_problem_content(
                     item["peer"], item["task_id"], watch_id,
                     "the local watch expired before the peer reported a terminal state",
@@ -593,30 +835,20 @@ class WatchManager:
                           "remote_state": item.get("state") or ""})
             return
         listed = ", ".join(f"{i['peer']}/{i['task_id']}" for i in pending)
-        self._publish_dict(
-            target, event_id=f"a2a:{watch_id}:watch-expired",
+        self.store.enqueue_publication(
+            watch_id=watch_id, event_id=f"a2a:{watch_id}:watch-expired",
             content=(f"A2A background watch {watch_id} expired before these tasks reached a "
                      f"terminal state: {listed}.\nThe remote tasks were not cancelled; poll "
                      f"a2a_get_task or start a new watch if you still need them."),
             metadata={"source": "a2a", "watch_id": watch_id, "state": "watch-expired",
                       "tasks": [f"{i['peer']}/{i['task_id']}" for i in pending]})
 
-    def _publish(self, watch: dict, item: dict, *, suffix: str, content: str,
-                 metadata: dict) -> bool:
-        target = _load_target(watch.get("target_json"))
+    def _enqueue(self, watch: dict, item: dict, *, suffix: str, content: str,
+                 metadata: dict) -> None:
+        """Write the event to the outbox; delivery (and retry) is the outbox's job."""
         event_id = f"a2a:{watch['watch_id']}:{item['peer']}:{item['task_id']}:{suffix}"
-        return self._publish_dict(target, event_id=event_id, content=content, metadata=metadata)
-
-    def _publish_dict(self, target: dict, *, event_id: str, content: str,
-                      metadata: dict) -> bool:
-        """Publish one completion; a publisher failure is logged, never raised into the loop."""
-        try:
-            self.ctx.publish_completion(
-                target=target, event_id=event_id, content=content, metadata=metadata)
-            return True
-        except Exception as exc:
-            logger.warning("A2A watch could not publish %s: %s", event_id, exc)
-            return False
+        self.store.enqueue_publication(watch_id=watch["watch_id"], event_id=event_id,
+                                       content=content, metadata=metadata)
 
 
 # --------------------------------------------------------------------------
@@ -647,6 +879,10 @@ def _watch_problem_content(peer: str, task_id: str, watch_id: str, problem: str,
 
 def _backoff(errors: int, interval: float) -> float:
     return min(MAX_BACKOFF_S, max(interval, interval * (2 ** min(errors, 6))))
+
+
+def _publication_backoff(attempts: int) -> float:
+    return min(MAX_PUBLICATION_BACKOFF_S, PUBLICATION_BACKOFF_S * (2 ** min(max(attempts, 1), 6)))
 
 
 def _env_float(name: str, override: Optional[float], default: float,

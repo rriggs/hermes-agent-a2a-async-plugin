@@ -59,11 +59,16 @@ Semantics:
 - `input-required` is not terminal. It publishes one attention-needed event and pauses that task
   until the caller sends a follow-up (`a2a_submit` with the task's `context_id`) and starts a new
   watch.
-- A watch is leased in SQLite before it is polled, so several processes on one profile (CLI,
-  gateway, TUI) never poll the same watch concurrently, and a crashed process's watches are
-  picked up by the next one.
-- Watches survive a restart: they are rehydrated when the plugin loads. Pending completions are
-  replayed by Hermes through its normal completion-delivery policy.
+- A watch is leased in SQLite before it is polled and the lease is renewed before every task, so
+  several processes on one profile (CLI, gateway, TUI) never poll the same watch concurrently --
+  not even a long multi-task batch -- and writes from a process that lost its lease are rejected.
+  A crashed process's watches are picked up when its lease expires.
+- Every event goes through a durable outbox before it is published: a failed publish (host
+  admission refused, ledger briefly locked) is retried on the next pass and after a restart,
+  never dropped because the watch closed. The outbox row is also the idempotency key.
+- Watches and undelivered publications survive a restart: both are rehydrated when the plugin
+  loads, and every background operation runs in the profile scope that created the watch, so
+  peers, credentials and transcripts resolve against that profile even in a multiplexed gateway.
 - `a2a_watch_cancel(watch_id)` stops local polling only. The remote task keeps running;
   `a2a_cancel(agent, task_id)` remains the separate, best-effort remote cancellation request.
 - A local watch expiry (default 7 days), cancellation, or repeated polling failure describes the
@@ -72,7 +77,8 @@ Semantics:
   given up on (still not failed).
 
 Tuning: `A2A_WATCH_INTERVAL` (seconds between polls, default 5, minimum 2) and `A2A_WATCH_TTL`
-(watch lifetime in seconds, default 604800).
+(watch lifetime in seconds, default 604800). Publication retries back off from 5s to 5 minutes;
+finished watches and delivered events are pruned after 7 days.
 
 Requirement: background mode needs a Hermes runtime that exposes the plugin completion publisher.
 On an older runtime the tool returns a clear error instead of starting a watch that could never

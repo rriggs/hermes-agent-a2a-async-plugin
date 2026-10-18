@@ -28,7 +28,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
-pc = pytest.importorskip("agent.plugin_completions")
+from tests.real_publisher import load_real_publisher
+
+pc = load_real_publisher()
 pytest.importorskip("hermes_cli.plugins")
 
 

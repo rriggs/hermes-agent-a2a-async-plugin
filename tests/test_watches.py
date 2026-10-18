@@ -312,21 +312,23 @@ def test_repeated_poll_errors_back_off_then_give_up_without_failing_the_task():
     assert record is None or record["state"] not in protocol.TERMINAL_STATES
 
 
-def test_a_stale_duplicate_observation_reuses_the_same_event_id():
-    """Crash after publish, before the item is marked: the stable event id makes the core dedup."""
+def test_a_stale_duplicate_observation_publishes_once():
+    """A second process holding a stale item snapshot must not enqueue a second event."""
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")))
     watch = _add(manager)
     item = dict(_store().get(watch["watch_id"])["items"][0])
 
     manager._apply_payload(_store().get(watch["watch_id"]), item, task_payload(
         state=protocol.STATE_COMPLETED, text="done"), now=100.0)
+    manager.flush_publications(now=100.0)
     # The same pre-update item snapshot, as a second process holding a stale row would see it.
     manager._apply_payload(_store().get(watch["watch_id"]), item, task_payload(
         state=protocol.STATE_COMPLETED, text="done"), now=101.0)
+    manager.flush_publications(now=101.0)
 
-    assert len(manager.ctx.published) == 2
-    assert manager.ctx.published[0]["event_id"] == manager.ctx.published[1]["event_id"]
-    assert manager.ctx.published[1]["duplicate"] is True, "the publisher must reject the repeat"
+    assert len(manager.ctx.published) == 1, "the outbox must be idempotent per event id"
+    assert _outbox(watch["watch_id"], pending_only=True) == [], (
+        "a delivered event must leave the pending outbox")
 
 
 def test_an_expired_watch_reports_the_watcher_not_a_remote_failure():
@@ -501,7 +503,8 @@ def test_watch_publishes_through_the_real_hermes_publisher(tmp_path, monkeypatch
     Needs the Hermes checkout importable (``PYTHONPATH=/path/to/hermes-agent``); skipped
     otherwise, so the plugin's standalone suite stays standalone.
     """
-    pc = pytest.importorskip("agent.plugin_completions")
+    from tests.real_publisher import load_real_publisher
+    pc = load_real_publisher()
     from gateway.session_context import clear_session_vars, set_session_vars
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
@@ -536,3 +539,171 @@ def test_watch_publishes_through_the_real_hermes_publisher(tmp_path, monkeypatch
         assert again["status"] == "duplicate"
     finally:
         clear_session_vars(tokens)
+
+def _outbox(watch_id: str, *, pending_only: bool = False) -> list[dict]:
+    con = sqlite3.connect(_store().db_path)
+    con.row_factory = sqlite3.Row
+    try:
+        sql = "SELECT * FROM a2a_watch_publications WHERE watch_id=?"
+        if pending_only:
+            sql += " AND published_at IS NULL"
+        rows = con.execute(sql + " ORDER BY created_at", (watch_id,)).fetchall()
+    finally:
+        con.close()
+    return [dict(r) for r in rows]
+
+
+class FlakyCtx(FakeCtx):
+    """Publisher that refuses until told otherwise (host admission failure)."""
+
+    def __init__(self):
+        super().__init__()
+        self.fail = True
+
+    def publish_completion(self, **kwargs):
+        if self.fail:
+            raise RuntimeError("completion ledger unavailable")
+        return super().publish_completion(**kwargs)
+
+
+def test_a_refused_publish_is_retried_after_the_watch_closes():
+    """The watch finishing must not take the undelivered notification with it."""
+    ctx = FlakyCtx()
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")),
+                       ctx=ctx)
+    watch = _add(manager)
+
+    manager.run_once(now=1_000.0)
+
+    assert ctx.published == []
+    assert _store().get(watch["watch_id"])["state"] == watches.WATCH_COMPLETE
+    [pending] = _outbox(watch["watch_id"])
+    assert pending["published_at"] is None and pending["attempts"] == 1
+    item = _store().get(watch["watch_id"])["items"][0]
+    assert item["published_state"] == "", "a refused publish must not look published"
+
+    ctx.fail = False
+    # Nothing left to poll: the outbox alone must drive the retry once its backoff elapses.
+    manager.run_once(now=1_000.0 + 11.0)
+
+    assert [p["event_id"] for p in ctx.published] == [pending["event_id"]]
+    assert _outbox(watch["watch_id"], pending_only=True) == []
+    assert _store().get(watch["watch_id"])["items"][0]["published_state"] == "completed"
+
+
+def test_a_pending_publication_survives_a_restart():
+    first = FlakyCtx()
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")),
+                       ctx=first)
+    watch = _add(manager)
+    manager.run_once(now=1_000.0)
+    [lost] = _outbox(watch["watch_id"])
+    assert lost["published_at"] is None
+
+    # A new process loads the plugin: no live watch, but the outbox row must still be resumed.
+    second = FakeCtx()
+    restarted = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED)),
+                         ctx=second, store=_store())
+    assert restarted.rehydrate() == 1, "a pending publication must count as work to resume"
+    restarted.flush_publications(now=1_000.0 + 3600.0)
+
+    assert [p["event_id"] for p in second.published] == [lost["event_id"]]
+
+
+def test_a_refused_input_required_notice_is_retried():
+    ctx = FlakyCtx()
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_INPUT_REQUIRED,
+                                                 text="which key?")), ctx=ctx)
+    watch = _add(manager)
+    manager.run_once(now=1_000.0)
+    assert ctx.published == []
+    [pending] = _outbox(watch["watch_id"])
+    assert pending["metadata_json"].find("input-required") >= 0
+
+    ctx.fail = False
+    manager.run_once(now=1_000.0 + 11.0)
+    assert [p["metadata"]["state"] for p in ctx.published] == ["input-required"]
+
+
+def test_a_refused_expiry_notice_is_retried():
+    ctx = FlakyCtx()
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)), ctx=ctx)
+    watch = _add(manager)
+    with _store()._session() as con:
+        con.execute("UPDATE a2a_watches SET expires_at=1 WHERE watch_id=?", (watch["watch_id"],))
+    manager.run_once(now=10_000.0)
+    assert ctx.published == []
+    [pending] = _outbox(watch["watch_id"])
+    assert "watch-expired" in pending["metadata_json"]
+
+    ctx.fail = False
+    manager.run_once(now=10_000.0 + 11.0)
+    assert [p["metadata"]["state"] for p in ctx.published] == ["watch-expired"]
+
+
+def test_the_lease_is_renewed_between_tasks_and_stale_writes_are_fenced():
+    clock = [1_000.0]
+    interlopers: list[bool] = []
+    box: dict[str, str] = {}
+    store = _store()
+    other = watches.WatchManager(FakeCtx(), store=store, poll=lambda p, t: {}, interval=5.0,
+                                 ttl_s=3600, clock=lambda: clock[0])
+
+    def poll(peer, task_id):
+        clock[0] += 60.0  # four polls would outlive the 90s lease if it were never renewed
+        if box.get("watch_id"):
+            # Mid-batch, with the clock 60s further on than the claim: still ours?
+            interlopers.append(store.claim(box["watch_id"], other.owner, clock[0]))
+        return task_payload(task_id=task_id, state=protocol.STATE_WORKING)
+
+    manager = watches.WatchManager(FakeCtx(), store=store, poll=poll, interval=5.0,
+                                   ttl_s=3600, clock=lambda: clock[0])
+    watch = _add(manager, tasks=(("peer", "t1"), ("peer", "t2"), ("peer", "t3"), ("peer", "t4")))
+    box["watch_id"] = watch["watch_id"]
+
+    assert manager.run_once(now=clock[0]) == 4
+    assert clock[0] > 1_000.0 + watches.LEASE_S, "the batch ran past the initial lease"
+    assert interlopers and not any(interlopers), (
+        "the lease expired mid-batch: a second process could take over and double-poll")
+
+    # Only after the lease really lapses may another owner take over ...
+    assert store.claim(watch["watch_id"], other.owner, clock[0] + watches.LEASE_S) is True
+    # ... and the old owner's writes are then rejected instead of overwriting the new owner's.
+    old_item = dict(store.get(watch["watch_id"])["items"][0])
+    manager.store.mark_item(watch["watch_id"], old_item["peer"], old_item["task_id"],
+                            watches.ITEM_DONE, owner=manager.owner)
+    assert store.get(watch["watch_id"])["items"][0]["completed_at"] is None, (
+        "a write from a process that lost the lease must be fenced out")
+
+
+def test_background_work_uses_the_creating_profiles_scope(tmp_path, monkeypatch):
+    """The same peer alias resolves per profile: the watcher must not use the launch profile."""
+    home_a, home_b = tmp_path / "profile-a", tmp_path / "profile-b"
+    for home, url in ((home_a, "http://10.0.0.1:9901"), (home_b, "http://10.0.0.2:9901")):
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(
+            "a2a_agents:\n"
+            "  peer:\n"
+            f"    url: {url}\n"
+            "    auth: {type: bearer, token: test}\n",
+            encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home_a))  # ambient = launch profile
+    resolved: list[str] = []
+    persisted: list[str] = []
+    from hermes_constants import get_hermes_home
+
+    def poll(peer, task_id):
+        resolved.append(tools._resolve_peer(peer)["url"])
+        return task_payload(task_id=task_id, state=protocol.STATE_COMPLETED, text="done")
+
+    monkeypatch.setattr(protocol, "persist_message",
+                        lambda *a, **kw: persisted.append(str(get_hermes_home())))
+
+    manager = watches.WatchManager(FakeCtx(), store=_store(), poll=poll, interval=5.0,
+                                   ttl_s=3600, profile_home=str(home_b))
+    _add(manager)
+    manager.run_once(now=1_000.0)
+
+    assert resolved == ["http://10.0.0.2:9901"]
+    assert persisted == [str(home_b)], "the reply transcript must land in the creating profile"
+    assert str(get_hermes_home()) == str(home_a), "the launch profile's scope must be restored"

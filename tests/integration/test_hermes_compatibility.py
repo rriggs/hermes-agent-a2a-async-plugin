@@ -76,8 +76,9 @@ PLATFORM_NAME = "a2a"
 EXPECTED_TOOLS = {
     "a2a_discover", "a2a_call", "a2a_list", "a2a_history", "a2a_orchestrate",
     "a2a_submit", "a2a_get_task", "a2a_await", "a2a_cancel", "a2a_steer",
+    "a2a_watch_cancel",
 }
-EXPECTED_TOOL_COUNT = 10
+EXPECTED_TOOL_COUNT = 11
 
 
 # ---------------------------------------------------------------------------
@@ -189,10 +190,10 @@ def _build_adapter_in_process(ctx, port: int):
     return factory(config)
 
 
-def test_registration_records_exactly_ten_a2a_tools_and_one_platform(
+def test_registration_records_exactly_eleven_a2a_tools_and_one_platform(
     monkeypatch, tmp_path: Path,
 ):
-    """(a, part 1) The plugin's ``register(ctx)`` registers exactly 10 tools
+    """(a, part 1) The plugin's ``register(ctx)`` registers exactly 11 tools
     under toolset='a2a' with zero duplicate names, and the inbound platform
     'a2a' is registered exactly once. The hermetic env (NOTES #12) keeps
     any in-process protocol helpers from polluting the operator's home.

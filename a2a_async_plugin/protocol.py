@@ -38,7 +38,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "1.0"
-A2A_TASK_SCHEMA_VERSION = 4
+A2A_TASK_SCHEMA_VERSION = 5
 
 # A2A v1.0 task lifecycle states.
 STATE_SUBMITTED = "TASK_STATE_SUBMITTED"
@@ -661,9 +661,9 @@ class TaskStore:
             ):
                 if name not in columns:
                     con.execute(f"ALTER TABLE a2a_tasks ADD COLUMN {name} {definition}")
-            # Background watches (a2a_async_plugin/watches.py, schema v4). Additive tables only: a
-            # v3 database gains them in place, and an older plugin reading a v4 database still sees
-            # every column it knows.
+            # Background watches (a2a_async_plugin/watches.py, schema v4+) and their publication
+            # outbox (v5). Additive tables only: an older database gains them in place, and an
+            # older plugin reading a newer database still sees every column it knows.
             con.execute(
                 """CREATE TABLE IF NOT EXISTS a2a_watches (
                 watch_id TEXT PRIMARY KEY,
@@ -693,6 +693,25 @@ class TaskStore:
                 updated_at REAL NOT NULL,
                 PRIMARY KEY (watch_id, peer, task_id)
             )"""
+            )
+            # The outbox makes delivery durable: an event is written here before the publish
+            # attempt and cleared only after the host accepted it, so a refused publish is retried
+            # on the next pass and after a restart instead of vanishing with the closed watch.
+            con.execute(
+                """CREATE TABLE IF NOT EXISTS a2a_watch_publications (
+                event_id TEXT PRIMARY KEY,
+                watch_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL DEFAULT 0,
+                published_at REAL
+            )"""
+            )
+            con.execute(
+                """CREATE INDEX IF NOT EXISTS idx_a2a_watch_publications_due
+                       ON a2a_watch_publications (published_at, next_attempt_at)"""
             )
             if version < A2A_TASK_SCHEMA_VERSION:
                 con.execute(f"PRAGMA user_version = {A2A_TASK_SCHEMA_VERSION}")

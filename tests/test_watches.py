@@ -673,6 +673,69 @@ def test_stop_mid_batch_does_not_poll_or_publish_the_next_task():
     assert _store().get(watch["watch_id"])["items"][0]["completed_at"] is None
 
 
+def test_release_drops_undelivered_publications_and_keeps_the_messages_queued():
+    """A task that leaves a session must not publish into it; the next owner gets the message."""
+    ctx = FlakyCtx()
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")),
+                       ctx=ctx)
+    watch = _add(manager)
+    manager.run_once(now=1_000.0)
+    assert _outbox(watch["watch_id"], pending_only=True)
+    assert [m["message_id"] for m in manager.ownership.queued("t1")]
+
+    manager.cancel_session("sess-1")  # release / session end
+
+    assert _outbox(watch["watch_id"], pending_only=True) == [], (
+        "an undelivered publication must not survive the session that owned the task")
+    assert manager.ownership.queued("t1"), "the message stays queued for the next owner"
+
+
+def test_an_expiring_watch_is_finished_after_a_restart():
+    """Crash between 'expiring' and enqueue: a fresh manager must finish the notice."""
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)))
+    watch = _add(manager)
+    with _store()._session() as con:
+        con.execute("UPDATE a2a_watches SET expires_at=1 WHERE watch_id=?", (watch["watch_id"],))
+
+    expired = _store().expire(now=10_000.0)  # commit happens, then the process dies
+    assert expired and _store().get(watch["watch_id"])["state"] == "expiring"
+
+    fresh = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)))
+    fresh.run_once(now=10_000.0)
+
+    assert [p["metadata"]["state"] for p in fresh.ctx.published] == ["watch-expired"]
+    assert _store().get(watch["watch_id"])["state"] == "expired"
+
+
+def test_an_input_required_notice_that_could_not_be_queued_is_retried():
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_INPUT_REQUIRED,
+                                                 text="which key?")))
+    watch = _add(manager)
+    store = _store()
+    real_enqueue = store.enqueue_publication
+    calls = {"n": 0}
+
+    def flaky_enqueue(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("ledger locked")
+        return real_enqueue(**kwargs)
+
+    store.enqueue_publication = flaky_enqueue  # type: ignore[method-assign]
+    manager.store = store
+
+    manager.run_once(now=1_000.0)
+
+    item = _store().get(watch["watch_id"])["items"][0]
+    assert item["state"] != watches.ITEM_PAUSED, (
+        "a task must not stop polling before its notice is durably queued")
+    assert manager.ctx.published == []
+
+    manager.run_once(now=1_010.0)
+    assert [p["metadata"]["kind"] for p in manager.ctx.published] == ["input-required"]
+    assert _store().get(watch["watch_id"])["items"][0]["state"] == watches.ITEM_PAUSED
+
+
 def test_a_refused_input_required_notice_is_retried():
     ctx = FlakyCtx()
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_INPUT_REQUIRED,

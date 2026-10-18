@@ -315,3 +315,31 @@ def test_a_list_shows_ownership_per_task(monkeypatch):
 
     assert "t1" in out and "owned-by-another-session" in out
     assert "t2" in out and "unowned" in out
+
+def test_blocking_await_returns_every_artifact(monkeypatch):
+    _task()
+    monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": "http://peer.invalid"})
+    monkeypatch.setattr(tools, "_rpc_request", lambda *a, **k: {"result": {
+        "id": "t1", "contextId": "ctx-1", "status": {"state": protocol.STATE_COMPLETED},
+        "artifacts": [{"parts": [{"text": "first artifact"}]},
+                      {"parts": [{"text": "second artifact"}]}]}})
+
+    out = tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 10},
+                          session_id=SESSION_A)
+
+    assert "first artifact" in out and "second artifact" in out, out
+
+
+def test_released_tasks_count_as_work_to_resume():
+    import importlib
+    watches = importlib.import_module(f"{PKG}.watches")
+    protocol.TaskStore().create("t1", "ctx", "peer", direction="outbound",
+                                remote_state=protocol.STATE_WORKING)
+    store = _store()
+    store.acquire("t1", SESSION_A)
+    store.release_all(SESSION_A)
+
+    manager = watches.WatchManager(object(), store=watches.WatchStore(),
+                                   poll=lambda p, t: {}, interval=5.0, ttl_s=3600)
+    assert manager.store.resumable_count_readonly() == 0
+    assert store.unowned_count_readonly() == 1

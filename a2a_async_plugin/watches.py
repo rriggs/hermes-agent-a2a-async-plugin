@@ -76,6 +76,7 @@ DEFAULT_UNOWNED_TTL_S = 7 * 24 * 3600.0
 MAX_REPLY_CHARS = 24_000
 
 WATCH_ACTIVE = "active"
+WATCH_EXPIRING = "expiring"  # expired, but its notice may not be durably queued yet
 WATCH_PAUSED = "paused"
 WATCH_COMPLETE = "complete"
 WATCH_CANCELED = "canceled"
@@ -233,7 +234,8 @@ class WatchStore:
         "nothing to resume".
         """
         row = self._readonly_scalar(
-            "SELECT COUNT(*) FROM a2a_watches WHERE state=?", (WATCH_ACTIVE,), "a2a_watches")
+            "SELECT COUNT(*) FROM a2a_watches WHERE state IN (?, ?)",
+            (WATCH_ACTIVE, WATCH_EXPIRING), "a2a_watches")
         return row
 
     def pending_publication_count_readonly(self) -> int:
@@ -394,6 +396,7 @@ class WatchStore:
         if not session_id:
             return 0
         now = time.time()
+        self.drop_pending_publications(session_id, task_ids)
         with self._session() as con:
             if task_ids is None:
                 rows = con.execute(
@@ -448,22 +451,65 @@ class WatchStore:
         return WATCH_ACTIVE
 
     def expire(self, now: Optional[float] = None) -> list[dict]:
-        """Mark overdue watches expired; return them (the caller publishes one notice each)."""
+        """Move overdue watches to ``expiring`` and return them, plus any left over.
+
+        The state change is committed before the notice is enqueued, so a crash in between must
+        not lose the notice: an ``expiring`` watch is picked up again on the next pass (the event
+        id is stable, so re-enqueueing is idempotent) and only then marked ``expired``.
+        """
         now = time.time() if now is None else now
         with self._session() as con:
             rows = con.execute(
                 "SELECT * FROM a2a_watches WHERE state=? AND expires_at<=?",
                 (WATCH_ACTIVE, now)).fetchall()
-            expired = [dict(r) for r in rows]
-            for watch in expired:
+            for watch in rows:
                 con.execute(
                     "UPDATE a2a_watches SET state=?, lease_owner='', lease_until=0, updated_at=? "
                     "WHERE watch_id=?",
-                    (WATCH_EXPIRED, now, watch["watch_id"]))
+                    (WATCH_EXPIRING, now, watch["watch_id"]))
+            pending = con.execute(
+                "SELECT * FROM a2a_watches WHERE state=?", (WATCH_EXPIRING,)).fetchall()
             con.commit()
+        expired = [dict(r) for r in pending]
         for watch in expired:
             watch["items"] = [dict(r) for r in con_items(self.db_path, watch["watch_id"])]
         return expired
+
+    def mark_expired(self, watch_id: str, now: Optional[float] = None) -> None:
+        now = time.time() if now is None else now
+        with self._session() as con:
+            con.execute(
+                "UPDATE a2a_watches SET state=?, updated_at=? WHERE watch_id=? AND state=?",
+                (WATCH_EXPIRED, now, watch_id, WATCH_EXPIRING))
+            con.commit()
+
+    def drop_pending_publications(self, session_id: str,
+                                  task_ids: Optional[Iterable[str]] = None) -> int:
+        """Drop undelivered outbox rows for tasks leaving this session (release or cancel).
+
+        The message rows stay undelivered, so the next owner receives them; publishing them to a
+        target the old session owned would deliver work into a session that gave it up.
+        """
+        if not session_id:
+            return 0
+        with self._session() as con:
+            if task_ids is None:
+                cur = con.execute(
+                    """DELETE FROM a2a_watch_publications
+                        WHERE published_at IS NULL AND watch_id IN (
+                              SELECT watch_id FROM a2a_watches WHERE session_id=?)""",
+                    (session_id,))
+            else:
+                ids = [str(t) for t in task_ids if t]
+                if not ids:
+                    return 0
+                marks = ",".join("?" for _ in ids)
+                cur = con.execute(
+                    f"""DELETE FROM a2a_watch_publications
+                         WHERE published_at IS NULL
+                           AND json_extract(metadata_json, '$.task_id') IN ({marks})""",
+                    ids)
+            return cur.rowcount
 
     # -- publication outbox ----------------------------------------------
     def enqueue_publication(self, *, watch_id: str, event_id: str, content: str,
@@ -716,13 +762,18 @@ class WatchManager:
             return self.store.cancel_session(session_id, task_ids=task_ids)
 
     def rehydrate(self) -> int:
-        """Resume persisted watches and undelivered publications; returns the work count.
+        """Resume persisted watches, undelivered publications and unowned-task timers.
 
         Read-only probe first: a plugin load with nothing to resume must not create or migrate the
-        profile's task database as a side effect.
+        profile's task database as a side effect. Unowned-but-released tasks count as work: the
+        auto-cancel and TTL timers only run in the poller, so a restart must not forget them.
         """
         with self._scope():
             pending = self.store.resumable_count_readonly()
+            try:
+                pending += self.ownership.unowned_count_readonly()
+            except Exception:
+                logger.debug("A2A: unowned task probe failed", exc_info=True)
         if pending:
             self.start()
         return pending
@@ -733,7 +784,10 @@ class WatchManager:
         with self._scope():
             now = self.clock() if now is None else now
             for expired in self.store.expire(now):
+                # Enqueue first (idempotent per event id), then close: a crash between the two
+                # leaves the watch in 'expiring', which the next pass finishes.
                 self._enqueue_expiry(expired)
+                self.store.mark_expired(expired["watch_id"], now)
             for watch in self.store.due(now):
                 if not self.store.claim(watch["watch_id"], self.owner, now):
                     continue
@@ -773,6 +827,15 @@ class WatchManager:
                                row["event_id"], attempts, exc)
                 continue
             self.store.mark_published(str(row["event_id"]), now)
+            meta = _load_metadata(row.get("metadata_json"))
+            task_id = str(meta.get("task_id") or "")
+            message_id = str(meta.get("message_id") or "")
+            session_id = str(meta.get("session_id") or "")
+            if task_id and message_id and session_id:
+                try:
+                    self.ownership.mark_delivered(task_id, [message_id], session_id, now)
+                except Exception:
+                    logger.debug("A2A: delivery marker failed for %s", row["event_id"], exc_info=True)
             published += 1
         return published
 
@@ -839,10 +902,7 @@ class WatchManager:
         if raw_state in protocol.TERMINAL_STATES:
             self._reconcile_local_task(task_id, raw_state, text, context_id, peer)
         elif raw_state == protocol.STATE_INPUT_REQUIRED:
-            # Non-terminal by design: the peer needs a follow-up before it can finish. Pause this
-            # task rather than spin on a state only the caller can resolve.
-            self.store.record_working(watch_id, peer, task_id, raw_state, context_id,
-                                      next_poll_at=float("inf"), owner=self.owner)
+            pass  # paused after the notice is durably queued (a failed enqueue must retry)
         else:
             self.store.record_working(watch_id, peer, task_id, raw_state, context_id,
                                       next_poll_at=now + self.interval, owner=self.owner)
@@ -860,21 +920,26 @@ class WatchManager:
                                                  str(msg["text"])),
                         metadata={"source": "a2a", "peer": peer, "task_id": task_id,
                                   "watch_id": watch_id, "state": _short_state(raw_state),
-                                  "kind": msg["kind"], "message_id": msg["message_id"]})
+                                  "kind": msg["kind"], "message_id": msg["message_id"],
+                                  "session_id": session_id})
                 except Exception:
                     logger.exception("A2A: could not enqueue %s/%s", task_id, msg["message_id"])
                     enqueue_failed = True
                     continue
                 delivered.append(str(msg["message_id"]))
-            if delivered:
-                # Only enqueued messages are delivered: the outbox is what makes the rest durable.
-                self.ownership.mark_delivered(task_id, delivered, session_id, now)
+            # Messages stay queued until the host ACCEPTS them (flush_publications marks them):
+            # a refused publish must not look delivered, and a release must leave them for the
+            # next owner instead of publishing them into the session that gave the task up.
         # The item is marked done only after its message is durably in the outbox. A crash or a
         # failed enqueue leaves the item open, so the next poll retries it instead of losing the
         # completion with the item already closed.
         if raw_state in protocol.TERMINAL_STATES and not enqueue_failed:
             self.store.mark_item(watch_id, peer, task_id, ITEM_DONE, owner=self.owner)
         elif raw_state == protocol.STATE_INPUT_REQUIRED and not enqueue_failed:
+            # Non-terminal by design: the peer needs a follow-up before it can finish. Only now,
+            # with the notice queued, is it safe to stop polling this task.
+            self.store.record_working(watch_id, peer, task_id, raw_state, context_id,
+                                      next_poll_at=float("inf"), owner=self.owner)
             self.store.mark_item(watch_id, peer, task_id, ITEM_PAUSED, owner=self.owner)
 
     def _record_messages(self, task_id: str, peer: str, payload: dict,

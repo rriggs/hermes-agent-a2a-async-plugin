@@ -776,7 +776,10 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
             short = _short_state(state)
             queued_now = _record_observation(task_id, payload, agent)
             if short in ("completed", "failed", "canceled", "rejected", "input-required"):
-                text = _reply_text_from_result(payload) or "(no text reply)"
+                results = [str(m.get("text") or "").strip() for m in queued_now
+                           if str(m.get("kind")) == "result" and str(m.get("text") or "").strip()]
+                text = "\n\n".join(results) if results else (
+                    _reply_text_from_result(payload) or "(no text reply)")
                 if state in protocol.TERMINAL_STATES:
                     _task_store().complete(task_id, state, text)
                 else:

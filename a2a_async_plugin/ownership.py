@@ -60,6 +60,27 @@ class OwnershipStore:
             protocol.TaskStore._ensure_db(con)
         return con
 
+    def unowned_count_readonly(self) -> int:
+        """Released-but-unowned tasks (the cancel/TTL timers' work), read without migrating."""
+        import os
+        if not self.db_path or not os.path.exists(self.db_path):
+            return 0
+        try:
+            con = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=5)
+            try:
+                if con.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='a2a_tasks'"
+                ).fetchone() is None:
+                    return 0
+                row = con.execute(
+                    """SELECT COUNT(*) FROM a2a_tasks
+                        WHERE owner_session_id='' AND released_by_session_id!=''""").fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            return 0
+        return int(row[0]) if row else 0
+
     # -- ownership --------------------------------------------------------
     def acquire(self, task_id: str, session_id: str, now: Optional[float] = None) -> bool:
         """Take ownership of ``task_id`` for ``session_id``; False when another session owns it."""

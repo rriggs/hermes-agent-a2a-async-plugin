@@ -160,6 +160,31 @@ class WatchStore:
                 "SELECT COUNT(*) FROM a2a_watches WHERE state=?", (WATCH_ACTIVE,)).fetchone()
         return int(row[0]) if row else 0
 
+    def active_count_readonly(self) -> int:
+        """Active watches WITHOUT creating or migrating the database.
+
+        Plugin registration probes this on every load in every process. Opening through
+        :meth:`_connect` would apply the schema (a write lock, and a v3 database upgraded just
+        because a plugin loaded), so the probe is read-only and treats "no watch table yet" as
+        "nothing to resume".
+        """
+        if not self.db_path or not os.path.exists(self.db_path):
+            return 0
+        try:
+            con = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=5)
+            try:
+                if con.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='a2a_watches'"
+                ).fetchone() is None:
+                    return 0
+                row = con.execute(
+                    "SELECT COUNT(*) FROM a2a_watches WHERE state=?", (WATCH_ACTIVE,)).fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            return 0
+        return int(row[0]) if row else 0
+
     def due(self, now: Optional[float] = None) -> list[dict]:
         """Active watches with a due item whose lease is free (or expired)."""
         now = time.time() if now is None else now
@@ -416,8 +441,12 @@ class WatchManager:
         return self.store.cancel(watch_id, session_id=session_id)
 
     def rehydrate(self) -> int:
-        """Resume polling persisted watches (a reload or restart); returns the active count."""
-        active = self.store.active_count()
+        """Resume polling persisted watches (a reload or restart); returns the active count.
+
+        Read-only probe first: a plugin load with nothing to resume must not create or migrate the
+        profile's task database as a side effect.
+        """
+        active = self.store.active_count_readonly()
         if active:
             self.start()
         return active

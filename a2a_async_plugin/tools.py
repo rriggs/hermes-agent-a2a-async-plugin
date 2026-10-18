@@ -1299,10 +1299,9 @@ def _resume_watches(ctx) -> None:
         from . import watches
         manager = _watch_manager(ctx)
         manager.ctx = ctx  # a plugin reload hands us a fresh PluginContext
-        if manager.store.db_path and os.path.exists(manager.store.db_path):
-            active = manager.rehydrate()
-            if active:
-                logger.info("A2A: resumed %d background watch(es)", active)
+        active = manager.rehydrate()  # read-only: never creates or migrates the task database
+        if active:
+            logger.info("A2A: resumed %d background watch(es)", active)
         register_unload = getattr(ctx, "on_unload", None)
         if callable(register_unload):
             register_unload(manager.stop)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -463,6 +464,33 @@ def test_register_tools_resumes_only_when_a_watch_database_exists(tmp_path):
     tools._resume_watches(ctx)
     assert tools._WATCH_MANAGER._thread is None  # start() is patched out in this suite
     assert watches.started_managers, "an active watch must start the poller"
+
+def test_a_plugin_load_never_creates_or_migrates_the_task_database(tmp_path, monkeypatch):
+    """Registration runs in every process; it must not write the profile's task database."""
+    legacy = tmp_path / "legacy.db"
+    con = sqlite3.connect(legacy)
+    con.execute("CREATE TABLE a2a_tasks (task_id TEXT PRIMARY KEY)")
+    con.execute("PRAGMA user_version=3")
+    con.commit()
+    con.close()
+
+    monkeypatch.setenv("A2A_TASKS_DB", str(legacy))
+    monkeypatch.setattr(tools, "_WATCH_MANAGER", None)
+    tools._resume_watches(FakeCtx())
+
+    con = sqlite3.connect(legacy)
+    try:
+        assert con.execute("PRAGMA user_version").fetchone()[0] == 3, "a plugin load migrated a v3 database"
+        tables = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        con.close()
+    assert "a2a_watches" not in tables
+
+    missing = tmp_path / "missing.db"
+    monkeypatch.setenv("A2A_TASKS_DB", str(missing))
+    monkeypatch.setattr(tools, "_WATCH_MANAGER", None)
+    tools._resume_watches(FakeCtx())
+    assert not missing.exists(), "a plugin load created a task database with nothing to resume"
 
 
 # ── the real core publisher ─────────────────────────────────────────────────

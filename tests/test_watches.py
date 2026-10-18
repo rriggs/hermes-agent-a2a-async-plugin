@@ -612,6 +612,67 @@ def test_a_pending_publication_survives_a_restart():
     assert [p["event_id"] for p in second.published] == [lost["event_id"]]
 
 
+def test_an_enqueue_failure_leaves_the_item_open_for_the_next_poll():
+    """Completion is recorded only after its message is durable: a failed enqueue must retry."""
+    ctx = FakeCtx()
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")),
+                       ctx=ctx)
+    watch = _add(manager)
+    store = _store()
+    real_enqueue = store.enqueue_publication
+    calls = {"n": 0}
+
+    def flaky_enqueue(**kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("ledger locked")
+        return real_enqueue(**kwargs)
+
+    store.enqueue_publication = flaky_enqueue  # type: ignore[method-assign]
+    manager.store = store
+
+    assert manager.run_once(now=1_000.0) == 1
+    item = _store().get(watch["watch_id"])["items"][0]
+    assert item["completed_at"] is None, "a completion that never reached the outbox must stay open"
+    assert _outbox(watch["watch_id"]) == []
+
+    assert manager.run_once(now=1_010.0) == 1
+    assert [p["event_id"] for p in ctx.published]
+    assert _store().get(watch["watch_id"])["items"][0]["completed_at"] is not None
+
+
+def test_a_late_response_from_a_stale_owner_publishes_nothing():
+    """The poll can outlive the lease; the fold must be fenced, not just the item update."""
+    clock = [1_000.0]
+    store = _store()
+    box: dict[str, str] = {}
+
+    def poll(peer, task_id):
+        # While this poll is in flight, another process takes the watch after the lease lapses.
+        clock[0] += watches.LEASE_S + 10
+        assert store.claim(box["watch_id"], "other-owner", clock[0]) is True
+        return task_payload(state=protocol.STATE_INPUT_REQUIRED, text="which key?")
+
+    manager = watches.WatchManager(FakeCtx(), store=store, poll=poll, interval=5.0,
+                                   ttl_s=3600, clock=lambda: clock[0])
+    watch = _add(manager)
+    box["watch_id"] = watch["watch_id"]
+
+    manager.run_once(now=clock[0])
+
+    assert manager.ctx.published == [], "a stale owner must not publish a superseded observation"
+
+
+def test_stop_mid_batch_does_not_poll_or_publish_the_next_task():
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")))
+    watch = _add(manager, tasks=(("peer", "t1"), ("peer", "t2")))
+    manager._stop.set()
+
+    assert manager.run_once(now=1_000.0) == 0
+    assert manager.ctx.published == []
+    assert _store().get(watch["watch_id"])["items"][0]["completed_at"] is None
+
+
 def test_a_refused_input_required_notice_is_retried():
     ctx = FlakyCtx()
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_INPUT_REQUIRED,

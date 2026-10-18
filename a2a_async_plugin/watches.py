@@ -782,6 +782,8 @@ class WatchManager:
         polls = 0
         items = [dict(r) for r in con_items(self.store.db_path, watch_id)]
         for item in items:
+            if self._stop.is_set():
+                return polls  # unload asked us to stop; never start another poll
             if item["completed_at"] is not None:
                 continue
             if item["state"] in (ITEM_DONE, ITEM_PAUSED, ITEM_UNWATCHED):
@@ -812,6 +814,11 @@ class WatchManager:
                     next_poll_at=now + _backoff(item["errors"] + 1, self.interval),
                     owner=self.owner)
                 continue
+            # The poll can outlive the lease: another process then owns this watch. Re-check
+            # before the observation is folded, so a late response cannot record or publish a
+            # result the new owner has already superseded.
+            if self._stop.is_set() or not self.store.renew(watch_id, self.owner, self.clock()):
+                return polls
             self._apply_payload(watch, item, payload, now)
         self.store.settle(watch_id, now=now)
         return polls
@@ -831,36 +838,44 @@ class WatchManager:
 
         if raw_state in protocol.TERMINAL_STATES:
             self._reconcile_local_task(task_id, raw_state, text, context_id, peer)
-            self.store.mark_item(watch_id, peer, task_id, ITEM_DONE, owner=self.owner)
         elif raw_state == protocol.STATE_INPUT_REQUIRED:
             # Non-terminal by design: the peer needs a follow-up before it can finish. Pause this
             # task rather than spin on a state only the caller can resolve.
             self.store.record_working(watch_id, peer, task_id, raw_state, context_id,
                                       next_poll_at=float("inf"), owner=self.owner)
-            self.store.mark_item(watch_id, peer, task_id, ITEM_PAUSED, owner=self.owner)
         else:
             self.store.record_working(watch_id, peer, task_id, raw_state, context_id,
                                       next_poll_at=now + self.interval, owner=self.owner)
 
         queued = self._record_messages(task_id, peer, payload, raw_state)
         session_id = str(watch.get("session_id") or "")
-        if session_id:
-            owner = self.ownership.owner(task_id)
-            if owner != session_id:
-                # Released, or adopted by another session: keep recording, deliver nothing here.
-                return
-        target = _load_target(watch.get("target_json"))
         delivered: list[str] = []
-        for msg in queued:
-            row = self.store.enqueue_publication(
-                watch_id=watch_id, event_id=f"a2a:{task_id}:{msg['message_id']}",
-                content=_message_content(peer, task_id, str(msg["kind"]), str(msg["text"])),
-                metadata={"source": "a2a", "peer": peer, "task_id": task_id,
-                          "watch_id": watch_id, "state": _short_state(raw_state),
-                          "kind": msg["kind"], "message_id": msg["message_id"]})
-            delivered.append(str(msg["message_id"]))
-        if delivered:
-            self.ownership.mark_delivered(task_id, delivered, session_id, now)
+        enqueue_failed = False
+        if session_id and self.ownership.owner(task_id) == session_id:
+            for msg in queued:
+                try:
+                    self.store.enqueue_publication(
+                        watch_id=watch_id, event_id=f"a2a:{task_id}:{msg['message_id']}",
+                        content=_message_content(peer, task_id, str(msg["kind"]),
+                                                 str(msg["text"])),
+                        metadata={"source": "a2a", "peer": peer, "task_id": task_id,
+                                  "watch_id": watch_id, "state": _short_state(raw_state),
+                                  "kind": msg["kind"], "message_id": msg["message_id"]})
+                except Exception:
+                    logger.exception("A2A: could not enqueue %s/%s", task_id, msg["message_id"])
+                    enqueue_failed = True
+                    continue
+                delivered.append(str(msg["message_id"]))
+            if delivered:
+                # Only enqueued messages are delivered: the outbox is what makes the rest durable.
+                self.ownership.mark_delivered(task_id, delivered, session_id, now)
+        # The item is marked done only after its message is durably in the outbox. A crash or a
+        # failed enqueue leaves the item open, so the next poll retries it instead of losing the
+        # completion with the item already closed.
+        if raw_state in protocol.TERMINAL_STATES and not enqueue_failed:
+            self.store.mark_item(watch_id, peer, task_id, ITEM_DONE, owner=self.owner)
+        elif raw_state == protocol.STATE_INPUT_REQUIRED and not enqueue_failed:
+            self.store.mark_item(watch_id, peer, task_id, ITEM_PAUSED, owner=self.owner)
 
     def _record_messages(self, task_id: str, peer: str, payload: dict,
                          raw_state: str) -> list[dict]:

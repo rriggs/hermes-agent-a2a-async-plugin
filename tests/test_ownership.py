@@ -160,6 +160,31 @@ def test_session_hooks_release_on_end_and_reclaim_with_a_note_on_start():
     assert "reclaimed" in note and "t1" in note
 
 
+def test_new_releases_the_outgoing_session():
+    """The host names the outgoing session old_session_id on /new and /reset."""
+    protocol.TaskStore().create("t1", "ctx", "peer", direction="outbound")
+    store = _store()
+    store.acquire("t1", "sess-old")
+
+    class Ctx:
+        def __init__(self):
+            self.hooks: dict = {}
+
+        def register_hook(self, event, callback):
+            self.hooks.setdefault(event, []).append(callback)
+
+        def queue_context_note(self, text, key=""):
+            return True
+
+    ctx = Ctx()
+    tools._install_session_hooks(ctx)
+    for handler in ctx.hooks["on_session_reset"]:
+        handler(session_id="sess-new", old_session_id="sess-old")
+
+    assert store.owner("t1") == "", "the OLD session's ownership must be released"
+    assert store.owner("t1") != "sess-new"
+
+
 def test_a_client_detach_does_not_release_a_local_sessions_tasks():
     """A gateway-hosted local chat finalizes when its client detaches after a turn."""
     _task()
@@ -229,6 +254,55 @@ def test_await_refuses_a_task_owned_by_another_session():
     assert ok is False
     assert "owned by another session" in refusal
     assert store.owner("t1") == SESSION_B
+
+
+def test_a_refused_backlog_message_stays_queued():
+    _task()
+    store = _store()
+    store.add_message("t1", "m1", "progress", "one")
+    store.add_message("t1", "m2", "result", "two")
+
+    class Ctx:
+        def __init__(self):
+            self.seen = []
+
+        def publish_completion(self, *, target, event_id, content, metadata=None):
+            if metadata["message_id"] == "m2":
+                raise RuntimeError("ledger unavailable")
+            self.seen.append(metadata["message_id"])
+            return {"status": "queued"}
+
+    ctx = Ctx()
+    queued = store.queued("t1")
+    accepted = tools._publish_queued(ctx, "t1", "peer", SESSION_A, {"target_id": "x"}, queued)
+    tools._mark_backlog_delivered(
+        "t1", [m for m in queued if m["message_id"] in accepted], SESSION_A)
+
+    assert accepted == ["m1"]
+    assert [m["message_id"] for m in store.queued("t1")] == ["m2"], (
+        "a refused message must stay queued for the next await")
+
+
+def test_blocking_await_returns_progress_it_consumed(monkeypatch):
+    _task()
+    monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": "http://peer.invalid"})
+    responses = iter([
+        {"result": {"id": "t1", "contextId": "ctx-1",
+                    "status": {"state": "TASK_STATE_WORKING",
+                               "message": {"messageId": "m1",
+                                           "parts": [{"text": "halfway there"}]}}}},
+        {"result": {"id": "t1", "contextId": "ctx-1",
+                    "status": {"state": "TASK_STATE_COMPLETED"},
+                    "artifacts": [{"parts": [{"text": "done"}]}]}},
+    ])
+    monkeypatch.setattr(tools, "_rpc_request",
+                        lambda *a, **k: next(responses, {"result": {}}))
+
+    out = tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 10},
+                          session_id=SESSION_A)
+
+    assert "halfway there" in out, "progress observed during the wait must not be swallowed"
+    assert "done" in out
 
 
 def test_a_list_shows_ownership_per_task(monkeypatch):

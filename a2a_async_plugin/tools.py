@@ -544,8 +544,10 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
         queued = _queued_backlog(task_id)
         accepted = _publish_queued(ctx, task_id, agent_name, session_id or "", target, queued)
         if accepted:
-            _mark_backlog_delivered(task_id, queued, session_id or "")
-            delivered += accepted
+            # Only what the host accepted: a refused message stays queued for the next await.
+            _mark_backlog_delivered(
+                task_id, [m for m in queued if m["message_id"] in accepted], session_id or "")
+            delivered += len(accepted)
 
     watch_id = str(watch.get("watch_id") or "")
     ttl_hours = manager.ttl_s / 3600.0
@@ -684,9 +686,9 @@ def _digest(text: str) -> str:
 
 
 def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: Any,
-                    messages: list[dict]) -> int:
-    """Publish undelivered peer messages to the owning session; returns how many were accepted."""
-    published = 0
+                    messages: list[dict]) -> list[str]:
+    """Publish undelivered peer messages; returns the message ids the host accepted."""
+    published: list[str] = []
     for msg in messages:
         text = str(msg.get("text") or "").strip()
         if not text:
@@ -701,7 +703,7 @@ def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: 
         except Exception as exc:
             logger.warning("A2A: could not publish %s/%s: %s", task_id, msg["message_id"], exc)
             continue
-        published += 1
+        published.append(str(msg["message_id"]))
     return published
 
 
@@ -796,13 +798,17 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                 if short == "input-required":
                     ctx = str(payload.get("contextId", ""))
                     body += f"\n\n(Peer needs input — reply via a2a_submit with context_id '{ctx}'.)"
-                prefix = ("\n".join(preface) + "\n\n") if preface else ""
-                return f"{prefix}{header}\n{body}"
+                progress = _backlog_lines(
+                    [m for m in queued_now if str(m.get("kind")) != "result"])
+                prefix = "\n".join(preface + progress)
+                return f"{prefix}\n\n{header}\n{body}" if prefix else f"{header}\n{body}"
         if time.time() >= deadline:
-            _mark_backlog_delivered(task_id, backlog, session_id or "")
-            prefix = ("\n".join(preface) + "\n\n") if preface else ""
-            return (f"{prefix}[{agent} · task {task_id} · still working after {timeout}s]\n"
+            observed = _queued_backlog(task_id)
+            _mark_backlog_delivered(task_id, observed, session_id or "")
+            prefix = "\n".join(preface + _backlog_lines(observed))
+            note = (f"[{agent} · task {task_id} · still working after {timeout}s]\n"
                     f"Call a2a_await again or check a2a_get_task.")
+            return f"{prefix}\n\n{note}" if prefix else note
         time.sleep(interval)
 
 
@@ -948,7 +954,8 @@ def _on_session_start(ctx: Any, payload: dict) -> None:
 
 
 def _on_session_end(ctx: Any, payload: dict, *, boundary: str = "reset") -> None:
-    session_id = str(payload.get("session_id") or "")
+    # /new and /reset name the OUTGOING session as old_session_id; session_id is the new one.
+    session_id = str(payload.get("old_session_id") or payload.get("session_id") or "")
     if not session_id:
         return
     # A finalize is not always an end: on a gateway-hosted local chat (and a TUI tab) it fires

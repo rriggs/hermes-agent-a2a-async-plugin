@@ -6,7 +6,11 @@ from pathlib import Path
 # sibling package: one name for one body of code. Pointing __path__ at the implementation directory
 # means a plugin loaded by file location (Hermes discovery, the test harness) and one loaded by
 # import name cannot end up as two module trees with relative imports resolving in the wrong one.
-__path__ = [str(Path(__file__).resolve().parent / "a2a_async_plugin")]
+_HERE = Path(__file__).resolve().parent
+# Inner package first (the implementation), checkout root second: pytest imports the tests
+# package as "<checkout>.tests" when the checkout directory name is a valid identifier, and that
+# needs the root on the search path.
+__path__ = [str(_HERE / "a2a_async_plugin"), str(_HERE)]
 
 if __package__:  # pytest may import this file as a bare sentinel; only a package has submodules
     from . import tools  # noqa: E402

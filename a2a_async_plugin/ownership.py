@@ -32,6 +32,24 @@ from . import protocol
 TERMINAL_REMOTE_STATES = frozenset(protocol.TERMINAL_STATES)
 
 
+# A publication names its task either as "task_id" or inside a "tasks" list. The list holds the
+# production "peer/task" form, so matching bare ids alone leaves an aggregate notice publishable
+# after one of its tasks is released.
+PUBLICATION_NAMES_TASK = """(json_extract(metadata_json, '$.task_id')=?
+    OR EXISTS (SELECT 1 FROM json_each(metadata_json, '$.tasks') AS t
+                WHERE t.value=?
+                   OR substr(t.value, -length(?)-1)='/'||?))"""
+
+
+class OwnershipConflict(RuntimeError):
+    """Another session owns the task; acquisition is atomic, so nothing is claimed."""
+
+    def __init__(self, task_id: str, owner: str) -> None:
+        super().__init__(f"task {task_id} is owned by another session")
+        self.task_id = task_id
+        self.owner = owner
+
+
 class OwnershipStore:
     """Profile-scoped ownership + message queue for A2A task records."""
 
@@ -171,14 +189,10 @@ class OwnershipStore:
 
     @staticmethod
     def _drop_publications(con: sqlite3.Connection, task_id: str) -> None:
-        # A single-task event names task_id; a multi-task expiry notice lists them under "tasks".
         con.execute(
-            """DELETE FROM a2a_watch_publications
-                WHERE published_at IS NULL
-                  AND (json_extract(metadata_json, '$.task_id')=?
-                       OR EXISTS (SELECT 1 FROM json_each(metadata_json, '$.tasks')
-                                   WHERE json_each.value=?))""",
-            (task_id, task_id))
+            f"DELETE FROM a2a_watch_publications WHERE published_at IS NULL"
+            f" AND {PUBLICATION_NAMES_TASK}",
+            (task_id,) * 4)
 
     def owner(self, task_id: str) -> str:
         with self._session() as con:

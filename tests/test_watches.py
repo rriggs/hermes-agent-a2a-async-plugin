@@ -707,6 +707,22 @@ def test_releasing_every_task_also_removes_a_multi_task_expiry_notice():
     assert manager.flush_publications(now=20_000.0) == 0
 
 
+def test_release_drops_an_aggregate_notice_naming_peer_slash_task():
+    """Production expiry notices list tasks as "peer/task", not bare ids."""
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)))
+    watch = _add(manager, tasks=(("peer", "t1"), ("peer", "t2")))
+    with _store()._session() as con:
+        con.execute(
+            "INSERT INTO a2a_watch_publications (event_id, watch_id, content,"
+            " metadata_json, created_at) VALUES ('evt1', ?, 'notice', ?, ?)",
+            (watch["watch_id"], '{"source": "a2a", "state": "watch-expired",'
+             ' "tasks": ["peer/t1", "peer/t2"]}', 1000.0))
+
+    assert manager.ownership.release("t1", SESSION_ID)
+
+    assert [p["event_id"] for p in _outbox(watch["watch_id"], pending_only=True)] == []
+
+
 def test_a_row_deleted_by_release_is_not_published_from_a_stale_snapshot():
     """The flush must re-read under the write lock; a snapshot alone can outlive ownership."""
     ctx = FlakyCtx()

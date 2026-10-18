@@ -504,14 +504,12 @@ class WatchStore:
                 if not ids:
                     return 0
                 total = 0
+                from .ownership import PUBLICATION_NAMES_TASK
                 for task_id in ids:
                     total += con.execute(
-                        """DELETE FROM a2a_watch_publications
-                            WHERE published_at IS NULL
-                              AND (json_extract(metadata_json, '$.task_id')=?
-                                   OR EXISTS (SELECT 1 FROM json_each(metadata_json, '$.tasks')
-                                               WHERE json_each.value=?))""",
-                        (task_id, task_id)).rowcount
+                        f"DELETE FROM a2a_watch_publications WHERE published_at IS NULL"
+                        f" AND {PUBLICATION_NAMES_TASK}",
+                        (task_id,) * 4).rowcount
                 return total
             return cur.rowcount
 
@@ -764,7 +762,14 @@ class WatchManager:
         """Persist a watch, take ownership of its tasks, and start the poller."""
         watch_id = "watch_" + uuid.uuid4().hex[:16]
         items = list(tasks)
+        from . import ownership as ownership_mod
         with self._scope():
+            # Atomic acquisition: a watch for another session's task can never deliver, and
+            # ignoring the failed acquire handed its backlog to the wrong session.
+            for _peer, task_id in items:
+                owner = self.ownership.owner(task_id)
+                if owner and owner != (session_id or ""):
+                    raise ownership_mod.OwnershipConflict(task_id, owner)
             self.store.create(watch_id=watch_id, session_id=session_id or "", target=target,
                               tasks=items, ttl_s=self.ttl_s)
             # Ownership is a session fact: a watch is only created for tasks this session may
@@ -776,8 +781,9 @@ class WatchManager:
                 if task_store.get(task_id) is None:
                     task_store.create(task_id, task_id, peer, direction="outbound",
                                       remote_state=protocol.STATE_SUBMITTED)
-                if session_id:
-                    self.ownership.acquire(task_id, session_id)
+                if session_id and not self.ownership.acquire(task_id, session_id):
+                    self.store.cancel(watch_id)
+                    raise ownership_mod.OwnershipConflict(task_id, self.ownership.owner(task_id))
             watch = self.store.get(watch_id) or {"watch_id": watch_id}
         self.start()
         return watch

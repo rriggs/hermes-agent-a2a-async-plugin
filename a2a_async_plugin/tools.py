@@ -531,7 +531,7 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
     try:
         watch = manager.add(session_id=session_id or "", target=target, tasks=entries)
     except Exception as exc:
-        logger.exception("A2A: background watch creation failed")
+        from . import ownership as ownership_mod
         # add() acquires inside; undo anything THIS call newly claimed so a failed start does not
         # leave tasks that no watch is polling.
         if session_id:
@@ -539,12 +539,19 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
             for _agent, task_id in entries:
                 if not owners_before.get(task_id) and store.owner(task_id) == session_id:
                     store.release(task_id, session_id)
+        if isinstance(exc, ownership_mod.OwnershipConflict):
+            return (f"Error: task {exc.task_id} is owned by another session ({exc.owner}). "
+                    "a2a_release_task_ownership there, or await it from that session.")
+        logger.exception("A2A: background watch creation failed")
         return f"Error: could not start the background watch — {exc}"
 
     # Anything the task produced while nobody owned it is delivered now, through the target just
     # captured for this session.
     delivered = 0
+    ownership_store = _ownership()
     for agent_name, task_id in entries:
+        if ownership_store.owner(task_id) != (session_id or ""):
+            continue  # never publish a backlog this session does not own
         queued = _queued_backlog(task_id)
         accepted = _publish_queued(ctx, task_id, agent_name, session_id or "", target, queued)
         if accepted:

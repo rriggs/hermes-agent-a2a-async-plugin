@@ -326,6 +326,42 @@ def test_timer_actions_do_not_touch_a_task_adopted_after_selection():
     assert [m["message_id"] for m in store.queued("t1")] == ["m1"], "the adopted backlog survives"
 
 
+def test_a_background_await_of_another_sessions_task_is_refused(monkeypatch):
+    """A watch for a task this session cannot deliver must not exist, and its backlog must survive."""
+    _task("t1")
+    _store().acquire("t1", SESSION_A)
+    _store().add_message("t1", "m1", "result", "A's result")
+
+    class Ctx:
+        def capture_completion_target(self, *, session_id=None):
+            return {"target_id": "pct_test"}
+
+        def publish_completion(self, **kwargs):
+            raise AssertionError("another session's backlog must never be published")
+
+    class Manager:
+        def start(self):
+            return self
+
+        def cancel_session(self, session_id, task_ids=None):
+            return 0
+
+        def add(self, *, session_id, target, tasks):
+            from a2a_async_plugin.ownership import OwnershipConflict
+            raise OwnershipConflict("t1", SESSION_A)
+
+    monkeypatch.setattr(tools, "_CTX", Ctx())
+    monkeypatch.setattr(tools, "_completion_capable", lambda ctx: True)
+    monkeypatch.setattr(tools, "_watch_manager", lambda ctx=None: Manager())
+    monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": "http://peer.invalid"})
+
+    out = tools._start_background_watch({"agent": "peer", "task_id": "t1"}, SESSION_B)
+
+    assert "owned by another session" in out
+    assert _store().owner("t1") == SESSION_A
+    assert [m["message_id"] for m in _store().queued("t1")] == ["m1"]
+
+
 def test_a_refused_background_await_claims_no_tasks(monkeypatch):
     _task("t1")
 

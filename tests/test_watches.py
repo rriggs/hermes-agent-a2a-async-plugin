@@ -229,7 +229,7 @@ def test_a_terminal_state_publishes_one_completion_and_updates_the_task_record(t
     assert manager.run_once(now=200.0) == 1          # completed: publish
     [published] = manager.ctx.published
     assert "finished the job" in published["content"]
-    assert "completed" in published["content"]
+    assert "returned a result" in published["content"]
     assert published["metadata"]["peer"] == "peer"
     assert published["metadata"]["task_id"] == "t1"
     assert published["metadata"]["watch_id"] == watch["watch_id"]
@@ -431,7 +431,7 @@ def test_rehydration_resumes_a_persisted_watch(monkeypatch):
     resumed.run_once(now=100.0)
 
     [published] = ctx.published
-    assert published["event_id"].startswith(f"a2a:{watch_id}:peer:t1:")
+    assert published["event_id"].startswith("a2a:t1:")
     assert "after restart" in published["content"]
 
 
@@ -529,13 +529,15 @@ def test_watch_publishes_through_the_real_hermes_publisher(tmp_path, monkeypatch
 
         manager.run_once(now=100.0)
 
-        receipt_row = pc._existing_completion("a2a-async", "agent:main:telegram:dm:42",
-                                              f"a2a:{watch['watch_id']}:peer:t1:completed")
+        [published] = _outbox(watch["watch_id"])
+        event_id = published["event_id"]
+        assert event_id.startswith("a2a:t1:")
+        receipt_row = pc._existing_completion("a2a-async", SESSION_ID, event_id)
         assert receipt_row is not None
         assert receipt_row["delivery_state"] == "pending", "queued for the surface, not yet delivered"
-        # A restarted watcher re-observing the same terminal state gets a duplicate receipt.
+        # Re-publishing the same message id for the same conversation is a duplicate receipt.
         again = manager.ctx.publish_completion(
-            target=target, event_id=f"a2a:{watch['watch_id']}:peer:t1:completed", content="again")
+            target=target, event_id=event_id, content="again")
         assert again["status"] == "duplicate"
     finally:
         clear_session_vars(tokens)

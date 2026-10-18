@@ -46,7 +46,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-from . import protocol
+from . import ownership, protocol
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +68,10 @@ PUBLICATION_BACKOFF_S = 5.0
 MAX_PUBLICATION_BACKOFF_S = 300.0
 # Finished watches and delivered outbox rows are pruned after this window (no unpublished rows).
 RETENTION_S = 7 * 24 * 3600.0
+# An unowned task is cancelled remotely after this long (it is costing a peer work nobody is
+# waiting for) and abandoned after the TTL. Both are configurable per profile.
+DEFAULT_UNOWNED_CANCEL_AFTER_S = 24 * 3600.0
+DEFAULT_UNOWNED_TTL_S = 7 * 24 * 3600.0
 # Keep a published completion inside the core publisher's content budget (32k chars).
 MAX_REPLY_CHARS = 24_000
 
@@ -380,6 +384,50 @@ class WatchStore:
             con.commit()
         return state
 
+    def cancel_session(self, session_id: str, task_ids: Optional[Iterable[str]] = None) -> int:
+        """Stop watching a session's tasks (session end, or an ownership release).
+
+        With ``task_ids``, only those items stop and each affected watch is settled; the watch
+        keeps polling its remaining tasks. Without, every active watch of the session is cancelled.
+        Returns the number of watches stopped or settled.
+        """
+        if not session_id:
+            return 0
+        now = time.time()
+        with self._session() as con:
+            if task_ids is None:
+                rows = con.execute(
+                    """SELECT watch_id FROM a2a_watches
+                        WHERE session_id=? AND state=?""",
+                    (session_id, WATCH_ACTIVE)).fetchall()
+                con.execute(
+                    """UPDATE a2a_watches SET state=?, lease_owner='', lease_until=0, updated_at=?
+                        WHERE session_id=? AND state=?""",
+                    (WATCH_CANCELED, now, session_id, WATCH_ACTIVE))
+                con.commit()
+                return len(rows)
+            ids = [str(t) for t in task_ids if t]
+            if not ids:
+                return 0
+            marks = ",".join("?" for _ in ids)
+            rows = con.execute(
+                f"""SELECT DISTINCT watch_id FROM a2a_watch_items
+                     WHERE task_id IN ({marks})
+                       AND watch_id IN (SELECT watch_id FROM a2a_watches
+                                         WHERE session_id=? AND state=?)""",
+                (*ids, session_id, WATCH_ACTIVE)).fetchall()
+            con.execute(
+                f"""UPDATE a2a_watch_items SET state=?, completed_at=?, updated_at=?
+                     WHERE task_id IN ({marks})
+                       AND watch_id IN (SELECT watch_id FROM a2a_watches
+                                         WHERE session_id=? AND state=?)""",
+                (ITEM_UNWATCHED, now, now, *ids, session_id, WATCH_ACTIVE))
+            con.commit()
+        watch_ids = [row["watch_id"] for row in rows]
+        for watch_id in watch_ids:
+            self.settle(watch_id, now=now)
+        return len(watch_ids)
+
     def cancel(self, watch_id: str, session_id: str = "") -> Optional[str]:
         """Stop polling a watch. Returns the prior state, or None when unknown/not owned."""
         now = time.time()
@@ -599,6 +647,11 @@ class WatchManager:
                                    MIN_POLL_INTERVAL_S, MAX_POLL_INTERVAL_S)
         self.ttl_s = _env_float("A2A_WATCH_TTL", ttl_s, DEFAULT_WATCH_TTL_S, 60.0, 365 * 24 * 3600.0)
         self.owner = f"{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        self.ownership = ownership.OwnershipStore(self.store.db_path)
+        self.unowned_cancel_after_s = _config_float(
+            "unowned_cancel_after_s", "A2A_UNOWNED_CANCEL_AFTER", DEFAULT_UNOWNED_CANCEL_AFTER_S)
+        self.unowned_ttl_s = _config_float(
+            "unowned_task_ttl_s", "A2A_UNOWNED_TASK_TTL", DEFAULT_UNOWNED_TTL_S)
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
 
@@ -632,11 +685,23 @@ class WatchManager:
     # -- operations -------------------------------------------------------
     def add(self, *, session_id: str, target: dict,
             tasks: Iterable[tuple[str, str]]) -> dict:
-        """Persist a watch and start the poller; returns the watch record."""
+        """Persist a watch, take ownership of its tasks, and start the poller."""
         watch_id = "watch_" + uuid.uuid4().hex[:16]
+        items = list(tasks)
         with self._scope():
             self.store.create(watch_id=watch_id, session_id=session_id or "", target=target,
-                              tasks=tasks, ttl_s=self.ttl_s)
+                              tasks=items, ttl_s=self.ttl_s)
+            # Ownership is a session fact: a watch is only created for tasks this session may
+            # deliver. The caller refuses another session's tasks first (tools._acquire_task); the
+            # acquire here covers direct manager use and makes the record exist before the first
+            # poll so messages have somewhere to land.
+            task_store = protocol.TaskStore(self.store.db_path)
+            for peer, task_id in items:
+                if task_store.get(task_id) is None:
+                    task_store.create(task_id, task_id, peer, direction="outbound",
+                                      remote_state=protocol.STATE_SUBMITTED)
+                if session_id:
+                    self.ownership.acquire(task_id, session_id)
             watch = self.store.get(watch_id) or {"watch_id": watch_id}
         self.start()
         return watch
@@ -644,6 +709,11 @@ class WatchManager:
     def cancel(self, watch_id: str, *, session_id: str = "") -> Optional[str]:
         with self._scope():
             return self.store.cancel(watch_id, session_id=session_id)
+
+    def cancel_session(self, session_id: str, task_ids: Optional[Iterable[str]] = None) -> int:
+        """Stop polling what a session no longer owns (session end or an ownership release)."""
+        with self._scope():
+            return self.store.cancel_session(session_id, task_ids=task_ids)
 
     def rehydrate(self) -> int:
         """Resume persisted watches and undelivered publications; returns the work count.
@@ -672,6 +742,7 @@ class WatchManager:
                 finally:
                     self.store.release(watch["watch_id"], self.owner)
             self.flush_publications(now)
+            self._maintain_unowned(now)
             self.store.prune(now)
         return polls
 
@@ -746,40 +817,104 @@ class WatchManager:
         return polls
 
     def _apply_payload(self, watch: dict, item: dict, payload: dict, now: float) -> None:
-        """Fold one authoritative task payload into local state and enqueue what it means."""
+        """Fold one authoritative task payload into local state and deliver what it contains.
+
+        Every peer message the payload carries (progress note, artifact/result, input request) is
+        recorded on the task once, keyed by its message id. While this session owns the task the
+        new messages are published to it; while the task is unowned they stay queued for whoever
+        adopts it.
+        """
         raw_state = str((payload.get("status") or {}).get("state") or "")
-        short = _short_state(raw_state)
         context_id = str(payload.get("contextId") or "")
         task_id, peer, watch_id = item["task_id"], item["peer"], watch["watch_id"]
         text = _reply_text(payload)
 
         if raw_state in protocol.TERMINAL_STATES:
             self._reconcile_local_task(task_id, raw_state, text, context_id, peer)
-            self._enqueue(
-                watch, item, suffix=short,
-                content=_terminal_content(peer, task_id, short, text),
-                metadata={"source": "a2a", "peer": peer, "task_id": task_id,
-                          "watch_id": watch_id, "state": short,
-                          "context_id": context_id or item["context_id"]})
             self.store.mark_item(watch_id, peer, task_id, ITEM_DONE, owner=self.owner)
-            return
-
-        if raw_state == protocol.STATE_INPUT_REQUIRED:
-            # Non-terminal by design: the peer needs a follow-up before it can finish. Report it
-            # once and pause this task rather than spin on a state only the caller can resolve.
-            self._enqueue(
-                watch, item, suffix="input-required",
-                content=_input_required_content(peer, task_id, text, context_id),
-                metadata={"source": "a2a", "peer": peer, "task_id": task_id,
-                          "watch_id": watch_id, "state": "input-required",
-                          "context_id": context_id or item["context_id"]})
+        elif raw_state == protocol.STATE_INPUT_REQUIRED:
+            # Non-terminal by design: the peer needs a follow-up before it can finish. Pause this
+            # task rather than spin on a state only the caller can resolve.
             self.store.record_working(watch_id, peer, task_id, raw_state, context_id,
                                       next_poll_at=float("inf"), owner=self.owner)
             self.store.mark_item(watch_id, peer, task_id, ITEM_PAUSED, owner=self.owner)
-            return
+        else:
+            self.store.record_working(watch_id, peer, task_id, raw_state, context_id,
+                                      next_poll_at=now + self.interval, owner=self.owner)
 
-        self.store.record_working(watch_id, peer, task_id, raw_state, context_id,
-                                  next_poll_at=now + self.interval, owner=self.owner)
+        queued = self._record_messages(task_id, peer, payload, raw_state)
+        session_id = str(watch.get("session_id") or "")
+        if session_id:
+            owner = self.ownership.owner(task_id)
+            if owner != session_id:
+                # Released, or adopted by another session: keep recording, deliver nothing here.
+                return
+        target = _load_target(watch.get("target_json"))
+        delivered: list[str] = []
+        for msg in queued:
+            row = self.store.enqueue_publication(
+                watch_id=watch_id, event_id=f"a2a:{task_id}:{msg['message_id']}",
+                content=_message_content(peer, task_id, str(msg["kind"]), str(msg["text"])),
+                metadata={"source": "a2a", "peer": peer, "task_id": task_id,
+                          "watch_id": watch_id, "state": _short_state(raw_state),
+                          "kind": msg["kind"], "message_id": msg["message_id"]})
+            delivered.append(str(msg["message_id"]))
+        if delivered:
+            self.ownership.mark_delivered(task_id, delivered, session_id, now)
+
+    def _record_messages(self, task_id: str, peer: str, payload: dict,
+                         raw_state: str) -> list[dict]:
+        """Store every new peer message on the task; returns the still-undelivered ones."""
+        from . import tools
+        status_msg = (payload.get("status") or {}).get("message") or {}
+        status_text = tools._text_of_message(status_msg)
+        if status_text:
+            kind = "input-required" if raw_state == protocol.STATE_INPUT_REQUIRED else "progress"
+            message_id = str(status_msg.get("messageId") or status_msg.get("message_id")
+                             or f"status:{tools._digest(status_text)}")
+            self.ownership.add_message(task_id, message_id, kind, status_text)
+        for index, artifact in enumerate(payload.get("artifacts") or []):
+            text = tools._text_of_message(artifact)
+            if not text:
+                continue
+            artifact_id = str(artifact.get("artifactId") or artifact.get("artifact_id")
+                              or f"artifact:{index}:{tools._digest(text)}")
+            kind = "input-required" if raw_state == protocol.STATE_INPUT_REQUIRED else "result"
+            self.ownership.add_message(task_id, artifact_id, kind, text)
+        if raw_state in protocol.TERMINAL_STATES and not self.ownership.has_kind(task_id, "result"):
+            self.ownership.add_message(
+                task_id, f"state:{raw_state}", "result",
+                f"task reached {_short_state(raw_state)} with no text reply")
+        return self.ownership.queued(task_id)
+
+    def _maintain_unowned(self, now: float) -> None:
+        """Cancel unowned tasks after the configured delay, abandon them after the TTL."""
+        from . import tools
+        try:
+            cancel, abandon = self.ownership.unowned_due(
+                now, cancel_after_s=self.unowned_cancel_after_s, ttl_s=self.unowned_ttl_s)
+        except Exception:
+            logger.debug("A2A: unowned task sweep failed", exc_info=True)
+            return
+        for rec in cancel:
+            task_id = str(rec["task_id"])
+            peer_name = str(rec["peer"] or "")
+            peer = tools._resolve_peer(peer_name)
+            if peer and peer.get("url"):
+                try:
+                    tools._rpc_request(peer, "CancelTask", {"id": task_id}, timeout=15)
+                    logger.info("A2A: cancelled unowned task %s on %s", task_id, peer_name)
+                except Exception as exc:
+                    logger.debug("A2A: CancelTask for unowned %s failed: %s", task_id, exc)
+            self.ownership.mark_cancel_requested(task_id, now)
+            self.ownership.add_message(
+                task_id, f"auto-cancel:{int(now)}", "error",
+                "This task was unowned for longer than the auto-cancellation timeout, so the "
+                "watcher asked the peer to cancel it. Its remote state may still be working.")
+        for rec in abandon:
+            task_id = str(rec["task_id"])
+            self.ownership.abandon(task_id, now)
+            logger.info("A2A: abandoned unowned task %s after the TTL", task_id)
 
     def _reconcile_local_task(self, task_id: str, raw_state: str, text: str,
                               context_id: str, peer: str) -> None:
@@ -854,6 +989,28 @@ class WatchManager:
 # --------------------------------------------------------------------------
 # Formatting
 # --------------------------------------------------------------------------
+
+def _message_content(peer: str, task_id: str, kind: str, text: str) -> str:
+    from . import tools
+    return tools._peer_message_content(peer, task_id, kind, text)
+
+
+def _config_float(key: str, env_name: str, default: float) -> float:
+    """A tuning value from ``a2a.<key>`` in config.yaml, else the env var, else the default."""
+    try:
+        from . import tools
+        section = (tools._load_config() or {}).get("a2a") or {}
+        raw = section.get(key)
+    except Exception:
+        raw = None
+    if raw in (None, ""):
+        raw = os.getenv(env_name, "").strip()
+    try:
+        value = float(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        value = default
+    return max(60.0, value)
+
 
 def _terminal_content(peer: str, task_id: str, short: str, text: str) -> str:
     body = (text or "(the peer returned no text reply)")[:MAX_REPLY_CHARS]

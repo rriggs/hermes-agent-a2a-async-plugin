@@ -78,6 +78,11 @@ def hermetic_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("A2A_WATCH_INTERVAL", "2")
     monkeypatch.setenv("A2A_TASKS_DB", str(home / "a2a_tasks.db"))
+    # A manager left over from another test points at ITS temp DB (and its session): a fresh
+    # process loads the plugin for this home, so reset the process-wide singletons too.
+    from a2a_async_plugin import tools as a2a_tools
+    monkeypatch.setattr(a2a_tools, "_WATCH_MANAGER", None)
+    monkeypatch.setattr(a2a_tools, "_CTX", None)
     return home
 
 
@@ -129,7 +134,7 @@ def test_background_await_delivers_through_real_hermes(hermetic_home, peer, monk
         plugins_mod.discover_plugins()
         result = registry.dispatch(
             "a2a_await",
-            {"agent": "peer", "task_id": "t1", "background": True},
+            {"agent": "peer", "task_id": "t-int", "background": True},
             session_id="sess-int",
         )
         assert result.startswith("[watch watch_"), result
@@ -139,7 +144,7 @@ def test_background_await_delivers_through_real_hermes(hermetic_home, peer, monk
         # completion queue is process-global, so wait for THIS watch's event and leave any
         # unrelated events (another test's completions) where they were.
         queue = process_registry.completion_queue
-        expected = f"a2a:{watch_id}:peer:t1:completed"
+        expected = "a2a:t-int:"  # one event per peer message: a2a:<task>:<message id>
         deadline = time.time() + 20.0
         event, others = None, []
         while time.time() < deadline and event is None:
@@ -148,23 +153,23 @@ def test_background_await_delivers_through_real_hermes(hermetic_home, peer, monk
                     candidate = queue.get_nowait()
                 except Exception:
                     break
-                if candidate.get("event_id") == expected:
+                if str(candidate.get("event_id") or "").startswith(expected):
                     event = candidate
                 else:
                     others.append(candidate)
             if event is None:
                 time.sleep(0.1)
-        assert event is not None, f"the watch never published {expected}"
+        assert event is not None, f"the watch never published an event for {expected}*"
         for evt in others + [event]:  # restore the queue for the session drain below
             queue.put(evt)
         assert event["plugin_id"] == "a2a-async"
-        assert event["event_id"] == f"a2a:{watch_id}:peer:t1:completed"
-        assert "peer finished t1" in event["content"]
+        assert event["event_id"].startswith(expected)
+        assert "peer finished t-int" in event["content"]
         assert event["metadata"]["state"] == "completed"
         assert event["session_key"] == "agent:main:telegram:dm:42"
 
         row = pc._existing_completion(
-            "a2a-async", "agent:main:telegram:dm:42", event["event_id"])
+            "a2a-async", "sess-int", event["event_id"])
         assert row is not None and row["delivery_state"] == "pending"
 
         # The session's drain claims and formats it, then acknowledges the ledger row.
@@ -173,13 +178,14 @@ def test_background_await_delivers_through_real_hermes(hermetic_home, peer, monk
             session_key="agent:main:telegram:dm:42",
             owns_event=lambda e: e.get("session_key") == "agent:main:telegram:dm:42")
         assert [(e.get("event_id"), text) for e, text in drained], "the completion was not drained"
-        evt, text = next((e, t) for e, t in drained if e.get("event_id") == expected)
-        assert "peer finished t1" in text and "plugin a2a-async" in text
+        evt, text = next((e, t) for e, t in drained
+                         if str(e.get("event_id") or "").startswith(expected))
+        assert "peer finished t-int" in text and "plugin a2a-async" in text
         claim = claim_event_delivery(evt, "integration:cli")
         assert claim
         complete_event_delivery(evt, claim)
         assert pc._existing_completion(
-            "a2a-async", "agent:main:telegram:dm:42", expected)["delivery_state"] == "delivered"
+            "a2a-async", "sess-int", evt["event_id"])["delivery_state"] == "delivered"
 
         # Cancelling a watch that is still polling stops it; the remote task is untouched and no
         # remote cancellation request is sent.

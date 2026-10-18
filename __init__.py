@@ -1,9 +1,16 @@
 import logging
 import os
+from pathlib import Path
 
-if __package__:
-    from .a2a_async_plugin import tools
-else:  # pytest imports repository root __init__.py as a sentinel module.
+# The implementation lives in ./a2a_async_plugin/. This file is that package's entry point, not a
+# sibling package: one name for one body of code. Pointing __path__ at the implementation directory
+# means a plugin loaded by file location (Hermes discovery, the test harness) and one loaded by
+# import name cannot end up as two module trees with relative imports resolving in the wrong one.
+__path__ = [str(Path(__file__).resolve().parent / "a2a_async_plugin")]
+
+if __package__:  # pytest may import this file as a bare sentinel; only a package has submodules
+    from . import tools  # noqa: E402
+else:
     tools = None
 
 logger = logging.getLogger(__name__)
@@ -28,8 +35,8 @@ def interactive_setup() -> None:
     return None
 
 def register(ctx) -> None:
-    from .a2a_async_plugin.tools import register_tools
-    from .a2a_async_plugin.adapter import A2AAdapter
+    from .tools import register_tools
+    from .adapter import A2AAdapter
 
     register_tools(ctx)
     ctx.register_platform(

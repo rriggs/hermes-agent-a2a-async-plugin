@@ -509,6 +509,12 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
     if unknown:
         return (f"Error: unknown agent '{unknown[0]}'. Configure it under 'a2a_agents' in "
                 f"config.yaml or pass a full http(s):// URL.")
+    # Ownership first: only unowned (or already ours) tasks may be watched. A refusal here names
+    # the task instead of starting a watch that could never deliver.
+    for agent_name, task_id in entries:
+        ok, refusal = _acquire_task(task_id, session_id or "", agent_name)
+        if not ok:
+            return refusal
     ctx = _CTX
     if not _completion_capable(ctx):
         return (
@@ -531,12 +537,24 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
         logger.exception("A2A: background watch creation failed")
         return f"Error: could not start the background watch — {exc}"
 
+    # Anything the task produced while nobody owned it is delivered now, through the target just
+    # captured for this session.
+    delivered = 0
+    for agent_name, task_id in entries:
+        queued = _queued_backlog(task_id)
+        accepted = _publish_queued(ctx, task_id, agent_name, session_id or "", target, queued)
+        if accepted:
+            _mark_backlog_delivered(task_id, queued, session_id or "")
+            delivered += accepted
+
     watch_id = str(watch.get("watch_id") or "")
     ttl_hours = manager.ttl_s / 3600.0
     lines = [
         f"[watch {watch_id} · {len(entries)} task(s) · background]",
         "Watching:",
         *(f"  - {peer} · task {task_id}" for peer, task_id in entries),
+        *([f"Delivered {delivered} queued message(s) from before this session owned the task."]
+          if delivered else []),
         "",
         f"The watch polls every {int(manager.interval)}s (with backoff on transient peer errors) "
         f"and expires after {ttl_hours:.0f}h. Continue with other work: when a task reaches a "
@@ -545,6 +563,159 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
         f"without cancelling remote work.",
     ]
     return "\n".join(lines)
+
+
+
+
+# ---------------------------------------------------------------------------
+# Task ownership (protocol: a task is unowned or owned by exactly one session)
+# ---------------------------------------------------------------------------
+
+def _ownership(ctx: Any = None):
+    from . import ownership
+    ctx = ctx if ctx is not None else _CTX
+    return ownership.OwnershipStore(_plugin_db_path(ctx))
+
+
+def _ensure_task_record(task_id: str, peer: str, context_id: str = "",
+                        remote_state: str = "") -> dict:
+    """Create the durable task record when the caller only knows the id (adoption)."""
+    store = _task_store()
+    record = store.get(task_id)
+    if record is None:
+        record = store.create(task_id, context_id or task_id, peer, direction="outbound",
+                              ownership="remote", remote_state=remote_state)
+    return record
+
+
+def _acquire_task(task_id: str, session_id: str, peer: str) -> tuple[bool, str]:
+    """Acquire ``task_id`` for this session. Returns (ok, error message)."""
+    _ensure_task_record(task_id, peer)
+    if not session_id:
+        return True, ""  # no bound session (one-shot caller): ownership is not tracked
+    store = _ownership()
+    owner = store.owner(task_id)
+    if owner and owner != session_id:
+        return False, (f"Error: a2a task {task_id} is owned by another session. "
+                       f"Only unowned tasks can be adopted; ask the owning session to release it.")
+    if not store.acquire(task_id, session_id):
+        return False, (f"Error: a2a task {task_id} is owned by another session. "
+                       f"Only unowned tasks can be adopted.")
+    return True, ""
+
+
+def _queued_backlog(task_id: str) -> list[dict]:
+    try:
+        return _ownership().queued(task_id)
+    except Exception:
+        logger.debug("A2A: backlog read failed", exc_info=True)
+        return []
+
+
+def _mark_backlog_delivered(task_id: str, messages: list[dict], session_id: str) -> None:
+    if not messages or not session_id:
+        return
+    try:
+        _ownership().mark_delivered(task_id, [m["message_id"] for m in messages], session_id)
+    except Exception:
+        logger.debug("A2A: backlog delivery marker failed", exc_info=True)
+
+
+def _backlog_lines(messages: list[dict]) -> list[str]:
+    """Render queued peer messages for an inline (blocking await) return, or for a tool result."""
+    lines: list[str] = []
+    for msg in messages:
+        kind = str(msg.get("kind") or "progress")
+        text = str(msg.get("text") or "").strip()
+        if not text:
+            continue
+        label = {"result": "result", "progress": "progress", "input-required": "needs input",
+                 "error": "error"}.get(kind, kind)
+        lines.append(f"[queued {label}] {text}")
+    return lines
+
+
+def _record_observation(task_id: str, payload: dict, peer: str) -> list[dict]:
+    """Store every new peer message on the task; returns the ones still queued (all of them)."""
+    from . import ownership
+    store = ownership.OwnershipStore(_plugin_db_path(_CTX))
+    state = str((payload.get("status") or {}).get("state") or "")
+    context_id = str(payload.get("contextId") or "")
+    _ensure_task_record(task_id, peer, context_id, state)
+    try:
+        status_msg = (payload.get("status") or {}).get("message") or {}
+        message_id = str(status_msg.get("messageId") or status_msg.get("message_id") or "")
+        status_text = _text_of_message(status_msg)
+        if status_text:
+            kind = "input-required" if state == protocol.STATE_INPUT_REQUIRED else "progress"
+            store.add_message(task_id, message_id or f"status:{_digest(status_text)}", kind, status_text)
+        for index, artifact in enumerate(payload.get("artifacts") or []):
+            text = _text_of_message(artifact)
+            if not text:
+                continue
+            artifact_id = str(artifact.get("artifactId") or artifact.get("artifact_id")
+                              or f"artifact:{index}:{_digest(text)}")
+            store.add_message(task_id, artifact_id, "result", text)
+        if state in protocol.TERMINAL_STATES and not any(
+                m["kind"] == "result" for m in store.queued(task_id)):
+            store.add_message(task_id, f"state:{state}", "result",
+                              f"task reached {_short_state(state)} with no text reply")
+    except Exception:
+        logger.debug("A2A: message recording failed", exc_info=True)
+    return store.queued(task_id)
+
+
+def _text_of_message(message: Any) -> str:
+    if not isinstance(message, dict):
+        return ""
+    parts = message.get("parts")
+    if isinstance(parts, list):
+        texts = [str(part.get("text") or "") for part in parts
+                 if isinstance(part, dict) and part.get("kind", "text") in ("text", "")]
+        joined = "\n".join(t for t in texts if t).strip()
+        if joined:
+            return joined
+    return str(message.get("text") or "").strip()
+
+
+def _digest(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: Any,
+                    messages: list[dict]) -> int:
+    """Publish undelivered peer messages to the owning session; returns how many were accepted."""
+    published = 0
+    for msg in messages:
+        text = str(msg.get("text") or "").strip()
+        if not text:
+            continue
+        kind = str(msg.get("kind") or "progress")
+        content = _peer_message_content(peer, task_id, kind, text)
+        try:
+            ctx.publish_completion(
+                target=target, event_id=f"a2a:{task_id}:{msg['message_id']}", content=content,
+                metadata={"source": "a2a", "peer": peer, "task_id": task_id,
+                          "state": kind, "message_id": msg["message_id"]})
+        except Exception as exc:
+            logger.warning("A2A: could not publish %s/%s: %s", task_id, msg["message_id"], exc)
+            continue
+        published += 1
+    return published
+
+
+def _peer_message_content(peer: str, task_id: str, kind: str, text: str) -> str:
+    if kind == "result":
+        head = f"A2A task {task_id} on peer '{peer}' returned a result."
+    elif kind == "input-required":
+        head = (f"A2A task {task_id} on peer '{peer}' needs input before it can finish. "
+                f"Reply with a2a_submit using the task's context_id.")
+    elif kind == "error":
+        head = f"A2A task {task_id} on peer '{peer}' reported a problem."
+    else:
+        head = f"A2A task {task_id} on peer '{peer}' sent a progress note."
+    return f"{head}\n\n{text}"
 
 
 def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
@@ -572,15 +743,27 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
     if not peer or not peer.get("url"):
         return f"Error: unknown agent '{agent}'."
 
+    # Ownership: a session-level fact. This call acquires an unowned task, refuses one owned by
+    # another session, and keeps ownership after the await returns.
+    ok, refusal = _acquire_task(task_id, session_id or "", agent)
+    if not ok:
+        return refusal
+    backlog = _queued_backlog(task_id)
+    preface = _backlog_lines(backlog)
+
     deadline = time.time() + timeout
     last_state = ""
     while True:
         try:
             resp = _rpc_request(peer, "GetTask", {"id": task_id}, timeout=30)
         except Exception as e:
-            return f"Error: poll of '{agent}' failed — {e}."
+            _mark_backlog_delivered(task_id, backlog, session_id or "")
+            prefix = ("\n".join(preface) + "\n\n") if preface else ""
+            return prefix + f"Error: poll of '{agent}' failed — {e}."
         if "error" in resp:
-            return _peer_rpc_error(resp, agent)
+            _mark_backlog_delivered(task_id, backlog, session_id or "")
+            prefix = ("\n".join(preface) + "\n\n") if preface else ""
+            return prefix + _peer_rpc_error(resp, agent)
         payload = resp.get("result", {})
         if isinstance(payload, dict):
             status = payload.get("status") or {}
@@ -589,6 +772,7 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                 logger.debug("A2A await: task %s now %s", task_id, state)
                 last_state = state
             short = _short_state(state)
+            queued_now = _record_observation(task_id, payload, agent)
             if short in ("completed", "failed", "canceled", "rejected", "input-required"):
                 text = _reply_text_from_result(payload) or "(no text reply)"
                 if state in protocol.TERMINAL_STATES:
@@ -604,14 +788,20 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                 if reply_ctx and text:
                     protocol.persist_message(reply_ctx, "agent", security.filter_inbound(text),
                                              task_id, peer=agent)
+                # Everything the peer said is in this return value: mark it delivered so a later
+                # background await does not repeat it.
+                _mark_backlog_delivered(task_id, queued_now, session_id or "")
                 header = f"[{agent} · task {payload.get('id', task_id)} · {short}]"
                 body = text
                 if short == "input-required":
                     ctx = str(payload.get("contextId", ""))
                     body += f"\n\n(Peer needs input — reply via a2a_submit with context_id '{ctx}'.)"
-                return f"{header}\n{body}"
+                prefix = ("\n".join(preface) + "\n\n") if preface else ""
+                return f"{prefix}{header}\n{body}"
         if time.time() >= deadline:
-            return (f"[{agent} · task {task_id} · still working after {timeout}s]\n"
+            _mark_backlog_delivered(task_id, backlog, session_id or "")
+            prefix = ("\n".join(preface) + "\n\n") if preface else ""
+            return (f"{prefix}[{agent} · task {task_id} · still working after {timeout}s]\n"
                     f"Call a2a_await again or check a2a_get_task.")
         time.sleep(interval)
 
@@ -632,6 +822,165 @@ def a2a_watch_cancel(args: dict, session_id: Optional[str] = None, **_: Any) -> 
                 f"Remote tasks are unchanged.")
     return (f"[watch {watch_id} · canceled] Local polling stopped. The remote tasks keep running; "
             f"use a2a_cancel(agent=..., task_id=...) to request remote cancellation.")
+
+
+
+
+def a2a_acquire_task_ownership(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
+    """Take ownership of unowned A2A tasks so their messages are delivered to this session.
+
+    Only tasks that are unowned can be adopted: a task owned by another session is refused. The
+    queued messages are delivered when this session awaits the task (``a2a_await``).
+    """
+    if not session_id:
+        return "Error: no session is bound to this call, so ownership cannot be recorded."
+    try:
+        entries = _background_tasks(args)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    store = _ownership()
+    lines: list[str] = []
+    for agent_name, task_id in entries:
+        peer = _resolve_peer(agent_name)
+        if not peer or not peer.get("url"):
+            lines.append(f"  - {agent_name} / {task_id}: unknown peer")
+            continue
+        _ensure_task_record(task_id, agent_name)
+        owner = store.owner(task_id)
+        if owner == session_id:
+            lines.append(f"  - {agent_name} / {task_id}: already owned by this session")
+            continue
+        if owner:
+            lines.append(f"  - {agent_name} / {task_id}: REFUSED — owned by another session")
+            continue
+        if store.acquire(task_id, session_id):
+            lines.append(f"  - {agent_name} / {task_id}: acquired")
+        else:
+            lines.append(f"  - {agent_name} / {task_id}: REFUSED — claimed by another session")
+    return "A2A task ownership:\n" + "\n".join(lines)
+
+
+def a2a_release_task_ownership(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
+    """Give up ownership of A2A tasks. They become adoptable by any session; polling stops.
+
+    This is separate from ``a2a_watch_cancel``: cancelling a watch stops polling but keeps
+    ownership. Release is what makes a task adoptable elsewhere (a handoff to another session).
+    """
+    if not session_id:
+        return "Error: no session is bound to this call."
+    store = _ownership()
+    if _truthy(args.get("all")):
+        released_watches = 0
+        try:
+            released_watches = _watch_manager().cancel_session(session_id)
+        except Exception:
+            logger.debug("A2A: stopping watches on release failed", exc_info=True)
+        count = store.release_all(session_id)
+        return (f"Released {count} task(s) owned by this session; stopped {released_watches} "
+                f"local watch(es). The remote tasks keep running and are now adoptable.")
+    try:
+        entries = _background_tasks(args)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    lines: list[str] = []
+    task_ids: list[str] = []
+    for agent_name, task_id in entries:
+        if store.release(task_id, session_id):
+            task_ids.append(task_id)
+            lines.append(f"  - {agent_name} / {task_id}: released")
+        else:
+            lines.append(f"  - {agent_name} / {task_id}: not released (not owned by this session)")
+    if task_ids:
+        try:
+            _watch_manager().cancel_session(session_id, task_ids=task_ids)
+        except Exception:
+            logger.debug("A2A: stopping released watches failed", exc_info=True)
+    return "A2A task ownership:\n" + "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Session lifecycle: release on end, reclaim on resume
+# ---------------------------------------------------------------------------
+
+_PENDING_NOTES: list[str] = []
+
+
+def _take_notes() -> str:
+    """Take queued ownership notes for the next tool result (fallback when no live agent)."""
+    global _PENDING_NOTES
+    if not _PENDING_NOTES:
+        return ""
+    notes, _PENDING_NOTES = list(_PENDING_NOTES), []
+    return "\n".join(notes) + "\n\n"
+
+
+def _ownership_note(reclaimed: list[str], lost: list[str]) -> str:
+    parts = ["A2A task ownership changed while this session was away:"]
+    if reclaimed:
+        parts.append("  reclaimed: " + ", ".join(reclaimed))
+        parts.append("  Their results are queued; a2a_await each task id to receive them.")
+    if lost:
+        parts.append("  lost (adopted by another session): " + ", ".join(lost))
+    return "\n".join(parts)
+
+
+def _on_session_start(ctx: Any, payload: dict) -> None:
+    session_id = str(payload.get("session_id") or "")
+    if not session_id:
+        return
+    try:
+        reclaimed, lost = _ownership().reclaim(session_id)
+    except Exception:
+        logger.debug("A2A: ownership reclaim failed", exc_info=True)
+        return
+    if not reclaimed and not lost:
+        return
+    note = _ownership_note(reclaimed, lost)
+    queued = getattr(ctx, "queue_context_note", None)
+    if callable(queued):
+        try:
+            if queued(note, key="a2a-ownership"):
+                logger.info("A2A: ownership note queued for session %s", session_id)
+                return
+        except Exception:
+            logger.debug("A2A: queue_context_note failed", exc_info=True)
+    _PENDING_NOTES.append(note)
+
+
+def _on_session_end(ctx: Any, payload: dict) -> None:
+    session_id = str(payload.get("session_id") or "")
+    if not session_id:
+        return
+    try:
+        _watch_manager(ctx).cancel_session(session_id)
+    except Exception:
+        logger.debug("A2A: stopping watches on session end failed", exc_info=True)
+    try:
+        released = _ownership(ctx).release_all(session_id)
+    except Exception:
+        logger.debug("A2A: ownership release on session end failed", exc_info=True)
+        return
+    if released:
+        logger.info("A2A: released %d task(s) owned by ended session %s", released, session_id)
+
+
+def _install_session_hooks(ctx: Any) -> None:
+    subscribe = getattr(ctx, "subscribe", None)
+    if not callable(subscribe):
+        return
+
+    def start(**payload: Any) -> None:
+        _on_session_start(ctx, payload)
+
+    def end(**payload: Any) -> None:
+        _on_session_end(ctx, payload)
+
+    for event, handler in (("on_session_start", start), ("on_session_end", end),
+                           ("on_session_finalize", end), ("on_session_reset", end)):
+        try:
+            subscribe(event, handler)
+        except Exception:
+            logger.debug("A2A: could not subscribe to %s", event, exc_info=True)
 
 
 def a2a_cancel(args: dict, **_: Any) -> str:
@@ -741,7 +1090,7 @@ def a2a_call(args: dict, **_: Any) -> str:
     return f"{header}\n{body}"
 
 
-def a2a_list(args: dict | None = None, **_: Any) -> str:
+def a2a_list(args: dict | None = None, session_id: Optional[str] = None, **_: Any) -> str:
     """List configured peers, conversations, metrics, and durable task records.
 
     Task records are local snapshots. Remote state changes only when another A2A
@@ -795,15 +1144,29 @@ def a2a_list(args: dict | None = None, **_: Any) -> str:
             records = [r for r in records if r.get("direction") == direction_filter]
         lines.append("")
         lines.append(f"Tasks ({len(records)}):")
-        for r in records[:limit]:
+        visible = records[:limit]
+        try:
+            owners = _ownership().owners([r.get("task_id", "") for r in visible])
+        except Exception:
+            owners = {}
+        for r in visible:
             state = str(r.get("state", "")).replace("TASK_STATE_", "").lower()
-            lines.append(f"  - {r.get('task_id')} context={r.get('context_id')} peer={r.get('peer')} "
-                         f"direction={r.get('direction', 'inbound')} ownership={r.get('ownership', 'local')} state={state}")
+            task_id = r.get("task_id")
+            owner = owners.get(task_id, "")
+            if not owner:
+                owned = "unowned"
+            elif session_id and owner == session_id:
+                owned = "owned-by-this-session"
+            else:
+                owned = "owned-by-another-session"
+            lines.append(f"  - {task_id} context={r.get('context_id')} peer={r.get('peer')} "
+                         f"direction={r.get('direction', 'inbound')} ownership={r.get('ownership', 'local')} "
+                         f"owner={owned} state={state}")
         if not records:
             lines.append("  (none)")
 
     if kind == "tasks":
-        return "\n".join(lines) if lines else "No A2A tasks found."
+        return _take_notes() + ("\n".join(lines) if lines else "No A2A tasks found.")
 
     # Show metrics snapshot
     m = protocol.metrics.snapshot()
@@ -814,7 +1177,7 @@ def a2a_list(args: dict | None = None, **_: Any) -> str:
                  f"{m['anti_loop_triggers']} anti-loop, {m['rate_limit_triggers']} rate-limited, "
                  f"avg {m['avg_latency_ms']}ms")
 
-    return "\n".join(lines)
+    return _take_notes() + "\n".join(lines)
 
 
 def a2a_history(args: dict, **_: Any) -> str:
@@ -1208,6 +1571,64 @@ _SCHEMAS: dict[str, _ToolSchema] = {
             },
         },
     },
+    "a2a_acquire_task_ownership": {
+        "type": "function",
+        "function": {
+            "name": "a2a_acquire_task_ownership",
+            "description": (
+                "Take ownership of unowned A2A tasks so their results and progress notes are "
+                "delivered to this session. Only unowned tasks can be adopted; a task owned by "
+                "another session is refused. Awaiting a task acquires it implicitly. The queued "
+                "backlog is delivered when you a2a_await the task."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "description": "Configured peer name or full http(s):// URL."},
+                    "task_id": {"type": "string", "description": "Task id to acquire."},
+                    "tasks": {
+                        "type": "array",
+                        "description": "Several tasks: [{agent, task_id}, ...].",
+                        "items": {
+                            "type": "object",
+                            "properties": {"agent": {"type": "string"}, "task_id": {"type": "string"}},
+                            "required": ["agent", "task_id"],
+                        },
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    "a2a_release_task_ownership": {
+        "type": "function",
+        "function": {
+            "name": "a2a_release_task_ownership",
+            "description": (
+                "Give up ownership of A2A tasks so another session can adopt them. This stops "
+                "local polling for them but does not cancel the remote work. Use all=true to "
+                "release every task this session owns. a2a_watch_cancel alone keeps ownership."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "agent": {"type": "string", "description": "Configured peer name or full http(s):// URL."},
+                    "task_id": {"type": "string", "description": "Task id to release."},
+                    "tasks": {
+                        "type": "array",
+                        "description": "Several tasks: [{agent, task_id}, ...].",
+                        "items": {
+                            "type": "object",
+                            "properties": {"agent": {"type": "string"}, "task_id": {"type": "string"}},
+                            "required": ["agent", "task_id"],
+                        },
+                    },
+                    "all": {"type": "boolean", "description": "Release every task this session owns."},
+                },
+                "required": [],
+            },
+        },
+    },
     "a2a_cancel": {
         "type": "function",
         "function": {
@@ -1241,6 +1662,8 @@ _HANDLERS = {
     "a2a_await": a2a_await,
     "a2a_watch_cancel": a2a_watch_cancel,
     "a2a_cancel": a2a_cancel,
+    "a2a_acquire_task_ownership": a2a_acquire_task_ownership,
+    "a2a_release_task_ownership": a2a_release_task_ownership,
 }
 
 
@@ -1293,6 +1716,7 @@ def register_tools(ctx) -> None:
             emoji="\U0001f9e9",
             check_fn=_a2a_tools_available,
         )
+    _install_session_hooks(ctx)
     _resume_watches(ctx)
 
 

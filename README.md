@@ -36,6 +36,31 @@ a2a_await(agent="researcher", task_id="...", background=true)   # or get the res
 
 Use `a2a_steer` with the `context_id` returned by an earlier A2A exchange when a running conversation needs a correction or follow-up. It returns a distinct task ID immediately.
 
+## Task ownership
+
+A task is either **unowned** or **owned by exactly one session**. Ownership belongs to the session,
+not to a watch:
+
+- `a2a_await` (blocking or background) implicitly acquires an unowned task and refuses one owned by
+  another session.
+- `a2a_watch_cancel` stops polling but keeps ownership. `a2a_release_task_ownership` gives it up
+  (tasks, or `all=true` for every task the session owns); the tasks become adoptable elsewhere.
+- Ending a session (exit, close, `/new`, `/reset`) releases everything it owns. Nothing keeps
+  polling for a session that is gone.
+- Resuming a session attempts to reclaim what it released. It is told, through a model-visible
+  note, which tasks it reclaimed and which it lost to another session. Reclaim is not automatic
+  delivery: `a2a_await` the task to receive its messages.
+- Adoption is final. Only unowned tasks can be adopted; `a2a_list` shows ownership per task.
+- Cross-profile adoption is not supported: the task store is per profile.
+
+While a task is unowned, every message it produces is queued on the task: results, progress notes,
+steering acknowledgements, input requests and watcher problems. Results arrived while unowned are
+delivered when the adopting session awaits the task, once per message, oldest first.
+
+An unowned task is cancelled remotely after `a2a.unowned_cancel_after_s` (default 86400s, one day)
+and abandoned after `a2a.unowned_task_ttl_s` (default 604800s, seven days). Both can also be set
+with `A2A_UNOWNED_CANCEL_AFTER` and `A2A_UNOWNED_TASK_TTL`.
+
 ## Background awaits
 
 `a2a_await(background=true)` returns immediately with a `watch_id`. The watch persists in the

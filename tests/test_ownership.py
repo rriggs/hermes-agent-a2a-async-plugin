@@ -330,6 +330,27 @@ def test_blocking_await_returns_every_artifact(monkeypatch):
     assert "first artifact" in out and "second artifact" in out, out
 
 
+def test_releasing_starts_the_maintenance_poller(monkeypatch):
+    """Auto-cancel and the TTL only run in the poller; a release must start it."""
+    started: list = []
+
+    class Manager:
+        def start(self):
+            started.append(True)
+            return self
+
+        def cancel_session(self, session_id, task_ids=None):
+            return 0
+
+    _task()
+    _store().acquire("t1", SESSION_A)
+    monkeypatch.setattr(tools, "_watch_manager", lambda ctx=None: Manager())
+
+    tools.a2a_release_task_ownership({"all": True}, session_id=SESSION_A)
+
+    assert started, "the unowned-task timers would never run"
+
+
 def test_released_tasks_count_as_work_to_resume():
     import importlib
     watches = importlib.import_module(f"{PKG}.watches")

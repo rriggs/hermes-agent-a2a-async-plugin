@@ -524,6 +524,32 @@ class WatchStore:
                 (event_id, watch_id, content, json.dumps(metadata, sort_keys=True), now))
             con.commit()
 
+    @contextlib.contextmanager
+    def publication_guard(self, event_id: str):
+        """Hold the plugin DB write lock across one publish, re-reading the row first.
+
+        Ownership can change (release + adoption) between reading an outbox row and delivering
+        it, which would publish work into the session that gave the task up. Taking BEGIN
+        IMMEDIATE and re-reading under it serializes delivery against every release/cancel, so a
+        row that no longer exists is never published.
+        """
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                """SELECT p.*, w.target_json FROM a2a_watch_publications p
+                     JOIN a2a_watches w ON w.watch_id = p.watch_id
+                    WHERE p.event_id=? AND p.published_at IS NULL""",
+                (event_id,)).fetchone()
+            yield con, (dict(row) if row else None)
+        except Exception:
+            con.rollback()
+            raise
+        else:
+            con.commit()
+        finally:
+            con.close()
+
     def due_publications(self, now: Optional[float] = None) -> list[dict]:
         now = time.time() if now is None else now
         with self._session() as con:
@@ -808,25 +834,52 @@ class WatchManager:
         """
         now = self.clock() if now is None else now
         published = 0
-        for row in self.store.due_publications(now):
-            try:
-                target = _load_target(row.get("target_json"))
-            except WatchError:
-                # A corrupt target can never deliver; stop retrying it forever.
-                logger.error("A2A watch %s has an unreadable target; dropping %s",
-                             row.get("watch_id"), row.get("event_id"))
-                self.store.mark_published(str(row["event_id"]), now)
-                continue
-            try:
-                self.ctx.publish_completion(
-                    target=target, event_id=row["event_id"], content=row["content"],
-                    metadata=_load_metadata(row.get("metadata_json")))
-            except Exception as exc:
-                attempts = self.store.record_publication_failure(str(row["event_id"]), now)
-                logger.warning("A2A watch could not publish %s (attempt %d): %s",
-                               row["event_id"], attempts, exc)
-                continue
-            self.store.mark_published(str(row["event_id"]), now)
+        for due in self.store.due_publications(now):
+            event_id = str(due["event_id"])
+            with self.store.publication_guard(event_id) as (con, row):
+                if row is None:
+                    continue  # released or already delivered while this pass was running
+                try:
+                    target = _load_target(row.get("target_json"))
+                except WatchError:
+                    logger.error("A2A watch %s has an unreadable target; dropping %s",
+                                 row.get("watch_id"), event_id)
+                    con.execute(
+                        "UPDATE a2a_watch_publications SET published_at=? WHERE event_id=?",
+                        (now, event_id))
+                    continue
+                try:
+                    self.ctx.publish_completion(
+                        target=target, event_id=event_id, content=row["content"],
+                        metadata=_load_metadata(row.get("metadata_json")))
+                except Exception as exc:
+                    name = type(exc).__name__
+                    if name.startswith("Completion"):
+                        # The publisher refused this event permanently (content or target
+                        # validation). Retrying cannot succeed; retire the row and say so.
+                        logger.error("A2A watch %s was refused permanently (%s); dropping %s",
+                                     row.get("watch_id"), name, event_id)
+                        con.execute(
+                            "UPDATE a2a_watch_publications SET published_at=? WHERE event_id=?",
+                            (now, event_id))
+                        continue
+                    con.execute(
+                        """UPDATE a2a_watch_publications
+                              SET attempts=attempts+1, next_attempt_at=? WHERE event_id=?""",
+                        (now + _publication_backoff(int(row.get("attempts", 0)) + 1), event_id))
+                    logger.warning("A2A watch could not publish %s: %s", event_id, exc)
+                    continue
+                con.execute(
+                    "UPDATE a2a_watch_publications SET published_at=?, next_attempt_at=0 "
+                    "WHERE event_id=?", (now, event_id))
+                meta = _load_metadata(row.get("metadata_json"))
+                if meta.get("peer") and meta.get("task_id") and meta.get("state"):
+                    con.execute(
+                        """UPDATE a2a_watch_items SET published_state=?, updated_at=?
+                            WHERE watch_id=? AND peer=? AND task_id=?""",
+                        (str(meta["state"]), now, row.get("watch_id"),
+                         str(meta["peer"]), str(meta["task_id"])))
+                published += 1
             meta = _load_metadata(row.get("metadata_json"))
             task_id = str(meta.get("task_id") or "")
             message_id = str(meta.get("message_id") or "")
@@ -835,8 +888,7 @@ class WatchManager:
                 try:
                     self.ownership.mark_delivered(task_id, [message_id], session_id, now)
                 except Exception:
-                    logger.debug("A2A: delivery marker failed for %s", row["event_id"], exc_info=True)
-            published += 1
+                    logger.debug("A2A: delivery marker failed for %s", event_id, exc_info=True)
         return published
 
     # -- internals --------------------------------------------------------

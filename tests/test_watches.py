@@ -690,6 +690,57 @@ def test_release_drops_undelivered_publications_and_keeps_the_messages_queued():
     assert manager.ownership.queued("t1"), "the message stays queued for the next owner"
 
 
+def test_a_row_deleted_by_release_is_not_published_from_a_stale_snapshot():
+    """The flush must re-read under the write lock; a snapshot alone can outlive ownership."""
+    ctx = FlakyCtx()
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")),
+                       ctx=ctx)
+    watch = _add(manager)
+    manager.run_once(now=1_000.0)  # publish refused -> durable outbox row
+    assert _outbox(watch["watch_id"], pending_only=True)
+
+    _store().due_publications(now=2_000.0)  # a flush pass that read the snapshot already
+    manager.cancel_session("sess-1")        # release + adoption elsewhere
+    ctx.fail = False
+    assert manager.flush_publications(now=2_000.0) == 0
+    assert ctx.published == [], "a released task must not publish into the session that gave it up"
+
+
+def test_an_oversized_result_is_truncated_to_the_publisher_limit():
+    text = "x" * 33_000
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text=text)))
+    watch = _add(manager)
+
+    manager.run_once(now=1_000.0)
+
+    [published] = manager.ctx.published
+    assert len(published["content"]) < 32_000
+    assert "characters truncated" in published["content"]
+    assert _outbox(watch["watch_id"], pending_only=True) == []
+
+
+def test_a_permanently_refused_publication_is_retired_not_retried():
+    class RejectingCtx(FakeCtx):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def publish_completion(self, **kwargs):
+            self.calls += 1
+            raise type("CompletionRequestError", (ValueError,), {})("content too large")
+
+    ctx = RejectingCtx()
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")),
+                       ctx=ctx)
+    watch = _add(manager)
+
+    manager.run_once(now=1_000.0)
+    manager.run_once(now=2_000.0)
+
+    assert ctx.calls == 1, "a permanent refusal must not be retried forever"
+    assert _outbox(watch["watch_id"], pending_only=True) == []
+
+
 def test_an_expiring_watch_is_finished_after_a_restart():
     """Crash between 'expiring' and enqueue: a fresh manager must finish the notice."""
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)))

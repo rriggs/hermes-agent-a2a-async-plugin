@@ -603,6 +603,7 @@ def _acquire_task(task_id: str, session_id: str, peer: str) -> tuple[bool, str]:
     if not store.acquire(task_id, session_id):
         return False, (f"Error: a2a task {task_id} is owned by another session. "
                        f"Only unowned tasks can be adopted.")
+    _ensure_maintenance()
     return True, ""
 
 
@@ -621,6 +622,14 @@ def _mark_backlog_delivered(task_id: str, messages: list[dict], session_id: str)
         _ownership().mark_delivered(task_id, [m["message_id"] for m in messages], session_id)
     except Exception:
         logger.debug("A2A: backlog delivery marker failed", exc_info=True)
+
+
+def _ensure_maintenance(ctx: Any = None) -> None:
+    """The auto-cancel/TTL timers run in the watch poller; start it after an ownership change."""
+    try:
+        _watch_manager(ctx).start()
+    except Exception:
+        logger.debug("A2A: could not start the maintenance poller", exc_info=True)
 
 
 def _backlog_lines(messages: list[dict]) -> list[str]:
@@ -707,6 +716,18 @@ def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: 
     return published
 
 
+# The core publisher refuses content over 32,000 characters. Bound every notification below that
+# with room for the header: an oversized result must arrive truncated, not retry forever.
+MAX_NOTIFICATION_CHARS = 24_000
+
+
+def _bound(text: str, limit: int = MAX_NOTIFICATION_CHARS) -> str:
+    body = str(text or "")
+    if len(body) <= limit:
+        return body
+    return body[:limit] + f"\n…[{len(body) - limit} characters truncated]"
+
+
 def _peer_message_content(peer: str, task_id: str, kind: str, text: str) -> str:
     if kind == "result":
         head = f"A2A task {task_id} on peer '{peer}' returned a result."
@@ -717,7 +738,7 @@ def _peer_message_content(peer: str, task_id: str, kind: str, text: str) -> str:
         head = f"A2A task {task_id} on peer '{peer}' reported a problem."
     else:
         head = f"A2A task {task_id} on peer '{peer}' sent a progress note."
-    return f"{head}\n\n{text}"
+    return f"{head}\n\n{_bound(text)}"
 
 
 def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
@@ -885,6 +906,7 @@ def a2a_release_task_ownership(args: dict, session_id: Optional[str] = None, **_
         except Exception:
             logger.debug("A2A: stopping watches on release failed", exc_info=True)
         count = store.release_all(session_id)
+        _ensure_maintenance()
         return (f"Released {count} task(s) owned by this session; stopped {released_watches} "
                 f"local watch(es). The remote tasks keep running and are now adoptable.")
     try:
@@ -904,6 +926,7 @@ def a2a_release_task_ownership(args: dict, session_id: Optional[str] = None, **_
             _watch_manager().cancel_session(session_id, task_ids=task_ids)
         except Exception:
             logger.debug("A2A: stopping released watches failed", exc_info=True)
+        _ensure_maintenance()
     return "A2A task ownership:\n" + "\n".join(lines)
 
 

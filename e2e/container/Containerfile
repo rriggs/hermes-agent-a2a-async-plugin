@@ -1,0 +1,24 @@
+# End-to-end verification image: Hermes from the feature branch + the a2a async plugin.
+#
+# The checkout is copied in and its PM environment built once, so a run only pays for the
+# per-HERMES_HOME bootstrap the CLI does on a fresh home. The plugin and the driver are mounted
+# at run time (see run-container.sh), never baked in.
+FROM python:3.14-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PATH=/opt/venv/bin:$PATH \
+    HERMES_RUNTIME_DIR=/opt/hermes-runtime \
+    HOME=/root
+
+RUN apt-get -o Acquire::Retries=3 update && \
+    apt-get install -y --no-install-recommends ca-certificates curl git build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . /src
+RUN python -m pm.build_env --source . --out /opt/venv --group dev --group test && \
+    /opt/venv/bin/hermes --version
+
+VOLUME ["/data"]
+ENTRYPOINT ["python"]

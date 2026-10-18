@@ -947,9 +947,17 @@ def _on_session_start(ctx: Any, payload: dict) -> None:
     _PENDING_NOTES.append(note)
 
 
-def _on_session_end(ctx: Any, payload: dict) -> None:
+def _on_session_end(ctx: Any, payload: dict, *, boundary: str = "reset") -> None:
     session_id = str(payload.get("session_id") or "")
     if not session_id:
+        return
+    # A finalize is not always an end: on a gateway-hosted local chat (and a TUI tab) it fires
+    # when the CLIENT detaches after a turn, while the session and its background work continue.
+    # Only the interactive CLI's finalize means "this session is over". Explicit /new and /reset
+    # always release.
+    platform = str(payload.get("platform") or "")
+    if boundary == "finalize" and platform != "cli":
+        logger.debug("A2A: session %s finalized on %s; ownership retained", session_id, platform or "?")
         return
     try:
         _watch_manager(ctx).cancel_session(session_id)
@@ -979,11 +987,14 @@ def _install_session_hooks(ctx: Any) -> None:
     def start(**payload: Any) -> None:
         _on_session_start(ctx, payload)
 
-    def end(**payload: Any) -> None:
-        _on_session_end(ctx, payload)
+    def reset(**payload: Any) -> None:
+        _on_session_end(ctx, payload, boundary="reset")
 
-    for event, handler in (("on_session_start", start), ("on_session_end", end),
-                           ("on_session_finalize", end), ("on_session_reset", end)):
+    def finalize(**payload: Any) -> None:
+        _on_session_end(ctx, payload, boundary="finalize")
+
+    for event, handler in (("on_session_start", start), ("on_session_reset", reset),
+                           ("on_session_finalize", finalize)):
         try:
             register(event, handler)
         except Exception:

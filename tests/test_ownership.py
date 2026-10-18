@@ -146,10 +146,9 @@ def test_session_hooks_release_on_end_and_reclaim_with_a_note_on_start():
 
     ctx = Ctx()
     tools._install_session_hooks(ctx)
-    assert {"on_session_start", "on_session_end", "on_session_reset",
-            "on_session_finalize"} <= set(ctx.hooks)
+    assert {"on_session_start", "on_session_reset", "on_session_finalize"} <= set(ctx.hooks)
 
-    for handler in ctx.hooks["on_session_end"]:
+    for handler in ctx.hooks["on_session_reset"]:
         handler(session_id=SESSION_A)
     assert store.owner("t1") == "", "session end releases ownership"
 
@@ -159,6 +158,33 @@ def test_session_hooks_release_on_end_and_reclaim_with_a_note_on_start():
     assert store.owner("t1") == SESSION_A, "resume reclaims what it released"
     [note] = ctx.notes
     assert "reclaimed" in note and "t1" in note
+
+
+def test_a_client_detach_does_not_release_a_local_sessions_tasks():
+    """A gateway-hosted local chat finalizes when its client detaches after a turn."""
+    _task()
+    store = _store()
+    store.acquire("t1", "local-abc")
+
+    class Ctx:
+        def __init__(self):
+            self.hooks: dict = {}
+
+        def register_hook(self, event, callback):
+            self.hooks.setdefault(event, []).append(callback)
+
+        def queue_context_note(self, text, key=""):
+            return True
+
+    ctx = Ctx()
+    tools._install_session_hooks(ctx)
+    for handler in ctx.hooks["on_session_finalize"]:
+        handler(session_id="local-abc", platform="local")
+    assert store.owner("t1") == "local-abc", "a detached client does not end the session"
+
+    for handler in ctx.hooks["on_session_finalize"]:
+        handler(session_id="local-abc", platform="cli")
+    assert store.owner("t1") == "", "the interactive CLI's finalize is a real session end"
 
 
 def test_resume_notes_a_lost_task_when_another_session_adopted_it():

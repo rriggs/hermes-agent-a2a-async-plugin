@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import urllib.error
 import urllib.request
@@ -150,6 +151,15 @@ def _interface_tenant(card: Optional[dict], peer: dict) -> str:
 def _short_state(state: str) -> str:
     """TASK_STATE_COMPLETED -> completed (also passes through v0.3 states)."""
     return state.replace("TASK_STATE_", "").replace("_", "-").lower() if state else ""
+
+
+def _truthy(value: Any) -> bool:
+    """Model-supplied booleans arrive as bool, "true"/"false", 1/0 or "yes"/"no"."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> tuple[str, str, str]:
@@ -422,13 +432,110 @@ def a2a_get_task(args: dict, **_: Any) -> str:
     return "\n".join(lines)
 
 
-def a2a_await(args: dict, **_: Any) -> str:
-    """Block until a submitted task reaches a terminal state (poll loop).
+_CTX: Any = None
+_WATCH_MANAGER: Any = None
 
-    Polls GetTask every ``interval`` seconds (default 5) until the task is
-    terminal or ``timeout`` (default 600s) elapses. Use for tasks you want
-    the result of now; use a2a_get_task for fire-and-forget polling.
+
+def _watch_manager(ctx: Any = None):
+    """The process-wide watch poller, created against the plugin context it was registered with."""
+    global _WATCH_MANAGER
+    if _WATCH_MANAGER is None:
+        from . import watches
+        _WATCH_MANAGER = watches.WatchManager(ctx if ctx is not None else _CTX)
+    return _WATCH_MANAGER
+
+
+def _completion_capable(ctx: Any) -> bool:
+    """Whether this Hermes runtime exposes the durable plugin completion publisher."""
+    return callable(getattr(ctx, "capture_completion_target", None)) and callable(
+        getattr(ctx, "publish_completion", None))
+
+
+def _background_tasks(args: dict) -> list[tuple[str, str]]:
+    """Normalise ``tasks=[{agent, task_id}]`` / legacy ``agent`` + ``task_id`` into pairs."""
+    raw = args.get("tasks")
+    entries: list[tuple[str, str]] = []
+    if isinstance(raw, list) and raw:
+        for entry in raw:
+            if not isinstance(entry, dict):
+                raise ValueError("each entry in 'tasks' must be an object with 'agent' and 'task_id'.")
+            agent = str(entry.get("agent") or entry.get("agent_name") or entry.get("name") or "").strip()
+            task_id = str(entry.get("task_id") or entry.get("taskId") or entry.get("id") or "").strip()
+            if not agent or not task_id:
+                raise ValueError("each entry in 'tasks' needs a non-empty 'agent' and 'task_id'.")
+            entries.append((agent, task_id))
+    else:
+        agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
+        task_id = str(args.get("task_id") or args.get("taskId") or args.get("id") or "").strip()
+        if not agent or not task_id:
+            raise ValueError("background mode needs 'agent' and 'task_id', or a 'tasks' list.")
+        entries.append((agent, task_id))
+    seen: set[tuple[str, str]] = set()
+    unique = []
+    for entry in entries:
+        if entry not in seen:
+            seen.add(entry)
+            unique.append(entry)
+    return unique
+
+
+def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
+    """``a2a_await(background=True)``: bind a delivery target, persist the watch, return its id."""
+    try:
+        entries = _background_tasks(args)
+    except ValueError as exc:
+        return f"Error: {exc}"
+    unknown = [agent for agent, _task in entries if not (_resolve_peer(agent) or {}).get("url")]
+    if unknown:
+        return (f"Error: unknown agent '{unknown[0]}'. Configure it under 'a2a_agents' in "
+                f"config.yaml or pass a full http(s):// URL.")
+    ctx = _CTX
+    if not _completion_capable(ctx):
+        return (
+            "Error: background a2a_await needs a Hermes runtime with the plugin completion "
+            "publisher (PluginContext.capture_completion_target / publish_completion). "
+            "Use blocking a2a_await, or poll with a2a_get_task, on this runtime.")
+    try:
+        target = ctx.capture_completion_target(session_id=session_id or None)
+    except Exception as exc:  # CompletionTargetError / CompletionDeliveryUnsupported
+        if type(exc).__name__ == "CompletionDeliveryUnsupported":
+            return (
+                "Error: this session cannot receive a later turn (one-shot, cron, Kanban/worker, "
+                "or a stateless API session), so a background watch has nowhere to deliver its "
+                "result. Use blocking a2a_await or poll with a2a_get_task.")
+        return f"Error: could not bind a background watch to this session — {exc}"
+    manager = _watch_manager(ctx)
+    try:
+        watch = manager.add(session_id=session_id or "", target=target, tasks=entries)
+    except Exception as exc:
+        logger.exception("A2A: background watch creation failed")
+        return f"Error: could not start the background watch — {exc}"
+
+    watch_id = str(watch.get("watch_id") or "")
+    ttl_hours = manager.ttl_s / 3600.0
+    lines = [
+        f"[watch {watch_id} · {len(entries)} task(s) · background]",
+        "Watching:",
+        *(f"  - {peer} · task {task_id}" for peer, task_id in entries),
+        "",
+        f"The watch polls every {int(manager.interval)}s (with backoff on transient peer errors) "
+        f"and expires after {ttl_hours:.0f}h. Continue with other work: when a task reaches a "
+        f"terminal state its result is delivered to this conversation as a new turn. Do not poll "
+        f"these tasks yourself. a2a_watch_cancel(watch_id='{watch_id}') stops local watching "
+        f"without cancelling remote work.",
+    ]
+    return "\n".join(lines)
+
+
+def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
+    """Block until a submitted task reaches a terminal state, or watch it in the background.
+
+    Blocking (default): polls GetTask every ``interval`` seconds (default 5) until the task is
+    terminal or ``timeout`` (default 600s) elapses. With ``background=true`` the watch is
+    persisted and polled off-turn; its result arrives later as a new turn in this session.
     """
+    if _truthy(args.get("background")):
+        return _start_background_watch(args, session_id)
     agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
     task_id = str(args.get("task_id") or args.get("taskId") or args.get("id") or "").strip()
     try:
@@ -487,6 +594,24 @@ def a2a_await(args: dict, **_: Any) -> str:
             return (f"[{agent} · task {task_id} · still working after {timeout}s]\n"
                     f"Call a2a_await again or check a2a_get_task.")
         time.sleep(interval)
+
+
+def a2a_watch_cancel(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
+    """Stop a background watch. Local polling only: the remote task keeps running."""
+    watch_id = str(args.get("watch_id") or args.get("watchId") or args.get("id") or "").strip()
+    if not watch_id:
+        return "Error: 'watch_id' is required."
+    try:
+        prior = _watch_manager().cancel(watch_id, session_id=session_id or "")
+    except Exception as exc:
+        return f"Error: {exc}"
+    if prior is None:
+        return f"Error: unknown watch '{watch_id}'."
+    if prior != "active":
+        return (f"[watch {watch_id} · {prior}] Nothing to stop: the watch is already {prior}. "
+                f"Remote tasks are unchanged.")
+    return (f"[watch {watch_id} · canceled] Local polling stopped. The remote tasks keep running; "
+            f"use a2a_cancel(agent=..., task_id=...) to request remote cancellation.")
 
 
 def a2a_cancel(args: dict, **_: Any) -> str:
@@ -1011,20 +1136,55 @@ _SCHEMAS: dict[str, _ToolSchema] = {
         "function": {
             "name": "a2a_await",
             "description": (
-                "Block until a previously submitted async task reaches a "
-                "terminal state, polling the peer. Returns the final result. "
-                "Times out after 'timeout' seconds (default 600) with the "
-                "task still running — call again to keep waiting."
+                "Wait for a previously submitted async task to reach a terminal "
+                "state. Blocking by default (polls the peer; returns the final "
+                "result, times out after 'timeout' seconds). With background=true "
+                "it returns immediately with a watch_id: the watch keeps polling "
+                "and the result is delivered back to this session as a new turn "
+                "when the task finishes, so you can keep working instead of "
+                "waiting. Background mode also accepts 'tasks' to watch several "
+                "tasks at once."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "agent": {"type": "string", "description": "Configured peer name or full http(s):// URL the task was submitted to."},
                     "task_id": {"type": "string", "description": "Task id returned by a2a_submit."},
-                    "timeout": {"type": "integer", "description": "Max seconds to wait (default 600, max 3600)."},
-                    "interval": {"type": "integer", "description": "Seconds between polls (default 5)."},
+                    "background": {"type": "boolean", "description": "Watch in the background and deliver the result to this session later (default false: block)."},
+                    "tasks": {
+                        "type": "array",
+                        "description": "Background mode only: several tasks to watch, each {agent, task_id}.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "agent": {"type": "string"},
+                                "task_id": {"type": "string"},
+                            },
+                            "required": ["agent", "task_id"],
+                        },
+                    },
+                    "timeout": {"type": "integer", "description": "Blocking mode: max seconds to wait (default 600, max 3600)."},
+                    "interval": {"type": "integer", "description": "Blocking mode: seconds between polls (default 5). Background polls every A2A_WATCH_INTERVAL (default 5)."},
                 },
-                "required": ["agent", "task_id"],
+                "required": [],
+            },
+        },
+    },
+    "a2a_watch_cancel": {
+        "type": "function",
+        "function": {
+            "name": "a2a_watch_cancel",
+            "description": (
+                "Stop a background a2a_await watch. This cancels local polling "
+                "only: the remote task keeps running. Use a2a_cancel when you "
+                "also want to ask the peer to cancel the work."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "watch_id": {"type": "string", "description": "Watch id returned by a2a_await(background=true)."},
+                },
+                "required": ["watch_id"],
             },
         },
     },
@@ -1059,6 +1219,7 @@ _HANDLERS = {
     "a2a_submit": a2a_submit,
     "a2a_get_task": a2a_get_task,
     "a2a_await": a2a_await,
+    "a2a_watch_cancel": a2a_watch_cancel,
     "a2a_cancel": a2a_cancel,
 }
 
@@ -1099,6 +1260,8 @@ def _a2a_tools_available() -> bool:
 
 def register_tools(ctx) -> None:
     """Register all A2A client tools in the shared ``a2a`` toolset."""
+    global _CTX
+    _CTX = ctx
     for name in _SCHEMAS:
         function_schema = _SCHEMAS[name]["function"]
         ctx.register_tool(
@@ -1110,3 +1273,26 @@ def register_tools(ctx) -> None:
             emoji="\U0001f9e9",
             check_fn=_a2a_tools_available,
         )
+    _resume_watches(ctx)
+
+
+def _resume_watches(ctx) -> None:
+    """Resume watches persisted by a previous process, and stop polling on unload.
+
+    Only a profile that already has a watch database is touched: plugin discovery in a fresh
+    profile must not create one. The manager leases each watch before polling, so several
+    processes loaded on one profile never poll the same watch concurrently.
+    """
+    try:
+        from . import watches
+        manager = _watch_manager(ctx)
+        manager.ctx = ctx  # a plugin reload hands us a fresh PluginContext
+        if manager.store.db_path and os.path.exists(manager.store.db_path):
+            active = manager.rehydrate()
+            if active:
+                logger.info("A2A: resumed %d background watch(es)", active)
+        register_unload = getattr(ctx, "on_unload", None)
+        if callable(register_unload):
+            register_unload(manager.stop)
+    except Exception:
+        logger.debug("A2A: background watch resume failed", exc_info=True)

@@ -1,5 +1,5 @@
 name: a2a-async
-version: 0.2.2
+version: 0.3.0
 description: "Complete asynchronous A2A client and inbound gateway contributed to the shared a2a toolset."
 author: Rob Riggs
 kind: platform
@@ -12,6 +12,7 @@ provides_tools:
   - a2a_submit
   - a2a_get_task
   - a2a_await
+  - a2a_watch_cancel
   - a2a_cancel
   - a2a_discover
   - a2a_call

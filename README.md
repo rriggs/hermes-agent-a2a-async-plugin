@@ -154,15 +154,18 @@ Run syntax checks with:
 
 ```bash
 python -m py_compile a2a_async_plugin/*.py
-python -m pytest tests/test_watches.py -q
+python -m pytest tests -q
 ```
 
 The cross-repo test (`test_watch_publishes_through_the_real_hermes_publisher`) skips unless a
 Hermes checkout with its dependencies is importable; run it against one with:
 
 ```bash
-PYTHONPATH=/path/to/hermes-agent /path/to/hermes-agent/.venv/bin/python -m pytest tests/test_watches.py -q
+PYTHONPATH=/path/to/hermes-agent /path/to/hermes-agent/.venv/bin/python -m pytest tests -q
 ```
+
+Without a Hermes checkout the publisher, profile-scope and registration tests skip; the rest of
+the suite (watches, ownership, protocol) runs standalone.
 
 The plugin is intended to be tested through Hermes' real plugin discovery path with a temporary `HERMES_HOME`. Do not run it alongside another plugin that registers the same async tool names.
 

@@ -503,12 +503,16 @@ class WatchStore:
                 ids = [str(t) for t in task_ids if t]
                 if not ids:
                     return 0
-                marks = ",".join("?" for _ in ids)
-                cur = con.execute(
-                    f"""DELETE FROM a2a_watch_publications
-                         WHERE published_at IS NULL
-                           AND json_extract(metadata_json, '$.task_id') IN ({marks})""",
-                    ids)
+                total = 0
+                for task_id in ids:
+                    total += con.execute(
+                        """DELETE FROM a2a_watch_publications
+                            WHERE published_at IS NULL
+                              AND (json_extract(metadata_json, '$.task_id')=?
+                                   OR EXISTS (SELECT 1 FROM json_each(metadata_json, '$.tasks')
+                                               WHERE json_each.value=?))""",
+                        (task_id, task_id)).rowcount
+                return total
             return cur.rowcount
 
     # -- publication outbox ----------------------------------------------

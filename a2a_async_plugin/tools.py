@@ -509,22 +509,9 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
     if unknown:
         return (f"Error: unknown agent '{unknown[0]}'. Configure it under 'a2a_agents' in "
                 f"config.yaml or pass a full http(s):// URL.")
-    # Ownership first: only unowned (or already ours) tasks may be watched. A refusal here names
-    # the task instead of starting a watch that could never deliver. Acquisitions made by THIS
-    # call are rolled back on failure, so a refused batch does not leave half the tasks claimed.
-    acquired: list[str] = []
-    for agent_name, task_id in entries:
-        was_unowned = session_id and _ownership().owner(task_id) in ("", session_id)
-        ok, refusal = _acquire_task(task_id, session_id or "", agent_name)
-        if not ok:
-            if acquired and session_id:
-                store = _ownership()
-                for claimed in acquired:
-                    store.release(claimed, session_id)
-            return refusal
-        if session_id and was_unowned:
-            acquired.append(task_id)
     ctx = _CTX
+    # Capability and target come FIRST: ownership is a session-wide fact, so a call that is going
+    # to be refused for a runtime/session reason must not leave tasks claimed.
     if not _completion_capable(ctx):
         return (
             "Error: background a2a_await needs a Hermes runtime with the plugin completion "
@@ -540,10 +527,18 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
                 "result. Use blocking a2a_await or poll with a2a_get_task.")
         return f"Error: could not bind a background watch to this session — {exc}"
     manager = _watch_manager(ctx)
+    owners_before = {task_id: _ownership().owner(task_id) for _agent, task_id in entries}
     try:
         watch = manager.add(session_id=session_id or "", target=target, tasks=entries)
     except Exception as exc:
         logger.exception("A2A: background watch creation failed")
+        # add() acquires inside; undo anything THIS call newly claimed so a failed start does not
+        # leave tasks that no watch is polling.
+        if session_id:
+            store = _ownership()
+            for _agent, task_id in entries:
+                if not owners_before.get(task_id) and store.owner(task_id) == session_id:
+                    store.release(task_id, session_id)
         return f"Error: could not start the background watch — {exc}"
 
     # Anything the task produced while nobody owned it is delivered now, through the target just

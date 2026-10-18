@@ -171,11 +171,14 @@ class OwnershipStore:
 
     @staticmethod
     def _drop_publications(con: sqlite3.Connection, task_id: str) -> None:
+        # A single-task event names task_id; a multi-task expiry notice lists them under "tasks".
         con.execute(
             """DELETE FROM a2a_watch_publications
                 WHERE published_at IS NULL
-                  AND json_extract(metadata_json, '$.task_id')=?""",
-            (task_id,))
+                  AND (json_extract(metadata_json, '$.task_id')=?
+                       OR EXISTS (SELECT 1 FROM json_each(metadata_json, '$.tasks')
+                                   WHERE json_each.value=?))""",
+            (task_id, task_id))
 
     def owner(self, task_id: str) -> str:
         with self._session() as con:

@@ -690,6 +690,23 @@ def test_release_drops_undelivered_publications_and_keeps_the_messages_queued():
     assert manager.ownership.queued("t1"), "the message stays queued for the next owner"
 
 
+def test_releasing_every_task_also_removes_a_multi_task_expiry_notice():
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)))
+    watch = _add(manager, tasks=(("peer", "t1"), ("peer", "t2")))
+    with _store()._session() as con:
+        con.execute("UPDATE a2a_watches SET expires_at=1 WHERE watch_id=?", (watch["watch_id"],))
+    manager.run_once(now=10_000.0)  # aggregate watch-expired notice with tasks=[t1, t2]
+    assert [p["metadata"]["state"] for p in manager.ctx.published] == ["watch-expired"]
+
+    store = _store()
+    store.release("t1", "sess-1")
+    store.release("t2", "sess-1")
+
+    assert _outbox(watch["watch_id"], pending_only=True) == [], (
+        "an aggregate notice must die with the tasks it describes")
+    assert manager.flush_publications(now=20_000.0) == 0
+
+
 def test_a_row_deleted_by_release_is_not_published_from_a_stale_snapshot():
     """The flush must re-read under the write lock; a snapshot alone can outlive ownership."""
     ctx = FlakyCtx()
@@ -855,6 +872,7 @@ def test_the_lease_is_renewed_between_tasks_and_stale_writes_are_fenced():
 
 def test_background_work_uses_the_creating_profiles_scope(tmp_path, monkeypatch):
     """The same peer alias resolves per profile: the watcher must not use the launch profile."""
+    pytest.importorskip("hermes_constants", reason="needs the Hermes source checkout")
     home_a, home_b = tmp_path / "profile-a", tmp_path / "profile-b"
     for home, url in ((home_a, "http://10.0.0.1:9901"), (home_b, "http://10.0.0.2:9901")):
         home.mkdir(parents=True)

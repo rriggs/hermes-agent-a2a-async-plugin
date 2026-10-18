@@ -326,6 +326,57 @@ def test_timer_actions_do_not_touch_a_task_adopted_after_selection():
     assert [m["message_id"] for m in store.queued("t1")] == ["m1"], "the adopted backlog survives"
 
 
+def test_a_refused_background_await_claims_no_tasks(monkeypatch):
+    _task("t1")
+
+    class LegacyCtx:
+        pass  # no capture/publish: the old-runtime refusal path
+
+    class Manager:
+        def start(self):
+            return self
+
+        def cancel_session(self, session_id, task_ids=None):
+            return 0
+
+    monkeypatch.setattr(tools, "_CTX", LegacyCtx())
+    monkeypatch.setattr(tools, "_watch_manager", lambda ctx=None: Manager())
+    monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": "http://peer.invalid"})
+
+    out = tools._start_background_watch({"agent": "peer", "task_id": "t1"}, SESSION_A)
+
+    assert "needs a Hermes runtime" in out
+    assert _store().owner("t1") == "", "a refused await must not claim the task"
+
+
+def test_a_failed_target_capture_claims_no_tasks(monkeypatch):
+    _task("t1")
+
+    class NoDeliveryCtx:
+        def capture_completion_target(self, *, session_id=None):
+            raise type("CompletionDeliveryUnsupported", (RuntimeError,), {})("no later turn")
+
+        def publish_completion(self, **kwargs):
+            return {}
+
+    class Manager:
+        def start(self):
+            return self
+
+        def cancel_session(self, session_id, task_ids=None):
+            return 0
+
+    monkeypatch.setattr(tools, "_CTX", NoDeliveryCtx())
+    monkeypatch.setattr(tools, "_completion_capable", lambda ctx: True)
+    monkeypatch.setattr(tools, "_watch_manager", lambda ctx=None: Manager())
+    monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": "http://peer.invalid"})
+
+    out = tools._start_background_watch({"agent": "peer", "task_id": "t1"}, SESSION_A)
+
+    assert "cannot receive a later turn" in out
+    assert _store().owner("t1") == ""
+
+
 def test_a_refused_multi_task_await_rolls_back_earlier_claims(monkeypatch):
     _task("t1")
     _task("t2")
@@ -345,11 +396,15 @@ def test_a_refused_multi_task_await_rolls_back_earlier_claims(monkeypatch):
         def cancel_session(self, session_id, task_ids=None):
             return 0
 
-        def add(self, **kwargs):
+        def add(self, *, session_id, target, tasks):
+            for _agent, task_id in tasks:
+                other = _store().owner(task_id)
+                if other and other != session_id:
+                    raise RuntimeError(f"task {task_id} is owned by another session")
             return {"watch_id": "watch_test"}
 
-        def ttl_s(self):
-            return 3600.0
+        ttl_s = 3600.0
+        interval = 30.0
 
     monkeypatch.setattr(tools, "_CTX", Ctx())
     monkeypatch.setattr(tools, "_completion_capable", lambda ctx: True)

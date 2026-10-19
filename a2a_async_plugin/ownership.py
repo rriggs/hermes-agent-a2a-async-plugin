@@ -270,7 +270,8 @@ class OwnershipStore:
         now = time.time() if now is None else now
         with self._session() as con:
             rows = con.execute(
-                """SELECT task_id, peer, remote_state, state, unowned_since, cancel_requested_at
+                """SELECT task_id, peer, remote_state, state, unowned_since, released_at,
+                          cancel_requested_at
                      FROM a2a_tasks
                     WHERE owner_session_id='' AND released_by_session_id!=''
                       AND unowned_since<=?
@@ -293,26 +294,34 @@ class OwnershipStore:
                 cancel.append(rec)
         return cancel, abandon
 
-    def mark_cancel_requested(self, task_id: str, now: Optional[float] = None) -> bool:
-        """Record the auto-cancel only if the task is STILL unowned; False means adopt happened."""
+    def mark_cancel_requested(self, task_id: str, now: Optional[float] = None,
+                              released_at: Optional[float] = None) -> bool:
+        """Claim the auto-cancel iff the task is still unowned AND on the release we selected.
+
+        Adoption and re-release between selection and action make the candidate stale: without
+        the release-generation fence the sweep cancels a task that was released seconds ago.
+        """
         now = time.time() if now is None else now
         with self._session() as con:
             cur = con.execute(
                 """UPDATE a2a_tasks SET cancel_requested_at=?
-                    WHERE task_id=? AND owner_session_id='' AND released_by_session_id!=''""",
-                (now, task_id))
+                    WHERE task_id=? AND owner_session_id='' AND released_by_session_id!=''
+                      AND (? IS NULL OR released_at=?)""",
+                (now, task_id, released_at, released_at))
             return cur.rowcount == 1
 
-    def abandon(self, task_id: str, now: Optional[float] = None) -> bool:
-        """Retire an unowned task and its backlog. False when it was adopted meanwhile."""
+    def abandon(self, task_id: str, now: Optional[float] = None,
+                released_at: Optional[float] = None) -> bool:
+        """Retire an unowned task and its backlog. False when it was adopted or re-released."""
         now = time.time() if now is None else now
         with self._session() as con:
             cur = con.execute(
                 """UPDATE a2a_tasks
                       SET state=?, remote_state=?, reply=?, completed_at=?
-                    WHERE task_id=? AND owner_session_id='' AND released_by_session_id!=''""",
+                    WHERE task_id=? AND owner_session_id='' AND released_by_session_id!=''
+                      AND (? IS NULL OR released_at=?)""",
                 (protocol.STATE_CANCELED, protocol.STATE_CANCELED,
-                 "abandoned after the unowned-task TTL", now, task_id))
+                 "abandoned after the unowned-task TTL", now, task_id, released_at, released_at))
             if cur.rowcount != 1:
                 return False
             con.execute("DELETE FROM a2a_task_messages WHERE task_id=?", (task_id,))

@@ -351,6 +351,26 @@ def test_a_blocking_await_does_not_consume_an_adopters_result(monkeypatch):
         "the adopter's backlog must still be queued")
 
 
+def test_a_timer_candidate_from_a_previous_release_is_not_applied():
+    """Adopt + re-release between selection and action must invalidate the old candidate."""
+    import time as _time
+    _task("t1")
+    store = _store()
+    store.acquire("t1", SESSION_A)
+    store.release_all(SESSION_A)
+    now = _time.time() + 604_801.0
+    selected = store.unowned_due(now, cancel_after_s=86_400.0, ttl_s=604_800.0)[1]
+    stale = [rec for rec in selected if rec["task_id"] == "t1"]
+    assert stale, "the task should be a TTL candidate"
+
+    store.acquire("t1", SESSION_B)
+    store.release_all(SESSION_B)  # fresh release, seconds old
+
+    assert store.abandon("t1", now, stale[0]["released_at"]) is False
+    assert protocol.TaskStore().get("t1")["state"] != protocol.STATE_CANCELED
+    assert [m["message_id"] for m in store.queued("t1")] == []
+
+
 def test_a_background_await_of_another_sessions_task_is_refused(monkeypatch):
     """A watch for a task this session cannot deliver must not exist, and its backlog must survive."""
     _task("t1")

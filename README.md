@@ -71,6 +71,11 @@ one. Delivery is durable on OUR side: every message is written to the plugin's o
 (`a2a_tasks.db`), retried with backoff while the host refuses it, and marked published only when a
 live host accepts it. Nothing is written to the host's `state.db`.
 
+Delivery is **at least once**. The host is handed the message and only then is the row committed;
+if the process dies in that window the message is delivered again on the next attempt. A duplicate
+is preferable to a silently dropped result, and the host treats a repeated result as another
+message, not as a protocol duplicate.
+
 ```text
 a2a_await(agent="researcher", task_id="task-1", background=true)
 a2a_await(background=true, tasks=[{agent: "researcher", task_id: "task-1"},

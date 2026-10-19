@@ -562,6 +562,23 @@ class FlakyCtx(FakeCtx):
         return super().inject_message(content, role=role, session_key=session_key, origin=origin)
 
 
+def test_publish_and_backlog_mark_commit_together():
+    """One transaction: an adoption cannot land between the host accepting and the mark."""
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)))
+    protocol.TaskStore(_store().db_path).create(
+        "t1", "t1", "peer", direction="outbound", remote_state=protocol.STATE_WORKING)
+    assert manager.ownership.acquire("t1", SESSION_ID)
+    manager.ownership.add_message("t1", "m1", "result", "the result")
+
+    assert manager.publish_if_owned(SESSION_ID, "t1", lambda: True, mark_messages=["m1"])
+    assert manager.ownership.queued("t1") == [], "the accepted message is marked in the same commit"
+
+    manager.ownership.add_message("t1", "m2", "result", "refused")
+    assert manager.publish_if_owned(SESSION_ID, "t1", lambda: False, mark_messages=["m2"]) is False
+    assert [m["message_id"] for m in manager.ownership.queued("t1")] == ["m2"], (
+        "a refused publish must leave the message queued")
+
+
 def test_a_publication_naming_an_unknown_task_is_not_delivered():
     """A row whose task record is gone must fail closed, not publish into the watch's session."""
     store = _store()

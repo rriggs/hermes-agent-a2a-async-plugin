@@ -731,7 +731,7 @@ def _record_observation(task_id: str, payload: dict, peer: str) -> list[dict]:
     try:
         # History first (chronology), peer-originated only: ROLE_USER is OUR request.
         for index, message in enumerate(payload.get("history") or []):
-            if str(message.get("role") or "").lower() not in ("agent", "assistant"):
+            if not _peer_role(message.get("role")):
                 continue
             text = _text_of_message(message)
             if not text:
@@ -759,6 +759,15 @@ def _record_observation(task_id: str, payload: dict, peer: str) -> list[dict]:
     except Exception:
         logger.debug("A2A: message recording failed", exc_info=True)
     return store.queued(task_id)
+
+
+def _peer_role(role: Any) -> bool:
+    """True for a peer-originated history entry.
+
+    A2A v1.0 payloads use the proto enum names ``ROLE_USER`` / ``ROLE_AGENT``; older producers
+    use ``agent`` / ``assistant``. ``ROLE_USER`` is OUR request, never peer progress.
+    """
+    return str(role or "").lower() in ("agent", "assistant", "role_agent")
 
 
 def _text_of_message(message: Any) -> str:
@@ -802,7 +811,8 @@ def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: 
     """Publish undelivered peer messages; returns the message ids the host accepted."""
     published: list[str] = []
     for msg in messages:
-        text = str(msg.get("text") or "").strip()
+        raw = str(msg.get("text") or "")
+        text = raw.strip()
         if not text:
             continue
         kind = str(msg.get("kind") or "progress")
@@ -810,10 +820,13 @@ def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: 
         try:
             # Serialized with release, and the backlog mark commits with the publish: a release
             # between them would let the next owner replay a message this session already saw.
+            # expected_text fences the revision, not just the identity: a poll can revise the
+            # artifact between this snapshot and the publish (Amy round 2, P1).
             accepted = _watch_manager(ctx).publish_if_owned(
                 session_id or "", task_id,
                 lambda: _inject(ctx, target, content),
-                mark_messages=[str(msg["message_id"])])
+                mark_messages=[str(msg["message_id"])],
+                expected_text=raw)
         except Exception as exc:
             logger.warning("A2A: could not publish %s/%s: %s", task_id, msg["message_id"], exc)
             continue
@@ -848,6 +861,12 @@ def _peer_message_content(peer: str, task_id: str, kind: str, text: str) -> str:
     else:
         head = f"A2A task {task_id} on peer '{peer}' sent a progress note."
     return f"{head}\n\n{_bound(text)}"
+
+
+def _ownership_changed_result(agent: str, task_id: str) -> str:
+    return (f"[{agent} · task {task_id} · ownership changed]\n"
+            "Another session took this task while the result was in flight; it was not "
+            "consumed here.")
 
 
 def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
@@ -889,13 +908,17 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
         try:
             resp = _rpc_request(peer, "GetTask", {"id": task_id}, timeout=30)
         except Exception as e:
-            _ownership().consume_if_owned(task_id, session_id or "",
-                                          [m["message_id"] for m in backlog])
+            # The fence verdict decides whether this caller may still hand back the backlog it
+            # snapshotted. Ignoring it leaked the adopter's messages to the old session.
+            if not _ownership().consume_if_owned(task_id, session_id or "",
+                                                 [m["message_id"] for m in backlog]):
+                return _ownership_changed_result(agent, task_id)
             prefix = ("\n".join(preface) + "\n\n") if preface else ""
             return prefix + f"Error: poll of '{agent}' failed — {e}."
         if "error" in resp:
-            _ownership().consume_if_owned(task_id, session_id or "",
-                                          [m["message_id"] for m in backlog])
+            if not _ownership().consume_if_owned(task_id, session_id or "",
+                                                 [m["message_id"] for m in backlog]):
+                return _ownership_changed_result(agent, task_id)
             prefix = ("\n".join(preface) + "\n\n") if preface else ""
             return prefix + _peer_rpc_error(resp, agent)
         payload = resp.get("result", {})
@@ -938,9 +961,7 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                 if not _ownership().consume_if_owned(
                         task_id, session_id or "", [m["message_id"] for m in queued_now],
                         state=state, reply=text):
-                    return (f"[{agent} · task {task_id} · ownership changed]\n"
-                            "Another session took this task while the result was in flight; it "
-                            "was not consumed here.")
+                    return _ownership_changed_result(agent, task_id)
                 # Mirror the committed transition into the in-memory TaskStore (the transaction
                 # above already wrote the row, so this is cache coherence, not durability).
                 if state in protocol.TERMINAL_STATES:
@@ -973,8 +994,9 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                 return f"{prefix}\n\n{header}\n{body}" if prefix else f"{header}\n{body}"
         if time.time() >= deadline:
             observed = _queued_backlog(task_id)
-            _ownership().consume_if_owned(task_id, session_id or "",
-                                          [m["message_id"] for m in observed])
+            if not _ownership().consume_if_owned(task_id, session_id or "",
+                                                 [m["message_id"] for m in observed]):
+                return _ownership_changed_result(agent, task_id)
             prefix = "\n".join(preface + _backlog_lines(observed))
             note = (f"[{agent} · task {task_id} · still working after {timeout}s]\n"
                     f"Call a2a_await again or check a2a_get_task.")

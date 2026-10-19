@@ -604,12 +604,18 @@ class WatchStore:
         return True
 
     def publish_if_owned(self, session_id: str, task_id: str, publish,
-                         mark_messages: Iterable[str] = ()) -> bool:
+                         mark_messages: Iterable[str] = (),
+                         expected_text: Optional[str] = None) -> bool:
         """Publish one message and mark it delivered, in ONE transaction.
 
         Ownership is verified before the host sees the message and the backlog mark commits with
         it, so an adoption cannot land between "delivered to A" and "marked delivered": the
         adopter would otherwise replay a message A already received, into a different session.
+
+        ``expected_text`` is the revision the caller is about to publish. The backlog row is keyed
+        on the message identity, not its content, so a background poll can revise the artifact
+        between the caller's snapshot and this call; without the revision fence the mark would
+        acknowledge content the host never saw (Amy round 2, P1).
         """
         ids = [str(m) for m in mark_messages if m]
         con = self._connect()
@@ -623,17 +629,27 @@ class WatchStore:
                 # the session that just gave it up, and a bound session must own what it replays.
                 con.rollback()
                 return False
+            undelivered: dict[str, str] = {}
             if ids:
                 # Publish only what is still undelivered. The outbox flush and a direct backlog
                 # replay are two paths for the same durable message; whichever loses this check
                 # must not inject a second copy (Amy's PR #9 finding 3).
                 marks = ",".join("?" for _ in ids)
-                pending = con.execute(
-                    f"""SELECT 1 FROM a2a_task_messages
-                         WHERE task_id=? AND message_id IN ({marks}) AND delivered_at IS NULL
-                         LIMIT 1""",
-                    (task_id, *ids)).fetchone()
-                if pending is None:
+                rows = con.execute(
+                    f"""SELECT message_id, text, delivered_at FROM a2a_task_messages
+                         WHERE task_id=? AND message_id IN ({marks})""",
+                    (task_id, *ids)).fetchall()
+                undelivered = {r["message_id"]: str(r["text"] or "")
+                               for r in rows if r["delivered_at"] is None}
+                if not undelivered:
+                    con.rollback()
+                    return False
+                if expected_text is not None and any(
+                        text != expected_text for text in undelivered.values()):
+                    # The caller snapshotted an older revision of the artifact. Publishing it
+                    # would let the mark settle content the host never saw (Amy round 2, P1).
+                    logger.info("A2A: %s/%s changed since it was read; leaving it queued",
+                                task_id, ", ".join(sorted(undelivered)))
                     con.rollback()
                     return False
             # The callback's own verdict matters: a host that REFUSED the message must leave it
@@ -645,8 +661,10 @@ class WatchStore:
                     con.execute(
                         """UPDATE a2a_task_messages
                               SET delivered_at=?, delivered_to_session=?
-                            WHERE task_id=? AND message_id=? AND delivered_at IS NULL""",
-                        (now, session_id, task_id, message_id))
+                            WHERE task_id=? AND message_id=? AND delivered_at IS NULL
+                              AND text=?""",
+                        (now, session_id, task_id, message_id,
+                         undelivered.get(message_id, expected_text or "")))
                     # Settle the matching outbox row in the SAME commit. Leaving it pending let
                     # the next flush deliver a message this path already accepted.
                     self._settle_publications(con, task_id, message_id, now)
@@ -961,10 +979,12 @@ class WatchManager:
         return watch
 
     def publish_if_owned(self, session_id: str, task_id: str, publish,
-                         mark_messages: Iterable[str] = ()) -> bool:
+                         mark_messages: Iterable[str] = (),
+                         expected_text: Optional[str] = None) -> bool:
         """One publish under the store write lock, only while this session still owns the task."""
         return self.store.publish_if_owned(session_id, task_id, publish,
-                                           mark_messages=mark_messages)
+                                           mark_messages=mark_messages,
+                                           expected_text=expected_text)
 
     def cancel(self, watch_id: str, *, session_id: str = "") -> Optional[str]:
         with self._scope():
@@ -1045,6 +1065,12 @@ class WatchManager:
                     continue
                 from . import tools as _tools
                 meta = _load_metadata(row.get("metadata_json"))
+                if self._message_content_changed(con, meta, row["content"]):
+                    # The artifact was revised after this row was written; the poll refreshes the
+                    # row. Delivering now would retire it with content the host already outgrew.
+                    logger.debug("A2A watch: %s carries an older revision; leaving it pending",
+                                 event_id)
+                    continue
                 if self._message_already_delivered(con, meta):
                     # A direct backlog replay accepted this durable message after this row was
                     # written. The backlog mark is authoritative; injecting again would duplicate.
@@ -1099,6 +1125,28 @@ class WatchManager:
                         (now, session_id, task_id, message_id))
                 published += 1
         return published
+
+    @staticmethod
+    def _message_content_changed(con: sqlite3.Connection, meta: dict, content: str) -> bool:
+        """True when the outbox row's body no longer matches the artifact's current revision.
+
+        The outbox row is written after the artifact is recorded, but a concurrent poll can revise
+        the artifact before this flush runs. Injecting the older body would retire the row with
+        text the host already outgrew (Amy round 2, P1); the poll refreshes the row instead.
+        """
+        task_id = str(meta.get("task_id") or "")
+        message_id = str(meta.get("message_id") or "")
+        if not task_id or not message_id:
+            return False
+        row = con.execute(
+            "SELECT text, kind FROM a2a_task_messages WHERE task_id=? AND message_id=?",
+            (task_id, message_id)).fetchone()
+        if row is None:
+            return False
+        current = _message_content(str(meta.get("peer") or ""), task_id,
+                                   str(row["kind"] or meta.get("kind") or "progress"),
+                                   str(row["text"] or ""))
+        return current != content
 
     @staticmethod
     def _message_already_delivered(con: sqlite3.Connection, meta: dict) -> bool:
@@ -1231,7 +1279,7 @@ class WatchManager:
         # History first (chronology), peer-originated only: ROLE_USER entries are OUR requests,
         # not peer progress, and status/artifacts are the newest messages.
         for index, message in enumerate(payload.get("history") or []):
-            if str(message.get("role") or "").lower() not in ("agent", "assistant"):
+            if not tools._peer_role(message.get("role")):
                 continue
             text = tools._text_of_message(message)
             if not text:

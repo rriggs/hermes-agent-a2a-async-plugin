@@ -93,6 +93,9 @@ PYTHONPATH=<hermes checkout> python -m pytest -q \
 | R2 | P2 | `artifact:{id}` and `artifact:{index}` shared a namespace: artifactId `1` aliased the id-less artifact at index 1 | `tests/test_watches.py::test_named_and_positional_artifacts_do_not_alias` |
 | R3 | P2 | `a2a_list` still opened the ambient DB | `tests/test_tools.py::test_a2a_list_reads_the_plugins_profile_database` |
 | R4 | P2 | The empty-reply escape hatch let a stale text-less report flip a finished task into the cancel sweep, and `a2a_list` took the write lock on construction (10s stall behind a publish) | `tests/test_watches.py::test_a_stale_report_cannot_flip_a_finished_task_with_no_text`, `tests/test_tools.py::test_a2a_list_does_not_wait_for_the_write_lock` |
+| A2-1 | P1 | A replay acknowledged an artifact revision it never sent: a poll revised the artifact (and refreshed its outbox row) between the replay's snapshot and the publish, so the mark settled the new content while the host only saw the old text | `tests/test_watches.py::test_a_replay_must_not_acknowledge_a_revision_it_did_not_send`, `::test_flush_skips_an_outbox_body_the_artifact_has_outgrown` |
+| A2-2 | P2 | Both history recorders lowercased the role and accepted only `agent`/`assistant`, dropping A2A v1.0 `ROLE_AGENT` messages | `tests/test_watches.py::test_v1_role_agent_history_reaches_both_recorders` |
+| A2-3 | P2 | The blocking await's transport-error, RPC-error and timeout exits ignored the ownership-fence verdict and returned the old caller's backlog snapshot | `tests/test_watches.py::test_a_poll_error_after_losing_ownership_does_not_return_the_backlog`, `::test_a_peer_rpc_error_after_losing_ownership_does_not_return_the_backlog`, `::test_a_timeout_after_losing_ownership_does_not_return_the_backlog` |
 | API-1 | -- | `provides_hooks` missing from `plugin.yaml`; plugin API validate failed | `hermes plugins validate` (section A) |
 | API-2 | -- | Validate on a working tree flags the gitignored SDK venv as dangerous | environment: run validate on a clean export (section A) |
 | ENV-1 | -- | In the e2e image, `test_real_runtime_registration_via_hermes_plugins_list` finds no installed plugin | environment limitation, identical on `f3ddaaa` (see D) |
@@ -141,9 +144,9 @@ Run 2026-10-19, branch `feat/inject-message-delivery`, plugin `0.5.0`.
 
 | Check | Result |
 |---|---|
-| Host targeted matrix (23 issue tests, section B) | 23 passed |
-| Host full suite (`pytest tests -q`) | 257 passed, 3 skipped |
-| Container full suite (same tree, image `localhost/hermes-e2e:local`) | 253 passed, 5 skipped, 2 known-limitation failures (D) |
+| Host targeted matrix (section B) | 29 passed |
+| Host full suite (`pytest tests -q`) | 263 passed, 3 skipped |
+| Container full suite (same tree, image `localhost/hermes-e2e:local`) | 259 passed, 5 skipped, 2 known-limitation failures (D) |
 | Container end-to-end (`run-container.sh`) | PASS, 8 model calls, 2 peer polls, outbox `attempts=0` |
 | `hermes plugins validate` (clean export) | Validation passed (2 warnings, section A) |
 | `hermes plugins doctor` (clean export) | OK: discovery, manifest, import, registration; 13 tools, 3 hooks |

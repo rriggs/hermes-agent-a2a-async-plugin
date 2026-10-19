@@ -213,17 +213,35 @@ class OwnershipStore:
 
     # -- message backlog --------------------------------------------------
     def add_message(self, task_id: str, message_id: str, kind: str, text: str,
-                    now: Optional[float] = None) -> bool:
-        """Record one peer message; True when it was new (idempotent per message id)."""
+                    now: Optional[float] = None, *, update_existing: bool = False) -> bool:
+        """Record one peer message; True when it was new (idempotent per message id).
+
+        ``update_existing`` is for artifacts, whose id is stable while their content changes
+        between snapshots: a changed body updates the row in place and re-queues it (a delivered
+        working revision must not hide the final one), an identical body is a no-op.
+        """
         if not task_id or not message_id:
             return False
         now = time.time() if now is None else now
         with self._session() as con:
-            cur = con.execute(
-                """INSERT OR IGNORE INTO a2a_task_messages
-                       (task_id, message_id, kind, text, created_at)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (task_id, message_id, kind or "progress", text or "", now))
+            if update_existing:
+                cur = con.execute(
+                    """INSERT INTO a2a_task_messages
+                           (task_id, message_id, kind, text, created_at)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(task_id, message_id) DO UPDATE SET
+                           kind=excluded.kind,
+                           text=excluded.text,
+                           delivered_at=NULL,
+                           delivered_to_session=''
+                       WHERE a2a_task_messages.text <> excluded.text""",
+                    (task_id, message_id, kind or "progress", text or "", now))
+            else:
+                cur = con.execute(
+                    """INSERT OR IGNORE INTO a2a_task_messages
+                           (task_id, message_id, kind, text, created_at)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (task_id, message_id, kind or "progress", text or "", now))
             return cur.rowcount == 1
 
     def queued(self, task_id: str) -> list[dict]:
@@ -244,12 +262,17 @@ class OwnershipStore:
         return row is not None
 
     def consume_if_owned(self, task_id: str, session_id: str,
-                         message_ids: list[str]) -> bool:
+                         message_ids: list[str], *, state: Optional[str] = None,
+                         reply: str = "") -> bool:
         """Mark backlog delivered in ONE transaction, fenced on live ownership.
 
         The blocking await records and acknowledges its results as separate statements; a release
         plus an adoption in between would otherwise let the former owner consume the new owner's
         backlog. ``False`` means ownership changed and NOTHING was marked.
+
+        ``state``/``reply`` fold the task-record transition into the same transaction. Without it
+        a crash between the acknowledgement and ``TaskStore.complete`` consumed the only durable
+        copy of the peer's final text (local review of PR #9, D1).
         """
         now = time.time()
         with self._session() as con:
@@ -263,6 +286,26 @@ class OwnershipStore:
                 "SELECT owner_session_id FROM a2a_tasks WHERE task_id=?", (task_id,)).fetchone()
             if row is None or str(row[0] or "") != str(session_id or ""):
                 return False
+            if state:
+                # Mirror TaskStore.complete/set_state: only an outbound task mirrors the remote
+                # state, and only a terminal state stores the reply and a completion time.
+                if state in TERMINAL_REMOTE_STATES:
+                    con.execute(
+                        """UPDATE a2a_tasks
+                              SET state=?,
+                                  remote_state=CASE WHEN direction='outbound' THEN ?
+                                                    ELSE remote_state END,
+                                  reply=?, completed_at=?
+                            WHERE task_id=?""",
+                        (state, state, reply or "", now, task_id))
+                else:
+                    con.execute(
+                        """UPDATE a2a_tasks
+                              SET state=?,
+                                  remote_state=CASE WHEN direction='outbound' THEN ?
+                                                    ELSE remote_state END
+                            WHERE task_id=?""",
+                        (state, state, task_id))
             for message_id in message_ids:
                 # The ownership condition is repeated on the UPDATE itself so the mark stays
                 # fenced even if a caller ever runs this inside an already-open transaction.

@@ -516,13 +516,25 @@ class WatchStore:
     # -- publication outbox ----------------------------------------------
     def enqueue_publication(self, *, watch_id: str, event_id: str, content: str,
                             metadata: dict) -> None:
-        """Persist an event for delivery. Idempotent per event id; the row IS the retry state."""
+        """Persist an event for delivery. Idempotent per event id; the row IS the retry state.
+
+        A changed body reopens a settled row: an artifact keeps its identity across snapshots, so
+        its outbox event id is stable and the final revision must be deliverable again after an
+        earlier one was accepted.
+        """
         now = time.time()
         with self._session() as con:
             con.execute(
-                """INSERT OR IGNORE INTO a2a_watch_publications
+                """INSERT INTO a2a_watch_publications
                        (event_id, watch_id, content, metadata_json, created_at, next_attempt_at)
-                   VALUES (?, ?, ?, ?, ?, 0)""",
+                   VALUES (?, ?, ?, ?, ?, 0)
+                   ON CONFLICT(event_id) DO UPDATE SET
+                       content=excluded.content,
+                       metadata_json=excluded.metadata_json,
+                       attempts=0,
+                       next_attempt_at=0,
+                       published_at=NULL
+                   WHERE a2a_watch_publications.content <> excluded.content""",
                 (event_id, watch_id, content, json.dumps(metadata, sort_keys=True), now))
             con.commit()
 
@@ -633,13 +645,7 @@ class WatchStore:
                         (now, session_id, task_id, message_id))
                     # Settle the matching outbox row in the SAME commit. Leaving it pending let
                     # the next flush deliver a message this path already accepted.
-                    con.execute(
-                        """UPDATE a2a_watch_publications
-                              SET published_at=?, next_attempt_at=0
-                            WHERE published_at IS NULL
-                              AND json_extract(metadata_json, '$.task_id')=?
-                              AND json_extract(metadata_json, '$.message_id')=?""",
-                        (now, task_id, message_id))
+                    self._settle_publications(con, task_id, message_id, now)
             con.commit()
             return bool(delivered)
         except Exception:
@@ -647,6 +653,27 @@ class WatchStore:
             raise
         finally:
             con.close()
+
+    @staticmethod
+    def _settle_publications(con: sqlite3.Connection, task_id: str, message_id: str,
+                             now: float) -> None:
+        """Retire pending outbox rows for one delivered message.
+
+        Metadata is parsed in Python rather than with ``json_extract``: a malformed row would
+        otherwise raise inside the publish transaction and roll back a delivery the host had
+        already accepted (local review, D4). An unreadable row is left untouched.
+        """
+        rows = con.execute(
+            "SELECT event_id, metadata_json FROM a2a_watch_publications"
+            " WHERE published_at IS NULL").fetchall()
+        for row in rows:
+            meta = _load_metadata(row["metadata_json"])
+            if (str(meta.get("task_id") or "") != task_id
+                    or str(meta.get("message_id") or "") != message_id):
+                continue
+            con.execute(
+                "UPDATE a2a_watch_publications SET published_at=?, next_attempt_at=0"
+                " WHERE event_id=?", (now, row["event_id"]))
 
     def due_publications(self, now: Optional[float] = None) -> list[dict]:
         now = time.time() if now is None else now
@@ -826,6 +853,10 @@ class WatchManager:
         self._stop = threading.Event()
         self._lifecycle = threading.Lock()
         self._restart_requested = False
+        # Epochs make a queued hand-over belong to one stop(): a later stop() bumps the epoch
+        # and invalidates the request, so a poller cannot outlive a stop() that already returned.
+        self._stop_epoch = 0
+        self._restart_epoch = 0
 
     # -- lifecycle --------------------------------------------------------
     def start(self) -> "WatchManager":
@@ -837,18 +868,24 @@ class WatchManager:
                     # under one lease-owner token; defer instead and let the exiting thread
                     # hand over (Amy's PR #9 finding 4).
                     self._restart_requested = True
+                    self._restart_epoch = self._stop_epoch
                 return self
-            self._stop = threading.Event()
-            stop = self._stop
-            self._thread = threading.Thread(
-                target=self._loop, args=(stop,), name="a2a-watch-manager", daemon=True)
-            self._thread.start()
+            self._start_locked()
             return self
+
+    def _start_locked(self) -> None:
+        """Start a poller generation. The caller holds ``_lifecycle``."""
+        self._stop = threading.Event()
+        stop = self._stop
+        self._thread = threading.Thread(
+            target=self._loop, args=(stop,), name="a2a-watch-manager", daemon=True)
+        self._thread.start()
 
     def stop(self, timeout: float = 5.0) -> None:
         thread = self._thread
         with self._lifecycle:
             self._stop.set()
+            self._stop_epoch += 1
             # A stop after a deferred start cancels the hand-over: the caller wants it stopped.
             self._restart_requested = False
         if thread is not None and thread.is_alive():
@@ -870,10 +907,13 @@ class WatchManager:
             with self._lifecycle:
                 if self._thread is threading.current_thread():
                     self._thread = None
-                restart = self._restart_requested
+                restart = (self._restart_requested
+                           and self._restart_epoch == self._stop_epoch)
                 self._restart_requested = False
-            if restart:
-                self.start()
+                if restart:
+                    # Hand over under the lock stop() also takes: a stop() that already
+                    # returned cannot be undone by this thread spawning a new poller after it.
+                    self._start_locked()
 
     def _scope(self):
         return profile_scope(self.profile_home)
@@ -1141,8 +1181,16 @@ class WatchManager:
         session_id = str(watch.get("session_id") or "")
         delivered: list[str] = []
         enqueue_failed = False
+        # Artifacts are deliverables, not progress notes: a streaming peer that grows one
+        # artifact on every poll must not fan out a message per revision (local review, D2).
+        # They stay queued, and the row's latest revision is published when the task turns
+        # terminal or needs input.
+        publish_results = (raw_state in protocol.TERMINAL_STATES
+                           or raw_state == protocol.STATE_INPUT_REQUIRED)
         if session_id and self.ownership.owner(task_id) == session_id:
             for msg in queued:
+                if str(msg.get("kind") or "") == "result" and not publish_results:
+                    continue
                 try:
                     self.store.enqueue_publication(
                         watch_id=watch_id, event_id=f"a2a:{task_id}:{msg['message_id']}",
@@ -1200,7 +1248,8 @@ class WatchManager:
                 continue
             kind = "input-required" if raw_state == protocol.STATE_INPUT_REQUIRED else "result"
             self.ownership.add_message(
-                task_id, tools._artifact_message_id(artifact, index, text), kind, text)
+                task_id, tools._artifact_message_id(artifact, index, text), kind, text,
+                update_existing=True)
         if raw_state in protocol.TERMINAL_STATES and not self.ownership.has_kind(task_id, "result"):
             self.ownership.add_message(
                 task_id, f"state:{raw_state}", "result",

@@ -747,9 +747,11 @@ def _record_observation(task_id: str, payload: dict, peer: str) -> list[dict]:
             text = _text_of_message(artifact)
             if not text:
                 continue
-            store.add_message(task_id, _artifact_message_id(artifact, index, text), "result", text)
-        if state in protocol.TERMINAL_STATES and not any(
-                m["kind"] == "result" for m in store.queued(task_id)):
+            store.add_message(task_id, _artifact_message_id(artifact, index, text), "result",
+                              text, update_existing=True)
+        if state in protocol.TERMINAL_STATES and not store.has_kind(task_id, "result"):
+            # Check DELIVERED rows too: a reply consumed by an earlier attempt still exists, and
+            # fabricating "no text reply" would hide it from a re-await (local review, D1).
             store.add_message(task_id, f"state:{state}", "result",
                               f"task reached {_short_state(state)} with no text reply")
     except Exception:
@@ -776,19 +778,19 @@ def _digest(text: str) -> str:
 
 
 def _artifact_message_id(artifact: dict, index: int, text: str) -> str:
-    """Key an artifact message by identity AND content revision.
+    """Stable backlog key for an artifact.
 
-    An ``artifactId`` is stable across snapshots: a working poll can expose it with partial text
-    and the completed poll re-emit the same id with the final answer. Keying only on the id made
-    ``INSERT OR IGNORE`` drop the final revision (Amy's PR #9 finding 2), so the revision is part
-    of the message id: re-polling identical content stays idempotent, changed content is a new
-    message.
+    An ``artifactId`` is an identity, not a content revision: a working snapshot can expose it
+    with partial text and the completed snapshot re-emit the same id with the final answer. The
+    row is keyed on that identity and updated in place (``add_message(update_existing=True)``) so
+    the final revision replaces the partial one instead of being dropped by ``INSERT OR IGNORE``
+    (Amy's PR #9 finding 2), and a streaming peer cannot turn every revision into its own message
+    (local review, D2).
     """
     artifact_id = str(artifact.get("artifactId") or artifact.get("artifact_id") or "")
-    revision = _digest(text)
-    if not artifact_id:
-        return f"artifact:{index}:{revision}"
-    return f"{artifact_id}#{revision}"
+    if artifact_id:
+        return artifact_id
+    return f"artifact:{index}:{_digest(text)}"
 
 
 def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: Any,
@@ -910,16 +912,27 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                 results = [str(m.get("text") or "").strip() for m in queued_now
                            if str(m.get("kind")) == "result" and str(m.get("text") or "").strip()]
                 text = "\n\n".join(results) if results else (
-                    _reply_text_from_result(payload) or "(no text reply)")
-                # Fence FIRST: ownership is verified and the backlog acknowledged in one
-                # transaction before the shared task record or the transcript is written. A
-                # release+adoption in flight must leave the adopter's task and transcript alone,
-                # and the old code wrote both before discovering it had lost the task.
+                    _reply_text_from_result(payload) or "")
+                if not text and state in protocol.TERMINAL_STATES:
+                    # The backlog can already be empty because an earlier attempt delivered the
+                    # reply and died before the turn returned. The task row holds the text, so
+                    # recover it instead of reporting "no text reply" (local review, D1).
+                    stored = _task_store().get(task_id) or {}
+                    if str(stored.get("state") or "") == state:
+                        text = str(stored.get("reply") or "")
+                text = text or "(no text reply)"
+                # Fence AND record in one transaction: ownership is verified, the task row goes
+                # terminal with the reply, and the backlog is acknowledged together. Recording
+                # after the acknowledgement (the first cut of this fix) meant a crash in between
+                # consumed the only durable copy of the peer's text (local review, D1).
                 if not _ownership().consume_if_owned(
-                        task_id, session_id or "", [m["message_id"] for m in queued_now]):
+                        task_id, session_id or "", [m["message_id"] for m in queued_now],
+                        state=state, reply=text):
                     return (f"[{agent} · task {task_id} · ownership changed]\n"
                             "Another session took this task while the result was in flight; it "
                             "was not consumed here.")
+                # Mirror the committed transition into the in-memory TaskStore (the transaction
+                # above already wrote the row, so this is cache coherence, not durability).
                 if state in protocol.TERMINAL_STATES:
                     _task_store().complete(task_id, state, text)
                 else:
@@ -928,11 +941,17 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                 # (issue #5 caller side — review finding 1). Without this the
                 # a2a_await result never reached the transcript, and the peer's
                 # text would enter later context only via the tool result,
-                # unframed.
+                # unframed. Best-effort like every other transcript mirror: the
+                # task row already holds the reply, so a failed write must not
+                # turn a delivered result into a tool error.
                 reply_ctx = str(payload.get("contextId", "")) if isinstance(payload, dict) else ""
                 if reply_ctx and text:
-                    protocol.persist_message(reply_ctx, "agent", security.filter_inbound(text),
-                                             task_id, peer=agent)
+                    try:
+                        protocol.persist_message(reply_ctx, "agent",
+                                                 security.filter_inbound(text),
+                                                 task_id, peer=agent)
+                    except Exception:
+                        logger.warning("A2A await could not persist the peer reply", exc_info=True)
                 header = f"[{agent} · task {payload.get('id', task_id)} · {short}]"
                 body = text
                 if short == "input-required":

@@ -1156,3 +1156,123 @@ def test_stop_does_not_abandon_a_live_poller_for_a_second_one(monkeypatch):
         manager.stop(timeout=5.0)
         old.join(timeout=5)
     assert not old.is_alive()
+
+
+# ── Local review of the PR #9 fixes (D1-D4) ─────────────────────────────────
+
+def test_the_answer_survives_a_crash_after_the_fence(monkeypatch):
+    """D1: the fence must write the task row in the same transaction as the acknowledgement.
+
+    A crash between 'consume' and 'TaskStore.complete' used to consume the only durable copy of
+    the peer's text; the reply must already be in the task row when the fence commits.
+    """
+    protocol.TaskStore().create("t1", "ctx-1", "peer", direction="outbound",
+                                remote_state=protocol.STATE_WORKING)
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED,
+                                                      "THE FINAL ANSWER")))
+    assert manager.ownership.acquire("t1", SESSION_ID)
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+    payload = _artifact_payload(protocol.STATE_COMPLETED, "THE FINAL ANSWER")
+    monkeypatch.setattr(tools, "_rpc_request",
+                        lambda peer, method, params, timeout=None: {"result": payload})
+    monkeypatch.setattr(protocol.TaskStore, "complete",
+                        lambda self, *a, **k: (_ for _ in ()).throw(RuntimeError("crash")))
+
+    with pytest.raises(RuntimeError, match="crash"):
+        tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5},
+                        SESSION_ID)
+
+    fresh = protocol.TaskStore()
+    record = fresh.get("t1")
+    assert record["state"] == protocol.STATE_COMPLETED, "the fence must persist the terminal state"
+    assert record["reply"] == "THE FINAL ANSWER", "the answer must be durable before the mirror"
+    assert manager.ownership.queued("t1") == []
+
+
+def test_a_streaming_artifact_delivers_once_with_its_final_content():
+    """D2: one stable artifactId is one message, however many revisions the peer streams."""
+    ctx = FakeCtx()
+    revisions = [_artifact_payload(protocol.STATE_WORKING, f"chunk {i}") for i in range(8)]
+    revisions.append(_artifact_payload(protocol.STATE_COMPLETED, "final"))
+    manager = _manager(ScriptedPoll(*revisions), ctx=ctx)
+    _add(manager)
+
+    for step in range(len(revisions)):
+        manager.run_once(now=1_000.0 + step * 5.0)
+
+    assert len(ctx.injected) == 1, f"one artifact must not fan out per revision: {len(ctx.injected)}"
+    assert "final" in ctx.injected[0]["content"]
+    [row] = [m for m in manager.ownership.queued("t1")] or [{"text": "final"}]
+    assert "final" in row["text"]
+
+
+def test_a_changed_body_reopens_the_settled_outbox_row():
+    """D2: an artifact keeps its event id across revisions; new content must be deliverable."""
+    store = _store()
+    store.create(watch_id="w", session_id=SESSION_ID,
+                 target={"session_key": TARGET_SESSION_KEY}, tasks=[("peer", "t1")], ttl_s=3600)
+    meta = {"task_id": "t1", "message_id": "a1", "session_id": SESSION_ID}
+
+    store.enqueue_publication(watch_id="w", event_id="evt", content="partial", metadata=meta)
+    store.mark_published("evt", now=1.0)
+    assert _outbox("w", pending_only=True) == []
+
+    store.enqueue_publication(watch_id="w", event_id="evt", content="final", metadata=meta)
+    [reopened] = _outbox("w", pending_only=True)
+    assert reopened["content"] == "final"
+
+    store.mark_published("evt", now=2.0)
+    store.enqueue_publication(watch_id="w", event_id="evt", content="final", metadata=meta)
+    assert _outbox("w", pending_only=True) == [], "an identical body must stay settled"
+
+
+def test_a_stop_that_returned_cannot_be_undone_by_a_queued_handover(monkeypatch):
+    """D3: a deferred hand-over queued before a later stop() must not start a poller."""
+    monkeypatch.setattr(watches.WatchManager, "start", _REAL_START)
+    in_poll, release = threading.Event(), threading.Event()
+
+    def poll(*_args):
+        in_poll.set()
+        assert release.wait(10)
+        return {"id": "t1", "status": {"state": protocol.STATE_WORKING}}
+
+    manager = watches.WatchManager(FakeCtx(), store=_store(), poll=poll, interval=0.01,
+                                   ttl_s=3600)
+    _add(manager)
+    old = manager._thread
+    started: list[int] = []
+    real_start_locked = watches.WatchManager._start_locked
+    try:
+        assert in_poll.wait(5)
+        manager.stop(timeout=0.01)          # the poller is still in flight
+        manager.start()                     # queued hand-over for this stop
+        monkeypatch.setattr(watches.WatchManager, "_start_locked",
+                            lambda self: (started.append(1), real_start_locked(self)))
+        manager.stop(timeout=0.0)           # a stop() that returns before the old thread exits
+    finally:
+        release.set()
+        old.join(timeout=5)
+    assert started == [], "a poller started after stop() returned"
+    assert not old.is_alive()
+
+
+def test_unreadable_publication_metadata_does_not_abort_a_publish():
+    """D4: settlement parses metadata in Python; a malformed row must not roll back an accepted
+    publish (the host already received the message)."""
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_WORKING, "x")))
+    protocol.TaskStore(_store().db_path).create("t1", "t1", "peer", direction="outbound",
+                                                remote_state=protocol.STATE_WORKING)
+    assert manager.ownership.acquire("t1", SESSION_ID)
+    manager.ownership.add_message("t1", "m1", "result", "answer")
+    watch = _add(manager)
+    with _store()._session() as con:
+        con.execute(
+            "INSERT INTO a2a_watch_publications (event_id, watch_id, content, metadata_json,"
+            " created_at) VALUES ('bad-row', ?, 'x', '{broken', 1.0)", (watch["watch_id"],))
+
+    assert manager.publish_if_owned(SESSION_ID, "t1", lambda: True, mark_messages=["m1"]) is True
+    assert manager.ownership.queued("t1") == [], "the accepted message must be marked delivered"
+    with _store()._session() as con:
+        row = con.execute(
+            "SELECT published_at FROM a2a_watch_publications WHERE event_id='bad-row'").fetchone()
+    assert row["published_at"] is None, "an unreadable row must be left alone, not settled"

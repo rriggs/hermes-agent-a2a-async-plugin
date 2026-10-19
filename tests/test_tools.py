@@ -175,3 +175,21 @@ def test_task_store_uses_the_plugins_profile_database(monkeypatch, tmp_path):
     monkeypatch.setenv("A2A_TASKS_DB", str(tmp_path / "ambient.db"))
 
     assert tools._task_store()._db_path == str(home / "a2a_tasks.db")
+
+
+def test_a2a_list_reads_the_plugins_profile_database(monkeypatch, tmp_path):
+    """Round 3 N5: the listing path must use the same database as the writes."""
+    home = tmp_path / "profile-home"
+    home.mkdir()
+    manager = type("Manager", (), {"home_path": str(home)})()
+    ctx = type("Ctx", (), {"_manager": manager})()
+    monkeypatch.setattr(tools, "_CTX", ctx)
+    monkeypatch.setenv("A2A_TASKS_DB", str(tmp_path / "ambient.db"))
+    monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {}})
+    tools.protocol.TaskStore(str(home / "a2a_tasks.db")).create(
+        "t-profile", "ctx-1", "peer", direction="outbound",
+        remote_state=tools.protocol.STATE_COMPLETED)
+
+    out = tools.a2a_list({"kind": "tasks"})
+
+    assert "t-profile" in out, "the profile's own task must be listed"

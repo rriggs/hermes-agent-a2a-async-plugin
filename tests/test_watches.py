@@ -1325,7 +1325,7 @@ def test_artifact_and_history_ids_do_not_collide():
 
     by_key = {(m["message_id"], m["kind"]): m["text"] for m in queued}
     assert by_key[("m-1", "progress")] == "HISTORY"
-    assert by_key[("artifact:m-1", "result")] == "ARTIFACT"
+    assert by_key[("artifact-id:m-1", "result")] == "ARTIFACT"
 
 
 def test_an_artifact_without_an_id_keeps_one_row():
@@ -1340,5 +1340,77 @@ def test_an_artifact_without_an_id_keeps_one_row():
              "artifacts": [{"parts": [{"text": "chunk 5"}]}]}
     queued = tools._record_observation("t1", final, "peer")
     assert len(queued) == 1
-    assert queued[0]["message_id"] == "artifact:0"
+    assert queued[0]["message_id"] == "artifact-pos:0"
     assert queued[0]["text"] == "chunk 5"
+
+
+def test_a_terminal_row_without_an_answer_accepts_the_later_answer(monkeypatch):
+    """Round 3 N1: the guard must not refuse a record that has no answer to protect."""
+    protocol.TaskStore().create("t1", "ctx-1", "peer", direction="outbound",
+                                remote_state=protocol.STATE_WORKING)
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "THE ANSWER")))
+    assert manager.ownership.acquire("t1", SESSION_ID)
+    with manager.ownership._session() as con:
+        # A terminal row with no reply, e.g. one terminalized by an explicit get_task failure.
+        con.execute("UPDATE a2a_tasks SET state=?, reply='' WHERE task_id=?",
+                    (protocol.STATE_FAILED, "t1"))
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+    monkeypatch.setattr(
+        tools, "_rpc_request",
+        lambda *a, **k: {"result": _artifact_payload(protocol.STATE_COMPLETED, "THE ANSWER")})
+
+    tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5}, SESSION_ID)
+
+    record = protocol.TaskStore().get("t1")
+    assert record["state"] == protocol.STATE_COMPLETED
+    assert record["reply"] == "THE ANSWER", "an empty row must still record the answer"
+
+
+def test_a_placeholder_failure_does_not_block_the_real_answer(monkeypatch):
+    """Round 3: a row whose only text was our own 'no text reply' placeholder must accept the
+    answer that arrives later, and a later text-less poll must recover it from the row."""
+    protocol.TaskStore().create("t1", "ctx-1", "peer", direction="outbound",
+                                remote_state=protocol.STATE_WORKING)
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "THE ANSWER")))
+    assert manager.ownership.acquire("t1", SESSION_ID)
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+
+    # 1. The peer fails with no text: our placeholder is not a durable reply.
+    monkeypatch.setattr(tools, "_rpc_request",
+                        lambda *a, **k: {"result": {"id": "t1", "contextId": "ctx-1",
+                                                    "status": {"state": protocol.STATE_FAILED}}})
+    first = tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5},
+                            SESSION_ID)
+    assert "no text reply" in first
+    assert (protocol.TaskStore().get("t1") or {}).get("reply") == ""
+
+    # 2. The answer arrives later and replaces the empty terminal row.
+    monkeypatch.setattr(
+        tools, "_rpc_request",
+        lambda *a, **k: {"result": _artifact_payload(protocol.STATE_COMPLETED, "THE ANSWER")})
+    tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5}, SESSION_ID)
+    record = protocol.TaskStore().get("t1")
+    assert record["state"] == protocol.STATE_COMPLETED
+    assert record["reply"] == "THE ANSWER"
+
+    # 3. A later poll with no text recovers the recorded answer.
+    monkeypatch.setattr(
+        tools, "_rpc_request",
+        lambda *a, **k: {"result": {"id": "t1", "contextId": "ctx-1",
+                                    "status": {"state": protocol.STATE_COMPLETED}}})
+    out = tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5},
+                          SESSION_ID)
+    assert "THE ANSWER" in out
+
+
+def test_named_and_positional_artifacts_do_not_alias():
+    """Round 3 N2: artifactId "1" and an id-less artifact at index 1 are different artifacts."""
+    payload = {"id": "t1", "contextId": "ctx-1",
+               "status": {"state": protocol.STATE_WORKING},
+               "artifacts": [{"artifactId": "1", "parts": [{"text": "NAMED"}]},
+                             {"parts": [{"text": "IDLESS"}]}]}
+
+    queued = tools._record_observation("t1", payload, "peer")
+
+    by_key = {m["message_id"]: m["text"] for m in queued}
+    assert by_key == {"artifact-id:1": "NAMED", "artifact-pos:1": "IDLESS"}

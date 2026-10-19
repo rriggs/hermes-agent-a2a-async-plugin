@@ -787,14 +787,14 @@ def _artifact_message_id(artifact: dict, index: int, text: str) -> str:
     row is keyed on that identity and updated in place (``add_message(update_existing=True)``) so
     the final revision replaces the partial one instead of being dropped by ``INSERT OR IGNORE``
     (Amy's PR #9 finding 2), and a streaming peer cannot turn every revision into its own message
-    (local review, D2). The ``artifact:`` prefix keeps the key out of the history/status message
-    namespace, where a peer is free to reuse the same id (local review, N2).
+    (local review, D2). The two prefixes keep named and positional artifacts out of each other's
+    namespace and out of a peer's history/status message ids (local review rounds 2-3, N2).
     """
     artifact_id = str(artifact.get("artifactId") or artifact.get("artifact_id") or "")
     if artifact_id:
-        return f"artifact:{artifact_id}"
+        return f"artifact-id:{artifact_id}"
     # No id to key on: the position is the only stable identity across polls.
-    return f"artifact:{index}"
+    return f"artifact-pos:{index}"
 
 
 def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: Any,
@@ -913,8 +913,13 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
             short = _short_state(state)
             queued_now = _record_observation(task_id, payload, agent)
             if short in ("completed", "failed", "canceled", "rejected", "input-required"):
+                # Our own "task reached X with no text reply" placeholder is not peer content:
+                # storing it as the durable reply would let it masquerade as a real answer and
+                # block the answer that arrives later (local review round 3).
                 results = [str(m.get("text") or "").strip() for m in queued_now
-                           if str(m.get("kind")) == "result" and str(m.get("text") or "").strip()]
+                           if str(m.get("kind")) == "result"
+                           and not str(m.get("message_id") or "").startswith("state:")
+                           and str(m.get("text") or "").strip()]
                 text = "\n\n".join(results) if results else (
                     _reply_text_from_result(payload) or "")
                 if not text and state in protocol.TERMINAL_STATES:
@@ -924,7 +929,8 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                     stored = _task_store().get(task_id) or {}
                     if str(stored.get("state") or "") == state:
                         text = str(stored.get("reply") or "")
-                text = text or "(no text reply)"
+                # An empty text stays empty in the task row: the guard must be able to accept the
+                # real answer later. Only the tool output names the absence.
                 # Fence AND record in one transaction: ownership is verified, the task row goes
                 # terminal with the reply, and the backlog is acknowledged together. Recording
                 # after the acknowledgement (the first cut of this fix) meant a crash in between
@@ -957,7 +963,7 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                     except Exception:
                         logger.warning("A2A await could not persist the peer reply", exc_info=True)
                 header = f"[{agent} · task {payload.get('id', task_id)} · {short}]"
-                body = text
+                body = text or "(no text reply)"
                 if short == "input-required":
                     ctx = str(payload.get("contextId", ""))
                     body += f"\n\n(Peer needs input — reply via a2a_submit with context_id '{ctx}'.)"
@@ -1327,7 +1333,7 @@ def a2a_list(args: dict | None = None, session_id: Optional[str] = None, **_: An
             lines.append(f"  - {c}")
 
     if kind in ("all", "tasks"):
-        records, _, _ = protocol.TaskStore().list(page_size=limit, with_total=True)
+        records, _, _ = _task_store().list(page_size=limit, with_total=True)
         records = [r for r in records if not peer_filter or r.get("peer") == peer_filter]
         if state_filter != "all":
             records = [r for r in records if (r.get("state") in protocol.TERMINAL_STATES) == (state_filter == "terminal")]

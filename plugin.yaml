@@ -22,3 +22,7 @@ provides_tools:
   - a2a_history
   - a2a_orchestrate
   - a2a_steer
+provides_hooks:
+  - on_session_start
+  - on_session_reset
+  - on_session_finalize

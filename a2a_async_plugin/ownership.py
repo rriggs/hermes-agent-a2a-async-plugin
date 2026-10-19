@@ -303,11 +303,14 @@ class OwnershipStore:
             if state:
                 # Mirror TaskStore.complete/set_state: both refuse a transition out of a terminal
                 # state, so a later poll that re-reports a different state cannot overwrite (or
-                # un-terminalize) an answer already recorded (local review round 2, N1). The
-                # ``reply=''`` escape hatch matters: a row terminalized without an answer (e.g.
-                # by an explicit get_task failure) must still be able to record the answer that
-                # arrives later, or the guarded write would consume it from the backlog and
-                # never store it (round 3).
+                # un-terminalize) an answer already recorded (local review round 2, N1).
+                #
+                # One escape hatch: a terminal row whose reply is EMPTY may be replaced by a
+                # terminal report that actually carries text. That is how a row terminalized
+                # without an answer (a get_task failure) still records the answer that arrives
+                # later. It is deliberately narrow — a text-less report can never flip a finished
+                # task, so a stale WORKING/INPUT_REQUIRED cannot un-terminalize it into the
+                # auto-cancel sweep, and a stale FAILED cannot rewrite a completed task (round 4).
                 terminal_marks = ",".join("?" for _ in TERMINAL_REMOTE_STATES)
                 if state in TERMINAL_REMOTE_STATES:
                     con.execute(
@@ -317,16 +320,17 @@ class OwnershipStore:
                                                     ELSE remote_state END,
                                   reply=?, completed_at=?
                             WHERE task_id=?
-                              AND (state NOT IN ({terminal_marks}) OR reply='')""",
-                        (state, state, reply or "", now, task_id, *TERMINAL_REMOTE_STATES))
+                              AND (state NOT IN ({terminal_marks})
+                                   OR (reply='' AND ?<>''))""",
+                        (state, state, reply or "", now, task_id,
+                         *TERMINAL_REMOTE_STATES, reply or ""))
                 else:
                     con.execute(
                         f"""UPDATE a2a_tasks
                               SET state=?,
                                   remote_state=CASE WHEN direction='outbound' THEN ?
                                                     ELSE remote_state END
-                            WHERE task_id=?
-                              AND (state NOT IN ({terminal_marks}) OR reply='')""",
+                            WHERE task_id=? AND state NOT IN ({terminal_marks})""",
                         (state, state, task_id, *TERMINAL_REMOTE_STATES))
             for message_id in message_ids:
                 # The ownership condition is repeated on the UPDATE itself so the mark stays

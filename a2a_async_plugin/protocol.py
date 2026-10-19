@@ -629,6 +629,11 @@ class TaskStore:
 
     @staticmethod
     def _ensure_db(con: "sqlite3.Connection") -> None:
+        if int(con.execute("PRAGMA user_version").fetchone()[0]) == A2A_TASK_SCHEMA_VERSION:
+            # Schema is current: constructing a store (and every read path through one) must not
+            # take the database-wide write lock. A listing that opened the profile DB used to
+            # stall behind a publish for the full 10s busy timeout and come up empty (round 4).
+            return
         con.execute("BEGIN IMMEDIATE")
         try:
             version = int(con.execute("PRAGMA user_version").fetchone()[0])

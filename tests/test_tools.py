@@ -193,3 +193,37 @@ def test_a2a_list_reads_the_plugins_profile_database(monkeypatch, tmp_path):
     out = tools.a2a_list({"kind": "tasks"})
 
     assert "t-profile" in out, "the profile's own task must be listed"
+
+
+def test_a2a_list_does_not_wait_for_the_write_lock(monkeypatch, tmp_path):
+    """Round 4: opening the profile DB for a listing must not take the write lock.
+
+    A publish holds BEGIN IMMEDIATE; a listing that migrates on construction would block for the
+    full 10s busy timeout and come up empty.
+    """
+    import sqlite3
+    import time
+
+    home = tmp_path / "profile-home"
+    home.mkdir()
+    manager = type("Manager", (), {"home_path": str(home)})()
+    ctx = type("Ctx", (), {"_manager": manager})()
+    monkeypatch.setattr(tools, "_CTX", ctx)
+    monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {}})
+    db_path = str(home / "a2a_tasks.db")
+    tools.protocol.TaskStore(db_path).create(
+        "t-profile", "ctx-1", "peer", direction="outbound",
+        remote_state=tools.protocol.STATE_COMPLETED)
+
+    holder = sqlite3.connect(db_path, timeout=1)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        started = time.time()
+        out = tools.a2a_list({"kind": "tasks"})
+        elapsed = time.time() - started
+    finally:
+        holder.rollback()
+        holder.close()
+
+    assert "t-profile" in out
+    assert elapsed < 5.0, f"the listing blocked on the writer for {elapsed:.1f}s"

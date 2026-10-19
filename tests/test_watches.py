@@ -1403,6 +1403,43 @@ def test_a_placeholder_failure_does_not_block_the_real_answer(monkeypatch):
     assert "THE ANSWER" in out
 
 
+def test_a_stale_report_cannot_flip_a_finished_task_with_no_text(monkeypatch):
+    """Round 4: a completed task with an empty reply must not be rewritten by a stale report.
+
+    The empty-reply escape hatch exists so a later REAL answer can be recorded; a text-less
+    report must not un-terminalize the task (which would put it in the auto-cancel sweep) or
+    rewrite its outcome.
+    """
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "unused")))
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+    for task_id, stale in (("t1", protocol.STATE_FAILED),
+                           ("t2", protocol.STATE_INPUT_REQUIRED),
+                           ("t3", protocol.STATE_COMPLETED)):
+        protocol.TaskStore(_store().db_path).create(
+            task_id, "ctx-1", "peer", direction="outbound",
+            remote_state=protocol.STATE_COMPLETED)
+        assert manager.ownership.acquire(task_id, SESSION_ID)
+        with manager.ownership._session() as con:
+            con.execute("UPDATE a2a_tasks SET state=?, reply='' WHERE task_id=?",
+                        (protocol.STATE_COMPLETED, task_id))
+        monkeypatch.setattr(
+            tools, "_rpc_request",
+            lambda *a, _stale=stale, _tid=task_id, **k: {
+                "result": {"id": _tid, "contextId": "ctx-1", "status": {"state": _stale}}})
+        tools.a2a_await({"agent": "peer", "task_id": task_id, "interval": 1, "timeout": 5},
+                        SESSION_ID)
+        record = protocol.TaskStore(_store().db_path).get(task_id)
+        assert record["state"] == protocol.STATE_COMPLETED, (
+            f"a stale {stale} report rewrote a finished task")
+        assert record["reply"] == ""
+
+    manager.ownership.release_all(SESSION_ID)
+    cancel, abandon = manager.ownership.unowned_due(
+        now=time.time() + 10 ** 6, cancel_after_s=0, ttl_s=10 ** 9)
+    swept = {c["task_id"] for c in cancel} | {a["task_id"] for a in abandon}
+    assert swept == set(), f"a finished task was swept as unfinished work: {swept}"
+
+
 def test_named_and_positional_artifacts_do_not_alias():
     """Round 3 N2: artifactId "1" and an id-less artifact at index 1 are different artifacts."""
     payload = {"id": "t1", "contextId": "ctx-1",

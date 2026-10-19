@@ -1451,3 +1451,190 @@ def test_named_and_positional_artifacts_do_not_alias():
 
     by_key = {m["message_id"]: m["text"] for m in queued}
     assert by_key == {"artifact-id:1": "NAMED", "artifact-pos:1": "IDLESS"}
+
+
+# ── Amy round 2 (P1 revision race, P2 roles, P2 fence verdict) ───────────────
+
+def _outbox_metadata(watch_id):
+    [row] = _outbox(watch_id, pending_only=True)
+    import json as _json
+    return row, _json.loads(row["metadata_json"] or "{}")
+
+
+def test_a_replay_must_not_acknowledge_a_revision_it_did_not_send():
+    """P1: the replay publishes the snapshot it read. If a background poll revised the artifact
+    in between, acking by message id alone marks the NEW content delivered and settles its outbox,
+    so the host only ever sees the stale text."""
+    ctx = FlakyCtx()
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "partial")),
+                       ctx=ctx)
+    watch = _add(manager)
+    manager.run_once(now=1_000.0)          # terminal: row 'partial' + pending outbox (refused)
+    snapshot = manager.ownership.queued("t1")
+    assert [m["text"] for m in snapshot] == ["partial"]
+    message_id = snapshot[0]["message_id"]
+
+    # A background poll records and enqueues the next snapshot while the replay holds the old one.
+    manager.ownership.add_message("t1", message_id, "result", "final answer",
+                                  update_existing=True)
+    _store().enqueue_publication(
+        watch_id=watch["watch_id"], event_id=f"a2a:t1:{message_id}",
+        content=watches._message_content("peer", "t1", "result", "final answer"),
+        metadata={"source": "a2a", "peer": "peer", "task_id": "t1",
+                  "watch_id": watch["watch_id"], "state": "completed", "kind": "result",
+                  "message_id": message_id, "session_id": SESSION_ID})
+
+    ctx.fail = False
+    accepted = tools._publish_queued(ctx, "t1", "peer", SESSION_ID,
+                                     {"session_key": TARGET_SESSION_KEY}, snapshot)
+
+    assert accepted == [], "a stale snapshot must not be published"
+    assert ctx.injected == []
+    assert [m["text"] for m in manager.ownership.queued("t1")] == ["final answer"], (
+        "the newer revision must stay queued")
+
+    # And the final is still deliverable: the stale ack must not have settled its outbox row.
+    manager.flush_publications(now=1_000.0 + 10_000.0)
+    assert len(ctx.injected) == 1
+    assert "final answer" in ctx.injected[0]["content"]
+    assert manager.ownership.queued("t1") == []
+
+
+def test_flush_skips_an_outbox_body_the_artifact_has_outgrown():
+    """P1: between the artifact update and the poll's enqueue, the pending outbox row still
+    carries the old body. Injecting it would retire the row with stale text."""
+    ctx = FlakyCtx()
+    manager = _manager(
+        ScriptedPoll(_artifact_payload(protocol.STATE_INPUT_REQUIRED, "partial")), ctx=ctx)
+    watch = _add(manager)
+    manager.run_once(now=1_000.0)          # enqueues 'partial'; the host refuses
+    row, meta = _outbox_metadata(watch["watch_id"])
+    message_id = meta["message_id"]
+
+    manager.ownership.add_message("t1", message_id, "result", "final answer",
+                                  update_existing=True)
+    ctx.fail = False
+    manager.flush_publications(now=1_000.0 + 10_000.0)
+
+    assert ctx.injected == [], "the outgrown body must not be injected"
+    assert _outbox(watch["watch_id"], pending_only=True), "the row must stay pending"
+
+    # The poll's enqueue step refreshes the row; only then does the final go out, once.
+    _store().enqueue_publication(
+        watch_id=watch["watch_id"], event_id=row["event_id"],
+        content=watches._message_content("peer", "t1", "result", "final answer"),
+        metadata=meta)
+    manager.flush_publications(now=1_000.0 + 20_000.0)
+    assert len(ctx.injected) == 1
+    assert "final answer" in ctx.injected[0]["content"]
+
+
+def test_v1_role_agent_history_reaches_both_recorders():
+    """P2: A2A v1.0 roles are ROLE_USER / ROLE_AGENT. The recorders lowercased the role and
+    accepted only agent/assistant, so a v1.0 peer's history was dropped."""
+    payload = {"id": "t1", "contextId": "ctx-1",
+               "status": {"state": protocol.STATE_WORKING},
+               "history": [
+                   {"role": "ROLE_AGENT", "messageId": "h1",
+                    "parts": [{"text": "v1 agent note"}]},
+                   {"role": "ROLE_USER", "messageId": "h2",
+                    "parts": [{"text": "our request"}]},
+               ]}
+
+    blocking = tools._record_observation("t1", payload, "peer")
+    assert "v1 agent note" in [m["text"] for m in blocking]
+    assert "our request" not in [m["text"] for m in blocking]
+
+    ctx = FakeCtx()
+    manager = _manager(ScriptedPoll(payload), ctx=ctx)
+    _add(manager)
+    manager.run_once(now=1_000.0)
+    assert any("v1 agent note" in item["content"] for item in ctx.injected), (
+        "the watch recorder must keep ROLE_AGENT history too")
+    assert not any("our request" in item["content"] for item in ctx.injected)
+
+
+def _owned_task_with_backlog(manager, text="queued before the swap"):
+    protocol.TaskStore().create("t1", "ctx-1", "peer", direction="outbound",
+                                remote_state=protocol.STATE_WORKING)
+    assert manager.ownership.acquire("t1", SESSION_ID)
+    manager.ownership.add_message("t1", "m1", "result", text)
+
+
+def test_a_poll_error_after_losing_ownership_does_not_return_the_backlog(monkeypatch):
+    """P2: the transport-error exit consumed but ignored the fence verdict, returning the old
+    caller's backlog snapshot after another session had adopted the task."""
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "x")))
+    _owned_task_with_backlog(manager, "the adopter's result")
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+
+    def rpc(*_a, **_k):
+        manager.ownership.release("t1", SESSION_ID)
+        manager.ownership.acquire("t1", "sess-B")
+        raise RuntimeError("transport went away")
+
+    monkeypatch.setattr(tools, "_rpc_request", rpc)
+
+    out = tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5},
+                          SESSION_ID)
+
+    assert "ownership changed" in out
+    assert "the adopter's result" not in out
+    assert [m["text"] for m in manager.ownership.queued("t1")] == ["the adopter's result"], (
+        "the adopter's backlog must stay queued")
+
+
+def test_a_peer_rpc_error_after_losing_ownership_does_not_return_the_backlog(monkeypatch):
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "x")))
+    _owned_task_with_backlog(manager, "the adopter's result")
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+
+    def rpc(*_a, **_k):
+        manager.ownership.release("t1", SESSION_ID)
+        manager.ownership.acquire("t1", "sess-B")
+        return {"error": {"code": -32603, "message": "peer exploded"}}
+
+    monkeypatch.setattr(tools, "_rpc_request", rpc)
+
+    out = tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5},
+                          SESSION_ID)
+
+    assert "ownership changed" in out
+    assert "the adopter's result" not in out
+
+
+def test_a_timeout_after_losing_ownership_does_not_return_the_backlog(monkeypatch):
+    """P2: the timeout exit ignored the fence verdict too. The swap lands after the loop's
+    ownership re-check and during result recording, so only the timeout branch sees it."""
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_WORKING, "x")))
+    _owned_task_with_backlog(manager, "the adopter's result")
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+
+    real_record = tools._record_observation
+    clock = {"offset": 0.0}
+    real_time = time.time
+
+    def fake_time():
+        return real_time() + clock["offset"]
+
+    monkeypatch.setattr(tools.time, "time", fake_time)
+
+    def record_then_swap(task_id, payload, peer):
+        recorded = real_record(task_id, payload, peer)
+        manager.ownership.release(task_id, SESSION_ID)
+        manager.ownership.acquire(task_id, "sess-B")
+        clock["offset"] = 3600.0   # the deadline passes after the swap
+        return recorded
+
+    def rpc(*_a, **_k):
+        return {"result": {"id": "t1", "contextId": "ctx-1",
+                           "status": {"state": protocol.STATE_WORKING}}}
+
+    monkeypatch.setattr(tools, "_record_observation", record_then_swap)
+    monkeypatch.setattr(tools, "_rpc_request", rpc)
+
+    out = tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 0},
+                          SESSION_ID)
+
+    assert "ownership changed" in out
+    assert "the adopter's result" not in out

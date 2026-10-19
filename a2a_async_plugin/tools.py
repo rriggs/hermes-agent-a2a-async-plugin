@@ -433,7 +433,7 @@ def a2a_get_task(args: dict, **_: Any) -> str:
 
 
 _CTX: Any = None
-_WATCH_MANAGER: Any = None
+_WATCH_MANAGERS: dict[str, Any] = {}
 
 
 def _plugin_home(ctx: Any) -> Optional[str]:
@@ -454,15 +454,26 @@ def _plugin_db_path(ctx: Any) -> Optional[str]:
 
 
 def _watch_manager(ctx: Any = None):
-    """The process-wide watch poller, created against the plugin context it was registered with."""
-    global _WATCH_MANAGER
-    if _WATCH_MANAGER is None:
-        from . import watches
-        ctx = ctx if ctx is not None else _CTX
-        _WATCH_MANAGER = watches.WatchManager(
+    """The watch poller for THIS profile's database.
+
+    One process serves many profiles (a multiplexed gateway, the TUI/desktop backend). A single
+    module-global manager would hand profile B the manager built for profile A: its watches,
+    ownership and outbox would land in A's database, and its injections would use A's context.
+    Key the cache on the resolved database path.
+    """
+    ctx = ctx if ctx is not None else _CTX
+    from . import watches
+    key = str(_plugin_db_path(ctx))
+    manager = _WATCH_MANAGERS.get(key)
+    if manager is None:
+        manager = watches.WatchManager(
             ctx, store=watches.WatchStore(_plugin_db_path(ctx)),
             profile_home=_plugin_home(ctx))
-    return _WATCH_MANAGER
+        _WATCH_MANAGERS[key] = manager
+    else:
+        # Same profile: refresh the context (a re-registration may carry a newer ctx).
+        manager.ctx = ctx
+    return manager
 
 
 def _delivery_capable(ctx: Any) -> bool:
@@ -560,6 +571,12 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
             "background watch has nowhere to deliver its result. Use blocking a2a_await or poll "
             "with a2a_get_task.")
     target = _capture_target(ctx)
+    if not target["session_key"]:
+        # inject_message with no key is the host's "keyless" mode: it routes by whatever session
+        # is calling at flush time, which may be a different live session. Never arm a watcher
+        # that cannot be addressed back to THIS session.
+        return ("Error: this session has no route key, so a background result cannot be addressed "
+                "back to it. Use blocking a2a_await or poll with a2a_get_task.")
     manager = _watch_manager(ctx)
     owners_before = {task_id: _ownership().owner(task_id) for _agent, task_id in entries}
     try:
@@ -590,8 +607,9 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
         accepted = _publish_queued(ctx, task_id, agent_name, session_id or "", target, queued)
         if accepted:
             # Only what the host accepted: a refused message stays queued for the next await.
-            _mark_backlog_delivered(
-                task_id, [m for m in queued if m["message_id"] in accepted], session_id or "")
+            _ownership().consume_if_owned(
+                task_id, session_id or "",
+                [m["message_id"] for m in queued if m["message_id"] in accepted])
             delivered += len(accepted)
 
     watch_id = str(watch.get("watch_id") or "")
@@ -845,11 +863,13 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
         try:
             resp = _rpc_request(peer, "GetTask", {"id": task_id}, timeout=30)
         except Exception as e:
-            _mark_backlog_delivered(task_id, backlog, session_id or "")
+            _ownership().consume_if_owned(task_id, session_id or "",
+                                          [m["message_id"] for m in backlog])
             prefix = ("\n".join(preface) + "\n\n") if preface else ""
             return prefix + f"Error: poll of '{agent}' failed — {e}."
         if "error" in resp:
-            _mark_backlog_delivered(task_id, backlog, session_id or "")
+            _ownership().consume_if_owned(task_id, session_id or "",
+                                          [m["message_id"] for m in backlog])
             prefix = ("\n".join(preface) + "\n\n") if preface else ""
             return prefix + _peer_rpc_error(resp, agent)
         payload = resp.get("result", {})
@@ -885,8 +905,13 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                     protocol.persist_message(reply_ctx, "agent", security.filter_inbound(text),
                                              task_id, peer=agent)
                 # Everything the peer said is in this return value: mark it delivered so a later
-                # background await does not repeat it.
-                _mark_backlog_delivered(task_id, queued_now, session_id or "")
+                # background await does not repeat it -- but only while this session still owns
+                # the task, fenced in the same transaction as the mark.
+                if not _ownership().consume_if_owned(
+                        task_id, session_id or "", [m["message_id"] for m in queued_now]):
+                    return (f"[{agent} · task {task_id} · ownership changed]\n"
+                            "Another session took this task while the result was in flight; it "
+                            "was not consumed here.")
                 header = f"[{agent} · task {payload.get('id', task_id)} · {short}]"
                 body = text
                 if short == "input-required":
@@ -898,7 +923,8 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                 return f"{prefix}\n\n{header}\n{body}" if prefix else f"{header}\n{body}"
         if time.time() >= deadline:
             observed = _queued_backlog(task_id)
-            _mark_backlog_delivered(task_id, observed, session_id or "")
+            _ownership().consume_if_owned(task_id, session_id or "",
+                                          [m["message_id"] for m in observed])
             prefix = "\n".join(preface + _backlog_lines(observed))
             note = (f"[{agent} · task {task_id} · still working after {timeout}s]\n"
                     f"Call a2a_await again or check a2a_get_task.")

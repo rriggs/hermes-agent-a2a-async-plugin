@@ -577,7 +577,13 @@ class WatchStore:
         for task_id in task_ids:
             owner = con.execute(
                 "SELECT owner_session_id FROM a2a_tasks WHERE task_id=?", (task_id,)).fetchone()
-            if owner is not None and str(owner[0] or "") != session:
+            if owner is None:
+                # Fail closed: a publication naming a task with no record cannot be authorized,
+                # and a missing row must never be read as "nobody owns it, so anyone may publish".
+                logger.error("A2A: publication names unknown task %s; refusing to deliver it",
+                             task_id)
+                return False
+            if str(owner[0] or "") != session:
                 return False
         return True
 
@@ -830,13 +836,19 @@ class WatchManager:
             # acquire here covers direct manager use and makes the record exist before the first
             # poll so messages have somewhere to land.
             task_store = protocol.TaskStore(self.store.db_path)
+            acquired: list[str] = []
             for peer, task_id in items:
                 if task_store.get(task_id) is None:
                     task_store.create(task_id, task_id, peer, direction="outbound",
                                       remote_state=protocol.STATE_SUBMITTED)
                 if session_id and not self.ownership.acquire(task_id, session_id):
+                    # Undo what THIS call already took: a task owned by a session with no watch
+                    # would never be polled or released.
+                    for claimed in acquired:
+                        self.ownership.release(claimed, session_id)
                     self.store.cancel(watch_id)
                     raise ownership_mod.OwnershipConflict(task_id, self.ownership.owner(task_id))
+                acquired.append(task_id)
             watch = self.store.get(watch_id) or {"watch_id": watch_id}
         self.start()
         return watch

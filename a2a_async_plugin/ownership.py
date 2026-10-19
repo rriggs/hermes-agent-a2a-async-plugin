@@ -243,6 +243,27 @@ class OwnershipStore:
                 (task_id, kind)).fetchone()
         return row is not None
 
+    def consume_if_owned(self, task_id: str, session_id: str,
+                         message_ids: list[str]) -> bool:
+        """Mark backlog delivered in ONE transaction, fenced on live ownership.
+
+        The blocking await records and acknowledges its results as separate statements; a release
+        plus an adoption in between would otherwise let the former owner consume the new owner's
+        backlog. ``False`` means ownership changed and NOTHING was marked.
+        """
+        now = time.time()
+        with self._session() as con:
+            row = con.execute(
+                "SELECT owner_session_id FROM a2a_tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None or str(row[0] or "") != str(session_id or ""):
+                return False
+            for message_id in message_ids:
+                con.execute(
+                    """UPDATE a2a_task_messages SET delivered_at=?, delivered_to_session=?
+                        WHERE task_id=? AND message_id=? AND delivered_at IS NULL""",
+                    (now, session_id, task_id, message_id))
+            return True
+
     def mark_delivered(self, task_id: str, message_ids: Iterable[str], session_id: str,
                        now: Optional[float] = None) -> int:
         ids = [str(m) for m in message_ids if m]

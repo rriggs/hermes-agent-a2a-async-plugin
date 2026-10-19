@@ -34,9 +34,17 @@ SESSION_B = "sess-B"
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
     monkeypatch.setenv("A2A_TASKS_DB", str(tmp_path / "a2a_tasks.db"))
+    from gateway.session_context import set_session_vars
+    tokens = set_session_vars(platform="telegram", source="telegram", chat_id="42",
+                              chat_type="dm", session_key="agent:main:telegram:dm:42",
+                              session_id=SESSION_A)
     monkeypatch.setattr(tools, "_CTX", None)
-    monkeypatch.setattr(tools, "_WATCH_MANAGER", None)
-    yield
+    tools._WATCH_MANAGERS.clear()
+    try:
+        yield
+    finally:
+        from gateway.session_context import clear_session_vars
+        clear_session_vars(tokens)
 
 
 def _store() -> ownership.OwnershipStore:
@@ -354,6 +362,43 @@ def test_a_blocking_await_does_not_consume_an_adopters_result(monkeypatch):
     assert _store().owner("t1") == SESSION_B
     assert [m["message_id"] for m in _store().queued("t1")] == ["m1"], (
         "the adopter's backlog must still be queued")
+
+
+def test_consuming_the_backlog_is_fenced_on_live_ownership():
+    _task("t1")
+    store = _store()
+    store.acquire("t1", SESSION_A)
+    store.add_message("t1", "m1", "result", "the result")
+
+    store.release_all(SESSION_A)
+    store.acquire("t1", SESSION_B)
+
+    assert store.consume_if_owned("t1", SESSION_A, ["m1"]) is False
+    assert [m["message_id"] for m in store.queued("t1")] == ["m1"], (
+        "the former owner must not consume the adopter's backlog")
+    assert store.consume_if_owned("t1", SESSION_B, ["m1"]) is True
+    assert store.queued("t1") == []
+
+
+def test_each_profile_gets_its_own_watch_manager(tmp_path, monkeypatch):
+    """One process serves many profiles: a shared manager would write to the wrong DB."""
+    a, b = tmp_path / "a", tmp_path / "b"
+    a.mkdir(); b.mkdir()
+    ctx_a = type("Ctx", (), {"session_surface": lambda self: "telegram",
+                             "inject_message": lambda self, *a, **k: True})()
+    ctx_b = type("Ctx", (), {"session_surface": lambda self: "telegram",
+                             "inject_message": lambda self, *a, **k: True})()
+    watch_mod = importlib.import_module(f"{PKG}.watches")
+    monkeypatch.setattr(watch_mod.WatchManager, "start", lambda self: self)
+
+    tools._WATCH_MANAGERS.clear()
+    monkeypatch.setattr(tools, "_plugin_db_path", lambda ctx=None: a / "a2a_tasks.db")
+    manager_a = tools._watch_manager(ctx_a)
+    monkeypatch.setattr(tools, "_plugin_db_path", lambda ctx=None: b / "a2a_tasks.db")
+    manager_b = tools._watch_manager(ctx_b)
+
+    assert manager_a is not manager_b
+    assert manager_a.store.db_path != manager_b.store.db_path
 
 
 def test_a_timer_candidate_from_a_previous_release_is_not_applied():

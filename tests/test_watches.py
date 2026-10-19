@@ -97,13 +97,22 @@ class FakeCtx:
 def _isolate(monkeypatch, tmp_path):
     """Temp task DB, fresh module globals, and no background threads in unit tests."""
     monkeypatch.setenv("A2A_TASKS_DB", str(tmp_path / "a2a_tasks.db"))
+    # Background delivery is addressed by the session's route key; bind one like a live surface.
+    from gateway.session_context import set_session_vars
+    tokens = set_session_vars(platform="telegram", source="telegram", chat_id="42",
+                              chat_type="dm", session_key="agent:main:telegram:dm:42",
+                              session_id=SESSION_ID)
     monkeypatch.setattr(tools, "_CTX", None)
-    monkeypatch.setattr(tools, "_WATCH_MANAGER", None)
+    tools._WATCH_MANAGERS.clear()
     started: list = []
     monkeypatch.setattr(watches.WatchManager, "start",
                         lambda self: (started.append(self), self)[1])
     monkeypatch.setattr(watches, "started_managers", started, raising=False)
-    yield
+    try:
+        yield
+    finally:
+        from gateway.session_context import clear_session_vars
+        clear_session_vars(tokens)
 
 
 def _store() -> watches.WatchStore:
@@ -403,7 +412,7 @@ def test_watch_cancel_stops_polling_and_leaves_the_remote_task_alone(monkeypatch
     assert "canceled" in out
     assert "keep running" in out
     assert _store().get(watch_id)["state"] == watches.WATCH_CANCELED
-    manager = tools._WATCH_MANAGER
+    manager = next(iter(tools._WATCH_MANAGERS.values()))
     manager.poll = ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED))
     assert manager.run_once(now=100.0) == 0
     assert manager.poll.calls == []
@@ -445,7 +454,7 @@ def test_rehydration_resumes_a_persisted_watch(monkeypatch):
     monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
     watch_id = tools.a2a_await({"agent": "peer", "task_id": "t1", "background": True},
                                session_id=SESSION_ID).split()[1]
-    tools._WATCH_MANAGER = None  # a new process starts with no manager
+    tools._WATCH_MANAGERS.clear()  # a new process starts with no manager
 
     resumed = tools._watch_manager(ctx)
     resumed.poll = ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="after restart"))
@@ -477,9 +486,10 @@ def test_the_watch_store_follows_the_plugins_profile_home(tmp_path, monkeypatch)
 def test_register_tools_resumes_only_when_a_watch_database_exists(tmp_path):
     ctx = FakeCtx()
     # No database yet: discovery must not create one or start a poller.
-    tools._WATCH_MANAGER = None
+    tools._WATCH_MANAGERS.clear()
     tools._resume_watches(ctx)
-    assert tools._WATCH_MANAGER.store.db_path.endswith("a2a_tasks.db")
+    [manager] = tools._WATCH_MANAGERS.values()
+    assert manager.store.db_path.endswith("a2a_tasks.db")
     assert not (tmp_path / "a2a_tasks.db").exists()
     assert ctx.unload_callbacks, "the manager must stop on plugin unload"
 
@@ -487,9 +497,10 @@ def test_register_tools_resumes_only_when_a_watch_database_exists(tmp_path):
     _store().create(watch_id="watch_x", session_id=SESSION_ID,
                     target={"session_key": TARGET_SESSION_KEY},
                     tasks=[("peer", "t1")])
-    tools._WATCH_MANAGER = None
+    tools._WATCH_MANAGERS.clear()
     tools._resume_watches(ctx)
-    assert tools._WATCH_MANAGER._thread is None  # start() is patched out in this suite
+    [manager] = tools._WATCH_MANAGERS.values()
+    assert manager._thread is None  # start() is patched out in this suite
     assert watches.started_managers, "an active watch must start the poller"
 
 def test_a_plugin_load_never_creates_or_migrates_the_task_database(tmp_path, monkeypatch):
@@ -502,7 +513,7 @@ def test_a_plugin_load_never_creates_or_migrates_the_task_database(tmp_path, mon
     con.close()
 
     monkeypatch.setenv("A2A_TASKS_DB", str(legacy))
-    monkeypatch.setattr(tools, "_WATCH_MANAGER", None)
+    tools._WATCH_MANAGERS.clear()
     tools._resume_watches(FakeCtx())
 
     con = sqlite3.connect(legacy)
@@ -515,7 +526,7 @@ def test_a_plugin_load_never_creates_or_migrates_the_task_database(tmp_path, mon
 
     missing = tmp_path / "missing.db"
     monkeypatch.setenv("A2A_TASKS_DB", str(missing))
-    monkeypatch.setattr(tools, "_WATCH_MANAGER", None)
+    tools._WATCH_MANAGERS.clear()
     tools._resume_watches(FakeCtx())
     assert not missing.exists(), "a plugin load created a task database with nothing to resume"
 
@@ -549,6 +560,23 @@ class FlakyCtx(FakeCtx):
         if self.fail:
             return False
         return super().inject_message(content, role=role, session_key=session_key, origin=origin)
+
+
+def test_a_publication_naming_an_unknown_task_is_not_delivered():
+    """A row whose task record is gone must fail closed, not publish into the watch's session."""
+    store = _store()
+    store.create(watch_id="watch_ghost", session_id=SESSION_ID,
+                 target={"session_key": "agent:main:telegram:dm:42"},
+                 tasks=[("peer", "t-ghost")], ttl_s=3600)
+    with store._session() as con:
+        con.execute("DELETE FROM a2a_tasks WHERE task_id='t-ghost'")
+        con.execute(
+            "INSERT INTO a2a_watch_publications (event_id, watch_id, content, metadata_json,"
+            " created_at) VALUES ('evt-ghost', 'watch_ghost', 'orphan', ?, 1.0)",
+            ('{"source": "a2a", "task_id": "t-ghost", "state": "completed"}',))
+
+    with store.publication_guard("evt-ghost") as (_con, row):
+        assert row is None, "an orphan publication must not be authorized"
 
 
 def test_a_refused_injection_leaves_the_outbox_row_pending():

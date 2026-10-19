@@ -22,9 +22,10 @@ live sessions racing for the same task resolve to one winner at the SQLite level
 from __future__ import annotations
 
 import contextlib
+import json
 import sqlite3
 import time
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 from . import protocol
 
@@ -32,13 +33,23 @@ from . import protocol
 TERMINAL_REMOTE_STATES = frozenset(protocol.TERMINAL_STATES)
 
 
-# A publication names its task either as "task_id" or inside a "tasks" list. The list holds the
-# production "peer/task" form, so matching bare ids alone leaves an aggregate notice publishable
-# after one of its tasks is released.
-PUBLICATION_NAMES_TASK = """(json_extract(metadata_json, '$.task_id')=?
-    OR EXISTS (SELECT 1 FROM json_each(metadata_json, '$.tasks') AS t
-                WHERE t.value=?
-                   OR substr(t.value, -length(?)-1)='/'||?))"""
+def publication_names_task(metadata_json: Any, task_id: str) -> bool:
+    """True when a publication row names ``task_id``.
+
+    A publication names its task either as "task_id" or inside a "tasks" list; the list holds the
+    production "peer/task" form. Metadata is parsed in Python rather than with ``json_extract`` so
+    one malformed row cannot make a release or a cancel fail (and strand the task's ownership).
+    """
+    try:
+        meta = json.loads(metadata_json) if metadata_json else {}
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(meta, dict):
+        return False
+    if str(meta.get("task_id") or "") == task_id:
+        return True
+    return any(str(listed) == task_id or str(listed).endswith("/" + task_id)
+               for listed in (meta.get("tasks") or []))
 
 
 class OwnershipConflict(RuntimeError):
@@ -189,10 +200,13 @@ class OwnershipStore:
 
     @staticmethod
     def _drop_publications(con: sqlite3.Connection, task_id: str) -> None:
-        con.execute(
-            f"DELETE FROM a2a_watch_publications WHERE published_at IS NULL"
-            f" AND {PUBLICATION_NAMES_TASK}",
-            (task_id,) * 4)
+        rows = con.execute(
+            "SELECT event_id, metadata_json FROM a2a_watch_publications"
+            " WHERE published_at IS NULL").fetchall()
+        for row in rows:
+            if publication_names_task(row["metadata_json"], task_id):
+                con.execute("DELETE FROM a2a_watch_publications WHERE event_id=?",
+                            (row["event_id"],))
 
     def owner(self, task_id: str) -> str:
         with self._session() as con:
@@ -287,25 +301,27 @@ class OwnershipStore:
             if row is None or str(row[0] or "") != str(session_id or ""):
                 return False
             if state:
-                # Mirror TaskStore.complete/set_state: only an outbound task mirrors the remote
-                # state, and only a terminal state stores the reply and a completion time.
+                # Mirror TaskStore.complete/set_state: both refuse a transition out of a terminal
+                # state, so a later poll that re-reports a different state cannot overwrite (or
+                # un-terminalize) an answer already recorded (local review round 2, N1).
+                terminal_marks = ",".join("?" for _ in TERMINAL_REMOTE_STATES)
                 if state in TERMINAL_REMOTE_STATES:
                     con.execute(
-                        """UPDATE a2a_tasks
+                        f"""UPDATE a2a_tasks
                               SET state=?,
                                   remote_state=CASE WHEN direction='outbound' THEN ?
                                                     ELSE remote_state END,
                                   reply=?, completed_at=?
-                            WHERE task_id=?""",
-                        (state, state, reply or "", now, task_id))
+                            WHERE task_id=? AND state NOT IN ({terminal_marks})""",
+                        (state, state, reply or "", now, task_id, *TERMINAL_REMOTE_STATES))
                 else:
                     con.execute(
-                        """UPDATE a2a_tasks
+                        f"""UPDATE a2a_tasks
                               SET state=?,
                                   remote_state=CASE WHEN direction='outbound' THEN ?
                                                     ELSE remote_state END
-                            WHERE task_id=?""",
-                        (state, state, task_id))
+                            WHERE task_id=? AND state NOT IN ({terminal_marks})""",
+                        (state, state, task_id, *TERMINAL_REMOTE_STATES))
             for message_id in message_ids:
                 # The ownership condition is repeated on the UPDATE itself so the mark stays
                 # fenced even if a caller ever runs this inside an already-open transaction.

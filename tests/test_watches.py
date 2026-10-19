@@ -13,6 +13,7 @@ import importlib.util
 import sqlite3
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -1276,3 +1277,68 @@ def test_unreadable_publication_metadata_does_not_abort_a_publish():
         row = con.execute(
             "SELECT published_at FROM a2a_watch_publications WHERE event_id='bad-row'").fetchone()
     assert row["published_at"] is None, "an unreadable row must be left alone, not settled"
+
+
+# ── Local review round 2 (N1-N5) ────────────────────────────────────────────
+
+def test_a_later_poll_cannot_overwrite_a_recorded_answer(monkeypatch):
+    """N1: the fence mirrors TaskStore's refusal to transition out of a terminal state."""
+    protocol.TaskStore().create("t1", "ctx-1", "peer", direction="outbound",
+                                remote_state=protocol.STATE_WORKING)
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "THE ANSWER")))
+    assert manager.ownership.acquire("t1", SESSION_ID)
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+    monkeypatch.setattr(
+        tools, "_rpc_request",
+        lambda *a, **k: {"result": _artifact_payload(protocol.STATE_COMPLETED, "THE ANSWER")})
+    first = tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5},
+                            SESSION_ID)
+    assert "THE ANSWER" in first
+
+    # The peer re-reports a different terminal state for the same task.
+    monkeypatch.setattr(
+        tools, "_rpc_request",
+        lambda *a, **k: {"result": {"id": "t1", "contextId": "ctx-1",
+                                    "status": {"state": protocol.STATE_FAILED}}})
+    tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5}, SESSION_ID)
+
+    record = protocol.TaskStore().get("t1")
+    assert record["state"] == protocol.STATE_COMPLETED, "a finished answer must not be overwritten"
+    assert record["reply"] == "THE ANSWER"
+
+    # Nor may it be un-terminalized and swept as unfinished work.
+    manager.ownership.release_all(SESSION_ID)
+    cancel, _abandon = manager.ownership.unowned_due(
+        now=time.time() + 10 ** 6, cancel_after_s=0, ttl_s=10 ** 9)
+    assert "t1" not in [c["task_id"] for c in cancel]
+
+
+def test_artifact_and_history_ids_do_not_collide():
+    """N2: the artifact key is namespaced; a peer reusing an id must not lose history text."""
+    payload = {"id": "t1", "contextId": "ctx-1",
+               "status": {"state": protocol.STATE_COMPLETED},
+               "history": [{"role": "agent", "messageId": "m-1",
+                            "parts": [{"text": "HISTORY"}]}],
+               "artifacts": [{"artifactId": "m-1", "parts": [{"text": "ARTIFACT"}]}]}
+
+    queued = tools._record_observation("t1", payload, "peer")
+
+    by_key = {(m["message_id"], m["kind"]): m["text"] for m in queued}
+    assert by_key[("m-1", "progress")] == "HISTORY"
+    assert by_key[("artifact:m-1", "result")] == "ARTIFACT"
+
+
+def test_an_artifact_without_an_id_keeps_one_row():
+    """N3: without an id the position is the only stable identity; revisions must not pile up."""
+    for index in range(6):
+        payload = {"id": "t1", "contextId": "ctx-1",
+                   "status": {"state": protocol.STATE_WORKING},
+                   "artifacts": [{"parts": [{"text": f"chunk {index}"}]}]}
+        tools._record_observation("t1", payload, "peer")
+
+    final = {"id": "t1", "contextId": "ctx-1", "status": {"state": protocol.STATE_WORKING},
+             "artifacts": [{"parts": [{"text": "chunk 5"}]}]}
+    queued = tools._record_observation("t1", final, "peer")
+    assert len(queued) == 1
+    assert queued[0]["message_id"] == "artifact:0"
+    assert queued[0]["text"] == "chunk 5"

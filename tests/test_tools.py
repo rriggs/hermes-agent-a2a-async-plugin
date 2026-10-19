@@ -163,3 +163,15 @@ def test_a2a_list_no_peers_reports_missing_config(monkeypatch):
     monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {}})
     out = tools.a2a_list({"kind": "all"})
     assert "No peers configured" in out
+
+
+def test_task_store_uses_the_plugins_profile_database(monkeypatch, tmp_path):
+    """N5: the recovery path must read the same database the ownership fence writes."""
+    home = tmp_path / "profile-home"
+    home.mkdir()
+    manager = type("Manager", (), {"home_path": str(home)})()
+    ctx = type("Ctx", (), {"_manager": manager})()
+    monkeypatch.setattr(tools, "_CTX", ctx)
+    monkeypatch.setenv("A2A_TASKS_DB", str(tmp_path / "ambient.db"))
+
+    assert tools._task_store()._db_path == str(home / "a2a_tasks.db")

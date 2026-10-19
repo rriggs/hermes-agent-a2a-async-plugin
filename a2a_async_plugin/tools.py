@@ -42,7 +42,9 @@ _ORCHESTRATE_MAX_WORKERS = 6  # max parallel peers for fan-out
 # Caller-side task records are opened lazily so merely discovering tools does not
 # create the profile's task database.
 def _task_store() -> protocol.TaskStore:
-    return protocol.TaskStore()
+    # Same database the ownership fence and the watcher write: an ambient env/home split would
+    # let the fence record a reply the recovery path then cannot read (local review, N5).
+    return protocol.TaskStore(_plugin_db_path(_CTX))
 
 
 # --------------------------------------------------------------------------
@@ -785,12 +787,14 @@ def _artifact_message_id(artifact: dict, index: int, text: str) -> str:
     row is keyed on that identity and updated in place (``add_message(update_existing=True)``) so
     the final revision replaces the partial one instead of being dropped by ``INSERT OR IGNORE``
     (Amy's PR #9 finding 2), and a streaming peer cannot turn every revision into its own message
-    (local review, D2).
+    (local review, D2). The ``artifact:`` prefix keeps the key out of the history/status message
+    namespace, where a peer is free to reuse the same id (local review, N2).
     """
     artifact_id = str(artifact.get("artifactId") or artifact.get("artifact_id") or "")
     if artifact_id:
-        return artifact_id
-    return f"artifact:{index}:{_digest(text)}"
+        return f"artifact:{artifact_id}"
+    # No id to key on: the position is the only stable identity across polls.
+    return f"artifact:{index}"
 
 
 def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: Any,

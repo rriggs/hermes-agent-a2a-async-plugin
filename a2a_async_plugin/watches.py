@@ -504,12 +504,16 @@ class WatchStore:
                 if not ids:
                     return 0
                 total = 0
-                from .ownership import PUBLICATION_NAMES_TASK
-                for task_id in ids:
-                    total += con.execute(
-                        f"DELETE FROM a2a_watch_publications WHERE published_at IS NULL"
-                        f" AND {PUBLICATION_NAMES_TASK}",
-                        (task_id,) * 4).rowcount
+                from .ownership import publication_names_task
+                rows = con.execute(
+                    "SELECT event_id, metadata_json FROM a2a_watch_publications"
+                    " WHERE published_at IS NULL").fetchall()
+                for row in rows:
+                    if any(publication_names_task(row["metadata_json"], task_id)
+                           for task_id in ids):
+                        total += con.execute(
+                            "DELETE FROM a2a_watch_publications WHERE event_id=?",
+                            (row["event_id"],)).rowcount
                 return total
             return cur.rowcount
 

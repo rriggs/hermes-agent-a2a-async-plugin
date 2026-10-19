@@ -24,9 +24,10 @@ module = importlib.util.module_from_spec(spec)
 sys.modules[PKG] = module
 spec.loader.exec_module(module)
 
-protocol = importlib.import_module(f"{PKG}.protocol")
-tools = importlib.import_module(f"{PKG}.tools")
-ownership = importlib.import_module(f"{PKG}.ownership")
+protocol = importlib.import_module(f"{PKG}.protocol")  # noqa: E402
+tools = importlib.import_module(f"{PKG}.tools")  # noqa: E402
+ownership = importlib.import_module(f"{PKG}.ownership")  # noqa: E402
+watches = importlib.import_module(f"{PKG}.watches")  # noqa: E402
 
 SESSION_A = "sess-A"
 SESSION_B = "sess-B"
@@ -669,3 +670,32 @@ def test_released_tasks_count_as_work_to_resume():
                                    poll=lambda p, t: {}, interval=5.0, ttl_s=3600)
     assert manager.store.resumable_count_readonly() == 0
     assert store.unowned_count_readonly() == 1
+
+
+def test_a_malformed_publication_row_cannot_block_a_release():
+    """N4: dropping publications must not depend on json_extract parsing every row.
+
+    A malformed row used to raise inside release(), leaving the task owned forever with no other
+    session able to adopt it.
+    """
+    _task("t1")
+    store = _store()
+    assert store.acquire("t1", SESSION_A)
+    outbox = watches.WatchStore()
+    outbox.create(watch_id="w", session_id=SESSION_A, target={"session_key": "k"},
+                  tasks=[("peer", "t1")], ttl_s=3600)
+    outbox.enqueue_publication(
+        watch_id="w", event_id="evt-valid", content="x",
+        metadata={"task_id": "t1", "message_id": "m1", "session_id": SESSION_A})
+    with outbox._session() as con:
+        con.execute(
+            "INSERT INTO a2a_watch_publications (event_id, watch_id, content, metadata_json,"
+            " created_at) VALUES ('evt-bad', 'w', 'x', '{broken', 1.0)")
+
+    assert store.release("t1", SESSION_A) is True
+    assert store.owner("t1") == "", "the release must succeed despite the unreadable row"
+    with outbox._session() as con:
+        remaining = {r["event_id"] for r in con.execute(
+            "SELECT event_id FROM a2a_watch_publications")}
+    assert "evt-valid" not in remaining, "a valid pending publication must still be dropped"
+    assert "evt-bad" in remaining, "an unreadable row cannot be attributed and is left alone"

@@ -42,7 +42,6 @@ so validate must run on a clean export:
 ```sh
 rm -rf /tmp/pr9-clean && mkdir -p /tmp/pr9-clean
 git archive HEAD | tar -x -C /tmp/pr9-clean
-cp plugin.yaml /tmp/pr9-clean/plugin.yaml        # only needed before the manifest fix is committed
 hermes plugins validate /tmp/pr9-clean
 ```
 

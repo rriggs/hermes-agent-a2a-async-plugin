@@ -287,10 +287,10 @@ def test_a_refused_backlog_message_stays_queued():
     queued = store.queued("t1")
     accepted = tools._publish_queued(ctx, "t1", "peer", SESSION_A,
                                      {"session_key": "agent:main:telegram:dm:42"}, queued)
-    tools._mark_backlog_delivered(
-        "t1", [m for m in queued if m["message_id"] in accepted], SESSION_A)
 
     assert accepted == ["m1"], "a refused message must stay queued for the next await"
+    # The accepted message is marked delivered in the SAME transaction as its publish: no second
+    # owner can replay it, and no separate mark call is needed.
     assert [m["message_id"] for m in store.queued("t1")] == ["m2"]
     # ``_publish_queued`` wraps the text with a header before handing it to inject_message;
     # m2 ("two") is refused at the accept gate and never reaches ``seen``.

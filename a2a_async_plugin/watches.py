@@ -587,8 +587,15 @@ class WatchStore:
                 return False
         return True
 
-    def publish_if_owned(self, session_id: str, task_id: str, publish) -> bool:
-        """Run one publish under the write lock, only while this session still owns the task."""
+    def publish_if_owned(self, session_id: str, task_id: str, publish,
+                         mark_messages: Iterable[str] = ()) -> bool:
+        """Publish one message and mark it delivered, in ONE transaction.
+
+        Ownership is verified before the host sees the message and the backlog mark commits with
+        it, so an adoption cannot land between "delivered to A" and "marked delivered": the
+        adopter would otherwise replay a message A already received, into a different session.
+        """
+        ids = [str(m) for m in mark_messages if m]
         con = self._connect()
         try:
             con.execute("BEGIN IMMEDIATE")
@@ -603,6 +610,14 @@ class WatchStore:
             # The callback's own verdict matters: a host that REFUSED the message must leave it
             # queued for the next attempt, not be reported as delivered because we own the task.
             delivered = publish()
+            if delivered and ids:
+                now = time.time()
+                for message_id in ids:
+                    con.execute(
+                        """UPDATE a2a_task_messages
+                              SET delivered_at=?, delivered_to_session=?
+                            WHERE task_id=? AND message_id=? AND delivered_at IS NULL""",
+                        (now, session_id, task_id, message_id))
             con.commit()
             return bool(delivered)
         except Exception:
@@ -853,9 +868,11 @@ class WatchManager:
         self.start()
         return watch
 
-    def publish_if_owned(self, session_id: str, task_id: str, publish) -> bool:
+    def publish_if_owned(self, session_id: str, task_id: str, publish,
+                         mark_messages: Iterable[str] = ()) -> bool:
         """One publish under the store write lock, only while this session still owns the task."""
-        return self.store.publish_if_owned(session_id, task_id, publish)
+        return self.store.publish_if_owned(session_id, task_id, publish,
+                                           mark_messages=mark_messages)
 
     def cancel(self, watch_id: str, *, session_id: str = "") -> Optional[str]:
         with self._scope():
@@ -961,16 +978,19 @@ class WatchManager:
                             WHERE watch_id=? AND peer=? AND task_id=?""",
                         (str(meta["state"]), now, row.get("watch_id"),
                          str(meta["peer"]), str(meta["task_id"])))
+                # Mark the backlog row in the SAME transaction as the accepted publication: a
+                # release between commit and a separate mark would let the next owner replay a
+                # message this session already received.
+                task_id = str(meta.get("task_id") or "")
+                message_id = str(meta.get("message_id") or "")
+                session_id = str(meta.get("session_id") or "")
+                if task_id and message_id and session_id:
+                    con.execute(
+                        """UPDATE a2a_task_messages
+                              SET delivered_at=?, delivered_to_session=?
+                            WHERE task_id=? AND message_id=? AND delivered_at IS NULL""",
+                        (now, session_id, task_id, message_id))
                 published += 1
-            meta = _load_metadata(row.get("metadata_json"))
-            task_id = str(meta.get("task_id") or "")
-            message_id = str(meta.get("message_id") or "")
-            session_id = str(meta.get("session_id") or "")
-            if task_id and message_id and session_id:
-                try:
-                    self.ownership.mark_delivered(task_id, [message_id], session_id, now)
-                except Exception:
-                    logger.debug("A2A: delivery marker failed for %s", event_id, exc_info=True)
         return published
 
     # -- internals --------------------------------------------------------

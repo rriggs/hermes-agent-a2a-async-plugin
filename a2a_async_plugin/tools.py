@@ -499,6 +499,13 @@ def _capture_target(ctx: Any) -> dict:
     try:
         from gateway.session_context import bound_session_key
         session_key = str(bound_session_key() or "")
+    except ImportError:
+        # Older runtime: no contextvar accessor, but the same value is on the session env.
+        try:
+            from gateway.session_context import get_session_env
+            session_key = str(get_session_env("HERMES_SESSION_KEY", "") or "")
+        except Exception:
+            session_key = ""
     except Exception:
         session_key = ""
     try:
@@ -607,9 +614,6 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
         accepted = _publish_queued(ctx, task_id, agent_name, session_id or "", target, queued)
         if accepted:
             # Only what the host accepted: a refused message stays queued for the next await.
-            _ownership().consume_if_owned(
-                task_id, session_id or "",
-                [m["message_id"] for m in queued if m["message_id"] in accepted])
             delivered += len(accepted)
 
     watch_id = str(watch.get("watch_id") or "")
@@ -784,11 +788,12 @@ def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: 
         kind = str(msg.get("kind") or "progress")
         content = _peer_message_content(peer, task_id, kind, text)
         try:
-            # Serialized with release: a backlog replay must not deliver into a session that
-            # released (or lost) the task while this call was running.
+            # Serialized with release, and the backlog mark commits with the publish: a release
+            # between them would let the next owner replay a message this session already saw.
             accepted = _watch_manager(ctx).publish_if_owned(
                 session_id or "", task_id,
-                lambda: _inject(ctx, target, content))
+                lambda: _inject(ctx, target, content),
+                mark_messages=[str(msg["message_id"])])
         except Exception as exc:
             logger.warning("A2A: could not publish %s/%s: %s", task_id, msg["message_id"], exc)
             continue

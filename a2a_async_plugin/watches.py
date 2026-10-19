@@ -588,8 +588,10 @@ class WatchStore:
             con.execute("BEGIN IMMEDIATE")
             owner = con.execute(
                 "SELECT owner_session_id FROM a2a_tasks WHERE task_id=?", (task_id,)).fetchone()
-            current = None if owner is None else str(owner[0] or "")
-            if current and current != str(session_id or ""):
+            current = "" if owner is None else str(owner[0] or "")
+            if current != str(session_id or ""):
+                # Exact match required: a released task (owner "") must not accept a publish from
+                # the session that just gave it up, and a bound session must own what it replays.
                 con.rollback()
                 return False
             publish()
@@ -1061,6 +1063,17 @@ class WatchManager:
                          raw_state: str) -> list[dict]:
         """Store every new peer message on the task; returns the still-undelivered ones."""
         from . import tools
+        # History first (chronology), peer-originated only: ROLE_USER entries are OUR requests,
+        # not peer progress, and status/artifacts are the newest messages.
+        for index, message in enumerate(payload.get("history") or []):
+            if str(message.get("role") or "").lower() not in ("agent", "assistant"):
+                continue
+            text = tools._text_of_message(message)
+            if not text:
+                continue
+            message_id = str(message.get("messageId") or message.get("message_id")
+                             or f"history:{index}:{tools._digest(text)}")
+            self.ownership.add_message(task_id, message_id, "progress", text)
         status_msg = (payload.get("status") or {}).get("message") or {}
         status_text = tools._text_of_message(status_msg)
         if status_text:
@@ -1076,15 +1089,6 @@ class WatchManager:
                               or f"artifact:{index}:{tools._digest(text)}")
             kind = "input-required" if raw_state == protocol.STATE_INPUT_REQUIRED else "result"
             self.ownership.add_message(task_id, artifact_id, kind, text)
-        # History carries messages that never appear as the current status, so ignoring it drops
-        # progress the peer did report. add_message dedupes by message id.
-        for index, message in enumerate(payload.get("history") or []):
-            text = tools._text_of_message(message)
-            if not text:
-                continue
-            message_id = str(message.get("messageId") or message.get("message_id")
-                             or f"history:{index}:{tools._digest(text)}")
-            self.ownership.add_message(task_id, message_id, "progress", text)
         if raw_state in protocol.TERMINAL_STATES and not self.ownership.has_kind(task_id, "result"):
             self.ownership.add_message(
                 task_id, f"state:{raw_state}", "result",

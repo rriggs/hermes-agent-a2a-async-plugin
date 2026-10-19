@@ -724,6 +724,22 @@ def test_a_notice_written_after_release_is_never_published():
     assert _outbox(watch["watch_id"], pending_only=True) == []
 
 
+def test_the_backlog_replay_refuses_a_released_task(monkeypatch):
+    """Release sets owner to "": the former owner must not publish into itself either."""
+    ctx = FakeCtx()
+    monkeypatch.setattr(tools, "_CTX", ctx)
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)))
+    monkeypatch.setattr(tools, "_watch_manager", lambda ctx=None: manager)
+    _add(manager, tasks=(("peer", "t1"),))
+    assert manager.ownership.release("t1", SESSION_ID)
+
+    accepted = tools._publish_queued(
+        ctx, "t1", "peer", SESSION_ID, {"target_id": "pct_test"},
+        [{"message_id": "m1", "kind": "result", "text": "result"}])
+
+    assert accepted == [] and ctx.published == []
+
+
 def test_the_backlog_replay_refuses_a_task_another_session_owns(monkeypatch):
     ctx = FakeCtx()
     monkeypatch.setattr(tools, "_CTX", ctx)
@@ -747,13 +763,16 @@ def test_history_messages_are_recorded_even_without_a_status_message(monkeypatch
         "status": {"state": protocol.STATE_COMPLETED},
         "artifacts": [],
         "history": [
+            {"messageId": "r0", "role": "user", "parts": [{"kind": "text", "text": "do the work"}]},
             {"messageId": "h1", "role": "agent", "parts": [{"kind": "text", "text": "halfway"}]},
         ],
     }
 
     queued = tools._record_observation("t-hist", payload, "peer")
 
-    assert queued[0]["message_id"] == "h1", "history is a message stream too"
+    ids = [m["message_id"] for m in queued]
+    assert ids[0] == "h1", "peer history is recorded first, in order"
+    assert "r0" not in ids, "our own request is not peer progress"
 
 
 def test_release_drops_an_aggregate_notice_naming_peer_slash_task():

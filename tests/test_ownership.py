@@ -259,6 +259,7 @@ def test_await_refuses_a_task_owned_by_another_session():
 def test_a_refused_backlog_message_stays_queued():
     _task()
     store = _store()
+    store.acquire("t1", SESSION_A)
     store.add_message("t1", "m1", "progress", "one")
     store.add_message("t1", "m2", "result", "two")
 
@@ -324,6 +325,30 @@ def test_timer_actions_do_not_touch_a_task_adopted_after_selection():
     assert store.abandon("t1") is False, "no abandonment for an owned task"
     assert store.owner("t1") == SESSION_B
     assert [m["message_id"] for m in store.queued("t1")] == ["m1"], "the adopted backlog survives"
+
+
+def test_a_blocking_await_does_not_consume_an_adopters_result(monkeypatch):
+    """GetTask can return after the task was adopted: the stale caller must not deliver it."""
+    _task("t1")
+    _store().acquire("t1", SESSION_A)
+    _store().add_message("t1", "m1", "result", "the result")
+
+    def adopt_during_poll(peer, method, params, timeout=30):
+        assert method == "GetTask"
+        _store().release("t1", SESSION_A)
+        _store().acquire("t1", SESSION_B)
+        return {"result": {"id": "t1", "status": {"state": protocol.STATE_COMPLETED},
+                           "artifacts": []}}
+
+    monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": "http://peer.invalid"})
+    monkeypatch.setattr(tools, "_rpc_request", adopt_during_poll)
+
+    out = tools.a2a_await({"agent": "peer", "task_id": "t1", "timeout": 5}, SESSION_A)
+
+    assert "ownership changed" in out
+    assert _store().owner("t1") == SESSION_B
+    assert [m["message_id"] for m in _store().queued("t1")] == ["m1"], (
+        "the adopter's backlog must still be queued")
 
 
 def test_a_background_await_of_another_sessions_task_is_refused(monkeypatch):

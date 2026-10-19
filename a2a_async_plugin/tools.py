@@ -671,6 +671,16 @@ def _record_observation(task_id: str, payload: dict, peer: str) -> list[dict]:
     context_id = str(payload.get("contextId") or "")
     _ensure_task_record(task_id, peer, context_id, state)
     try:
+        # History first (chronology), peer-originated only: ROLE_USER is OUR request.
+        for index, message in enumerate(payload.get("history") or []):
+            if str(message.get("role") or "").lower() not in ("agent", "assistant"):
+                continue
+            text = _text_of_message(message)
+            if not text:
+                continue
+            message_id = str(message.get("messageId") or message.get("message_id")
+                             or f"history:{index}:{_digest(text)}")
+            store.add_message(task_id, message_id, "progress", text)
         status_msg = (payload.get("status") or {}).get("message") or {}
         message_id = str(status_msg.get("messageId") or status_msg.get("message_id") or "")
         status_text = _text_of_message(status_msg)
@@ -684,14 +694,6 @@ def _record_observation(task_id: str, payload: dict, peer: str) -> list[dict]:
             artifact_id = str(artifact.get("artifactId") or artifact.get("artifact_id")
                               or f"artifact:{index}:{_digest(text)}")
             store.add_message(task_id, artifact_id, "result", text)
-        # History carries messages that never appear as the current status.
-        for index, message in enumerate(payload.get("history") or []):
-            text = _text_of_message(message)
-            if not text:
-                continue
-            message_id = str(message.get("messageId") or message.get("message_id")
-                             or f"history:{index}:{_digest(text)}")
-            store.add_message(task_id, message_id, "progress", text)
         if state in protocol.TERMINAL_STATES and not any(
                 m["kind"] == "result" for m in store.queued(task_id)):
             store.add_message(task_id, f"state:{state}", "result",
@@ -821,6 +823,11 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
             prefix = ("\n".join(preface) + "\n\n") if preface else ""
             return prefix + _peer_rpc_error(resp, agent)
         payload = resp.get("result", {})
+        if session_id and _ownership().owner(task_id) != session_id:
+            # Released or adopted while this GetTask was in flight. The result belongs to the
+            # session that owns the task now; consuming it here would empty the adopter's backlog.
+            return (f"[{agent} · task {task_id} · ownership changed]\n"
+                    "Another session owns this task now; its result was not delivered here.")
         if isinstance(payload, dict):
             status = payload.get("status") or {}
             state = str(status.get("state", ""))

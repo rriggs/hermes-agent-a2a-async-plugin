@@ -465,10 +465,51 @@ def _watch_manager(ctx: Any = None):
     return _WATCH_MANAGER
 
 
-def _completion_capable(ctx: Any) -> bool:
-    """Whether this Hermes runtime exposes the durable plugin completion publisher."""
-    return callable(getattr(ctx, "capture_completion_target", None)) and callable(
-        getattr(ctx, "publish_completion", None))
+def _delivery_capable(ctx: Any) -> bool:
+    """Whether this session can receive a later turn and the runtime can inject one.
+
+    Delivery uses the public plugin surface ``PluginContext.inject_message``: the host routes the
+    text to the live CLI, TUI/desktop session or messaging chat. The session must also be one that
+    can take a later turn at all -- a one-shot/worker/stateless session accepts nothing later, so a
+    watch there would be a promise we cannot keep.
+    """
+    if not callable(getattr(ctx, "inject_message", None)):
+        return False
+    try:
+        from gateway.session_context import async_delivery_supported
+        return bool(async_delivery_supported())
+    except Exception:  # core moved the helper: fall back to the surface itself
+        logger.debug("A2A: async delivery probe unavailable", exc_info=True)
+        return True
+
+
+def _capture_target(ctx: Any) -> dict:
+    """Where a later turn goes: the session's route key plus the surface, for diagnostics."""
+    try:
+        from gateway.session_context import bound_session_key
+        session_key = str(bound_session_key() or "")
+    except Exception:
+        session_key = ""
+    try:
+        surface = str(ctx.session_surface() or "")
+    except Exception:
+        surface = ""
+    return {"session_key": session_key, "surface": surface}
+
+
+def _inject(ctx: Any, target: Any, content: str) -> bool:
+    """Hand one message to the host for delivery into the captured session.
+
+    ``inject_message`` is the public plugin surface: the host routes the text to the live CLI, the
+    owning TUI/desktop session or the messaging chat, and returns True only when a host accepted
+    it. Durability, retries and de-duplication are ours (the watch outbox), not the host's.
+    """
+    session_key = str((target or {}).get("session_key") or "") if isinstance(target, dict) else ""
+    try:
+        return bool(ctx.inject_message(content, session_key=session_key or None))
+    except Exception as exc:
+        logger.warning("A2A: host refused the injected message: %s", exc)
+        return False
 
 
 def _background_tasks(args: dict) -> list[tuple[str, str]]:
@@ -512,20 +553,13 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
     ctx = _CTX
     # Capability and target come FIRST: ownership is a session-wide fact, so a call that is going
     # to be refused for a runtime/session reason must not leave tasks claimed.
-    if not _completion_capable(ctx):
+    if not _delivery_capable(ctx):
         return (
-            "Error: background a2a_await needs a Hermes runtime with the plugin completion "
-            "publisher (PluginContext.capture_completion_target / publish_completion). "
-            "Use blocking a2a_await, or poll with a2a_get_task, on this runtime.")
-    try:
-        target = ctx.capture_completion_target(session_id=session_id or None)
-    except Exception as exc:  # CompletionTargetError / CompletionDeliveryUnsupported
-        if type(exc).__name__ == "CompletionDeliveryUnsupported":
-            return (
-                "Error: this session cannot receive a later turn (one-shot, cron, Kanban/worker, "
-                "or a stateless API session), so a background watch has nowhere to deliver its "
-                "result. Use blocking a2a_await or poll with a2a_get_task.")
-        return f"Error: could not bind a background watch to this session — {exc}"
+            "Error: this session cannot receive a later turn (one-shot, cron, Kanban/worker, a "
+            "stateless API session, or a runtime without PluginContext.inject_message), so a "
+            "background watch has nowhere to deliver its result. Use blocking a2a_await or poll "
+            "with a2a_get_task.")
+    target = _capture_target(ctx)
     manager = _watch_manager(ctx)
     owners_before = {task_id: _ownership().owner(task_id) for _agent, task_id in entries}
     try:
@@ -736,11 +770,7 @@ def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: 
             # released (or lost) the task while this call was running.
             accepted = _watch_manager(ctx).publish_if_owned(
                 session_id or "", task_id,
-                lambda: ctx.publish_completion(
-                    target=target, event_id=f"a2a:{task_id}:{msg['message_id']}",
-                    content=content,
-                    metadata={"source": "a2a", "peer": peer, "task_id": task_id,
-                              "state": kind, "message_id": msg["message_id"]}))
+                lambda: _inject(ctx, target, content))
         except Exception as exc:
             logger.warning("A2A: could not publish %s/%s: %s", task_id, msg["message_id"], exc)
             continue

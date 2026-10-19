@@ -267,21 +267,26 @@ def test_a_refused_backlog_message_stays_queued():
         def __init__(self):
             self.seen = []
 
-        def publish_completion(self, *, target, event_id, content, metadata=None):
-            if metadata["message_id"] == "m2":
-                raise RuntimeError("ledger unavailable")
-            self.seen.append(metadata["message_id"])
-            return {"status": "queued"}
+        def inject_message(self, content, role="user", session_key=None, origin=None):
+            # The injection path carries text, not the metadata dict, so identify by content:
+            # the host refuses m2 and accepts m1.
+            if "two" in content:
+                return False
+            self.seen.append(content)
+            return True
 
     ctx = Ctx()
     queued = store.queued("t1")
-    accepted = tools._publish_queued(ctx, "t1", "peer", SESSION_A, {"target_id": "x"}, queued)
+    accepted = tools._publish_queued(ctx, "t1", "peer", SESSION_A,
+                                     {"session_key": "agent:main:telegram:dm:42"}, queued)
     tools._mark_backlog_delivered(
         "t1", [m for m in queued if m["message_id"] in accepted], SESSION_A)
 
-    assert accepted == ["m1"]
-    assert [m["message_id"] for m in store.queued("t1")] == ["m2"], (
-        "a refused message must stay queued for the next await")
+    assert accepted == ["m1"], "a refused message must stay queued for the next await"
+    assert [m["message_id"] for m in store.queued("t1")] == ["m2"]
+    # ``_publish_queued`` wraps the text with a header before handing it to inject_message;
+    # m2 ("two") is refused at the accept gate and never reaches ``seen``.
+    assert len(ctx.seen) == 1 and "one" in ctx.seen[0]
 
 
 def test_blocking_await_returns_progress_it_consumed(monkeypatch):
@@ -378,11 +383,11 @@ def test_a_background_await_of_another_sessions_task_is_refused(monkeypatch):
     _store().add_message("t1", "m1", "result", "A's result")
 
     class Ctx:
-        def capture_completion_target(self, *, session_id=None):
-            return {"target_id": "pct_test"}
+        def session_surface(self):
+            return "telegram"
 
-        def publish_completion(self, **kwargs):
-            raise AssertionError("another session's backlog must never be published")
+        def inject_message(self, content, role="user", session_key=None, origin=None):
+            raise AssertionError("another session's backlog must never be injected")
 
     class Manager:
         def start(self):
@@ -396,7 +401,7 @@ def test_a_background_await_of_another_sessions_task_is_refused(monkeypatch):
             raise OwnershipConflict("t1", SESSION_A)
 
     monkeypatch.setattr(tools, "_CTX", Ctx())
-    monkeypatch.setattr(tools, "_completion_capable", lambda ctx: True)
+    monkeypatch.setattr(tools, "_delivery_capable", lambda ctx: True)
     monkeypatch.setattr(tools, "_watch_manager", lambda ctx=None: Manager())
     monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": "http://peer.invalid"})
 
@@ -411,7 +416,7 @@ def test_a_refused_background_await_claims_no_tasks(monkeypatch):
     _task("t1")
 
     class LegacyCtx:
-        pass  # no capture/publish: the old-runtime refusal path
+        pass  # no inject_message: the old-runtime refusal path
 
     class Manager:
         def start(self):
@@ -426,7 +431,7 @@ def test_a_refused_background_await_claims_no_tasks(monkeypatch):
 
     out = tools._start_background_watch({"agent": "peer", "task_id": "t1"}, SESSION_A)
 
-    assert "needs a Hermes runtime" in out
+    assert "PluginContext.inject_message" in out
     assert _store().owner("t1") == "", "a refused await must not claim the task"
 
 
@@ -434,11 +439,11 @@ def test_a_failed_target_capture_claims_no_tasks(monkeypatch):
     _task("t1")
 
     class NoDeliveryCtx:
-        def capture_completion_target(self, *, session_id=None):
-            raise type("CompletionDeliveryUnsupported", (RuntimeError,), {})("no later turn")
+        def session_surface(self):
+            return "telegram"
 
-        def publish_completion(self, **kwargs):
-            return {}
+        def inject_message(self, content, role="user", session_key=None, origin=None):
+            return True
 
     class Manager:
         def start(self):
@@ -447,8 +452,11 @@ def test_a_failed_target_capture_claims_no_tasks(monkeypatch):
         def cancel_session(self, session_id, task_ids=None):
             return 0
 
+    # The delivery-capability probe refuses: the session is one-shot / stateless, so a watch here
+    # would be a promise the runtime cannot keep.
+    import gateway.session_context as sc
+    monkeypatch.setattr(sc, "async_delivery_supported", lambda: False)
     monkeypatch.setattr(tools, "_CTX", NoDeliveryCtx())
-    monkeypatch.setattr(tools, "_completion_capable", lambda ctx: True)
     monkeypatch.setattr(tools, "_watch_manager", lambda ctx=None: Manager())
     monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": "http://peer.invalid"})
 
@@ -464,11 +472,11 @@ def test_a_refused_multi_task_await_rolls_back_earlier_claims(monkeypatch):
     _store().acquire("t2", SESSION_B)
 
     class Ctx:
-        def capture_completion_target(self, *, session_id=None):
-            return {"target_id": "pct_test"}
+        def session_surface(self):
+            return "telegram"
 
-        def publish_completion(self, **kwargs):
-            return {"status": "queued"}
+        def inject_message(self, content, role="user", session_key=None, origin=None):
+            return True
 
     class Manager:
         def start(self):
@@ -488,7 +496,7 @@ def test_a_refused_multi_task_await_rolls_back_earlier_claims(monkeypatch):
         interval = 30.0
 
     monkeypatch.setattr(tools, "_CTX", Ctx())
-    monkeypatch.setattr(tools, "_completion_capable", lambda ctx: True)
+    monkeypatch.setattr(tools, "_delivery_capable", lambda ctx: True)
     monkeypatch.setattr(tools, "_watch_manager", lambda ctx=None: Manager())
     monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": "http://peer.invalid"})
 

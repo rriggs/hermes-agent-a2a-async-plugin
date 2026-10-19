@@ -1,15 +1,15 @@
-"""Background A2A watches: capture a delivery target, poll off-turn, publish one completion.
+"""Background A2A watches: capture a delivery target, poll off-turn, inject into the host.
 
-The watch is the plugin side of ``PluginContext.capture_completion_target`` /
-``publish_completion``. Each test drives the manager deterministically (injected poll, injected
-clock, no thread) against a temp ``a2a_tasks.db``; the last test runs the same flow through the
-REAL Hermes publisher when the core checkout is importable.
+The watch is the plugin side of ``PluginContext.inject_message``: the host routes the captured
+content into the live CLI, the owning TUI/desktop session, or the messaging chat. Each test drives
+the manager deterministically (injected poll, injected clock, no thread) against a temp
+``a2a_tasks.db``; the ``FakeCtx`` records every accepted ``inject_message`` call so the test can
+assert both the injected content and the durable outbox row.
 """
 
 from __future__ import annotations
 
 import importlib.util
-import json
 import sqlite3
 import sys
 from pathlib import Path
@@ -34,6 +34,7 @@ tools = importlib.import_module(f"{PKG}.tools")  # noqa: E402
 watches = importlib.import_module(f"{PKG}.watches")  # noqa: E402
 
 SESSION_ID = "sess-1"
+TARGET_SESSION_KEY = "agent:main:telegram:dm:42"
 
 
 def task_payload(task_id="t1", state=protocol.STATE_WORKING, text="", context_id="ctx-1"):
@@ -59,31 +60,31 @@ class ScriptedPoll:
 
 
 class FakeCtx:
-    """Minimal PluginContext: records captures/publishes, dedups by event id like the real one."""
+    """Minimal PluginContext: records every ``inject_message`` call and honours an ``accept`` flag.
+
+    The host contract: ``inject_message(content, role="user", *, session_key=None, origin=None)``
+    returns ``True`` only when a live host accepted the message. ``session_surface()`` returns a
+    short string for diagnostics; the outbox row already carries the peer / task_id / state, so the
+    tests no longer need the metadata dict that ``publish_completion`` used to receive.
+    """
 
     def __init__(self):
-        self.captures: list = []
-        self.published: list[dict] = []
+        self.injected: list[dict] = []
         self.unload_callbacks: list = []
-        self.event_ids: set[str] = set()
+        self.accept = True
+        self.surface = "telegram"
 
-    def capture_completion_target(self, *, session_id=None):
-        self.captures.append(session_id)
-        return {
-            "contract_version": 1, "target_id": "pct_test", "plugin_id": "a2a-async",
-            "session_key": session_id or "", "session_id": session_id or "",
-            "platform": "telegram", "chat_id": "42", "chat_type": "dm", "thread_id": "",
-            "scope_id": "", "user_id": "", "user_name": "", "ui_session_id": "",
-            "profile": "default", "profile_home": "/tmp/hermes", "created_at": 1.0,
-            "expires_at": None,
-        }
+    def inject_message(self, content, role="user", session_key=None, origin=None):
+        self.injected.append({
+            "content": content,
+            "role": role,
+            "session_key": session_key,
+            "origin": origin,
+        })
+        return bool(self.accept)
 
-    def publish_completion(self, *, target, event_id, content, metadata=None):
-        duplicate = event_id in self.event_ids
-        self.event_ids.add(event_id)
-        self.published.append({"target": target, "event_id": event_id, "content": content,
-                               "metadata": metadata or {}, "duplicate": duplicate})
-        return {"status": "duplicate" if duplicate else "queued", "event_id": event_id}
+    def session_surface(self) -> str:
+        return self.surface
 
     def on_unload(self, callback):
         self.unload_callbacks.append(callback)
@@ -115,7 +116,8 @@ def _manager(poll, *, ctx=None, interval=5.0, store=None):
 
 
 def _add(manager, tasks=(("peer", "t1"),), target=None):
-    return manager.add(session_id=SESSION_ID, target=target or {"target_id": "pct_test"},
+    return manager.add(session_id=SESSION_ID,
+                       target=target or {"session_key": TARGET_SESSION_KEY},
                        tasks=list(tasks))
 
 
@@ -131,11 +133,18 @@ def test_background_await_returns_a_watch_id_and_persists_the_watch(monkeypatch)
 
     assert result.startswith("[watch watch_"), result
     assert "background" in result
-    assert ctx.captures == [SESSION_ID], "the target must be captured from the invoking session"
+    assert ctx.injected == [], (
+        "the watch starts by capturing the target through _capture_target; "
+        "no message is injected until a poll observes a terminal state"
+    )
     watch_id = result.split()[1]
     watch = _store().get(watch_id)
     assert watch["session_id"] == SESSION_ID
     assert watch["state"] == watches.WATCH_ACTIVE
+    assert watch["target"]["surface"] == ctx.surface, (
+        "_capture_target must record the runtime surface so diagnostics and the "
+        "outbox row agree on where the message went"
+    )
     assert [(i["peer"], i["task_id"]) for i in watch["items"]] == [("peer", "t1")]
 
 
@@ -155,7 +164,7 @@ def test_background_await_accepts_a_task_list_and_rejects_duplicates(monkeypatch
     assert [(i["peer"], i["task_id"]) for i in items] == [("peer", "t1"), ("peer", "t2")]
 
 
-def test_background_await_refuses_a_runtime_without_the_publisher(monkeypatch):
+def test_background_await_refuses_a_runtime_without_inject_message(monkeypatch):
     class LegacyCtx:
         pass
 
@@ -166,19 +175,17 @@ def test_background_await_refuses_a_runtime_without_the_publisher(monkeypatch):
                              session_id=SESSION_ID)
 
     assert result.startswith("Error:")
-    assert "plugin completion publisher" in result
+    assert "PluginContext.inject_message" in result, (
+        "the error must name the missing surface so an operator knows what to upgrade"
+    )
 
 
 def test_background_await_refuses_a_session_that_cannot_receive_a_later_turn(monkeypatch):
-    class StatelessFailure(Exception):
-        pass
+    import gateway.session_context as sc
 
-    class Ctx(FakeCtx):
-        def capture_completion_target(self, *, session_id=None):
-            raise type("CompletionDeliveryUnsupported", (Exception,), {})("no later turn")
-
-    monkeypatch.setattr(tools, "_CTX", Ctx())
+    monkeypatch.setattr(tools, "_CTX", FakeCtx())
     monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+    monkeypatch.setattr(sc, "async_delivery_supported", lambda: False)
 
     result = tools.a2a_await({"agent": "peer", "task_id": "t1", "background": True},
                              session_id=SESSION_ID)
@@ -218,22 +225,28 @@ def test_blocking_await_is_unchanged_by_background_support(monkeypatch):
 
 # ── polling and publishing ──────────────────────────────────────────────────
 
-def test_a_terminal_state_publishes_one_completion_and_updates_the_task_record(tmp_path):
+def test_a_terminal_state_injects_one_message_and_updates_the_task_record(tmp_path):
     poll = ScriptedPoll(task_payload(state=protocol.STATE_WORKING),
                         task_payload(state=protocol.STATE_COMPLETED, text="finished the job"))
     manager = _manager(poll)
     watch = _add(manager)
 
-    assert manager.run_once(now=100.0) == 1          # working: no notification yet
-    assert manager.ctx.published == []
-    assert manager.run_once(now=200.0) == 1          # completed: publish
-    [published] = manager.ctx.published
-    assert "finished the job" in published["content"]
-    assert "returned a result" in published["content"]
-    assert published["metadata"]["peer"] == "peer"
-    assert published["metadata"]["task_id"] == "t1"
-    assert published["metadata"]["watch_id"] == watch["watch_id"]
-    assert published["metadata"]["state"] == "completed"
+    assert manager.run_once(now=100.0) == 1          # working: no injection yet
+    assert manager.ctx.injected == []
+    assert manager.run_once(now=200.0) == 1          # completed: inject
+    [injected] = manager.ctx.injected
+    assert "finished the job" in injected["content"]
+    assert "returned a result" in injected["content"]
+    assert injected["session_key"] == TARGET_SESSION_KEY, (
+        "the injection must target the captured session, not None"
+    )
+    [row] = _outbox(watch["watch_id"])
+    assert row["published_at"] is not None, "the outbox row must be marked delivered"
+    meta = _meta(row)
+    assert meta["peer"] == "peer"
+    assert meta["task_id"] == "t1"
+    assert meta["watch_id"] == watch["watch_id"]
+    assert meta["state"] == "completed"
 
     stored = _store().get(watch["watch_id"])
     assert stored["state"] == watches.WATCH_COMPLETE
@@ -243,9 +256,9 @@ def test_a_terminal_state_publishes_one_completion_and_updates_the_task_record(t
     assert record["state"] == protocol.STATE_COMPLETED
     assert record["reply"] == "finished the job"
 
-    # Nothing left to poll: a later pass must not notify again.
+    # Nothing left to poll: a later pass must not inject again.
     assert manager.run_once(now=300.0) == 0
-    assert len(manager.ctx.published) == 1
+    assert len(manager.ctx.injected) == 1
 
 
 def test_one_completion_per_task_while_siblings_keep_running():
@@ -259,11 +272,11 @@ def test_one_completion_per_task_while_siblings_keep_running():
     watch = _add(manager, tasks=(("peer", "t1"), ("peer", "t2")))
 
     manager.run_once(now=100.0)
-    assert [p["metadata"]["task_id"] for p in manager.ctx.published] == ["t1"]
+    assert [_meta(r)["task_id"] for r in _outbox(watch["watch_id"])] == ["t1"]
     assert _store().get(watch["watch_id"])["state"] == watches.WATCH_ACTIVE
 
     manager.run_once(now=200.0)
-    assert [p["metadata"]["task_id"] for p in manager.ctx.published] == ["t1", "t2"]
+    assert [_meta(r)["task_id"] for r in _outbox(watch["watch_id"])] == ["t1", "t2"]
     assert _store().get(watch["watch_id"])["state"] == watches.WATCH_COMPLETE
 
 
@@ -274,9 +287,10 @@ def test_input_required_pauses_without_terminalizing():
 
     manager.run_once(now=100.0)
 
-    [published] = manager.ctx.published
-    assert published["metadata"]["state"] == "input-required"
-    assert "which branch?" in published["content"]
+    [injected] = manager.ctx.injected
+    assert "which branch?" in injected["content"]
+    [row] = _outbox(watch["watch_id"])
+    assert _meta(row)["state"] == "input-required"
     stored = _store().get(watch["watch_id"])
     assert stored["items"][0]["state"] == watches.ITEM_PAUSED
     assert stored["state"] == watches.WATCH_PAUSED
@@ -285,7 +299,7 @@ def test_input_required_pauses_without_terminalizing():
 
     # A paused task is not polled again.
     assert manager.run_once(now=200.0) == 0
-    assert len(manager.ctx.published) == 1
+    assert len(manager.ctx.injected) == 1
 
 
 def test_repeated_poll_errors_back_off_then_give_up_without_failing_the_task():
@@ -297,14 +311,15 @@ def test_repeated_poll_errors_back_off_then_give_up_without_failing_the_task():
     for _ in range(watches.MAX_CONSECUTIVE_ERRORS - 1):
         manager.run_once(now=now)
         now += 1000.0
-        assert manager.ctx.published == [], "a transient poll error is not a remote outcome"
+        assert manager.ctx.injected == [], "a transient poll error is not a remote outcome"
 
     assert poll.calls, "the watch must retry with backoff"
     manager.run_once(now=now)
 
-    [published] = manager.ctx.published
-    assert published["metadata"]["state"] == "watch-error"
-    assert "not cancelled or marked failed" in published["content"]
+    [injected] = manager.ctx.injected
+    [row] = _outbox(watch["watch_id"])
+    assert _meta(row)["state"] == "watch-error"
+    assert "not cancelled or marked failed" in injected["content"]
     stored = _store().get(watch["watch_id"])
     assert stored["items"][0]["state"] == watches.ITEM_UNWATCHED
     assert stored["state"] == watches.WATCH_COMPLETE
@@ -312,7 +327,7 @@ def test_repeated_poll_errors_back_off_then_give_up_without_failing_the_task():
     assert record is None or record["state"] not in protocol.TERMINAL_STATES
 
 
-def test_a_stale_duplicate_observation_publishes_once():
+def test_a_stale_duplicate_observation_injects_once():
     """A second process holding a stale item snapshot must not enqueue a second event."""
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")))
     watch = _add(manager)
@@ -326,9 +341,10 @@ def test_a_stale_duplicate_observation_publishes_once():
         state=protocol.STATE_COMPLETED, text="done"), now=101.0)
     manager.flush_publications(now=101.0)
 
-    assert len(manager.ctx.published) == 1, "the outbox must be idempotent per event id"
+    assert len(manager.ctx.injected) == 1, "the outbox must be idempotent per event id"
     assert _outbox(watch["watch_id"], pending_only=True) == [], (
-        "a delivered event must leave the pending outbox")
+        "a delivered event must leave the pending outbox"
+    )
 
 
 def test_an_expired_watch_reports_the_watcher_not_a_remote_failure():
@@ -341,19 +357,22 @@ def test_an_expired_watch_reports_the_watcher_not_a_remote_failure():
 
     assert manager.run_once(now=10_000_000.0) == 0
 
-    [published] = manager.ctx.published
-    assert published["metadata"]["state"] == "watch-expired"
-    assert "remote task was not cancelled" in published["content"].lower() or \
-        "not cancelled" in published["content"]
+    [injected] = manager.ctx.injected
+    [row] = _outbox(watch["watch_id"])
+    assert _meta(row)["state"] == "watch-expired"
+    assert "remote task was not cancelled" in injected["content"].lower() or \
+        "not cancelled" in injected["content"]
     assert _store().get(watch["watch_id"])["state"] == watches.WATCH_EXPIRED
     record = protocol.TaskStore().get("t1")
     assert record is None or record["state"] not in protocol.TERMINAL_STATES
 
 
-def test_a_publish_failure_is_not_recorded_as_published():
+def test_an_injection_failure_is_not_recorded_as_delivered():
+    """A host that raises out of ``inject_message`` must leave the outbox row retryable."""
+
     class FailingCtx(FakeCtx):
-        def publish_completion(self, **_kwargs):
-            raise RuntimeError("publisher unavailable")
+        def inject_message(self, content, role="user", session_key=None, origin=None):
+            raise RuntimeError("host unavailable")
 
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")),
                        ctx=FailingCtx())
@@ -363,7 +382,10 @@ def test_a_publish_failure_is_not_recorded_as_published():
 
     item = _store().get(watch["watch_id"])["items"][0]
     assert item["state"] == watches.ITEM_DONE
-    assert item["published_state"] == "", "a refused publish must stay retryable, not look delivered"
+    assert item["published_state"] == "", "a refused inject must stay retryable, not look delivered"
+    [pending] = _outbox(watch["watch_id"], pending_only=True)
+    assert pending["published_at"] is None
+    assert pending["attempts"] == 1
 
 
 # ── cancellation ────────────────────────────────────────────────────────────
@@ -385,7 +407,7 @@ def test_watch_cancel_stops_polling_and_leaves_the_remote_task_alone(monkeypatch
     manager.poll = ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED))
     assert manager.run_once(now=100.0) == 0
     assert manager.poll.calls == []
-    assert ctx.published == []
+    assert ctx.injected == []
 
 
 def test_watch_cancel_is_idempotent_and_refuses_an_unknown_id(monkeypatch):
@@ -430,9 +452,11 @@ def test_rehydration_resumes_a_persisted_watch(monkeypatch):
     assert resumed.rehydrate() == 1
     resumed.run_once(now=100.0)
 
-    [published] = ctx.published
-    assert published["event_id"].startswith("a2a:t1:")
-    assert "after restart" in published["content"]
+    [injected] = ctx.injected
+    assert "after restart" in injected["content"]
+    [row] = _outbox(watch_id)
+    assert row["event_id"].startswith("a2a:t1:")
+    assert row["published_at"] is not None
 
 
 def test_the_watch_store_follows_the_plugins_profile_home(tmp_path, monkeypatch):
@@ -460,7 +484,8 @@ def test_register_tools_resumes_only_when_a_watch_database_exists(tmp_path):
     assert ctx.unload_callbacks, "the manager must stop on plugin unload"
 
     # A persisted watch resumes on the next load.
-    _store().create(watch_id="watch_x", session_id=SESSION_ID, target={"target_id": "pct"},
+    _store().create(watch_id="watch_x", session_id=SESSION_ID,
+                    target={"session_key": TARGET_SESSION_KEY},
                     tasks=[("peer", "t1")])
     tools._WATCH_MANAGER = None
     tools._resume_watches(ctx)
@@ -495,53 +520,6 @@ def test_a_plugin_load_never_creates_or_migrates_the_task_database(tmp_path, mon
     assert not missing.exists(), "a plugin load created a task database with nothing to resume"
 
 
-# ── the real core publisher ─────────────────────────────────────────────────
-
-def test_watch_publishes_through_the_real_hermes_publisher(tmp_path, monkeypatch):
-    """Cross-repo integration: the same flow through ``agent.plugin_completions``.
-
-    Needs the Hermes checkout importable (``PYTHONPATH=/path/to/hermes-agent``); skipped
-    otherwise, so the plugin's standalone suite stays standalone.
-    """
-    from tests.real_publisher import load_real_publisher
-    pc = load_real_publisher()
-    from gateway.session_context import clear_session_vars, set_session_vars
-
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
-    tokens = set_session_vars(platform="telegram", source="telegram", chat_id="42",
-                              chat_type="dm", session_key="agent:main:telegram:dm:42",
-                              session_id=SESSION_ID)
-    try:
-        class RealCtx:
-            def capture_completion_target(self, *, session_id=None):
-                return pc.capture_completion_target("a2a-async", session_id=session_id).to_dict()
-
-            def publish_completion(self, *, target, event_id, content, metadata=None):
-                return pc.publish_completion("a2a-async", target=target, event_id=event_id,
-                                             content=content, metadata=metadata)
-
-        manager = watches.WatchManager(
-            RealCtx(), store=_store(),
-            poll=ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="real publisher")),
-            interval=5.0, ttl_s=3600)
-        target = manager.ctx.capture_completion_target(session_id=SESSION_ID)
-        watch = manager.add(session_id=SESSION_ID, target=target, tasks=[("peer", "t1")])
-
-        manager.run_once(now=100.0)
-
-        [published] = _outbox(watch["watch_id"])
-        event_id = published["event_id"]
-        assert event_id.startswith("a2a:t1:")
-        receipt_row = pc._existing_completion("a2a-async", SESSION_ID, event_id)
-        assert receipt_row is not None
-        assert receipt_row["delivery_state"] == "pending", "queued for the surface, not yet delivered"
-        # Re-publishing the same message id for the same conversation is a duplicate receipt.
-        again = manager.ctx.publish_completion(
-            target=target, event_id=event_id, content="again")
-        assert again["status"] == "duplicate"
-    finally:
-        clear_session_vars(tokens)
-
 def _outbox(watch_id: str, *, pending_only: bool = False) -> list[dict]:
     con = sqlite3.connect(_store().db_path)
     con.row_factory = sqlite3.Row
@@ -555,21 +533,27 @@ def _outbox(watch_id: str, *, pending_only: bool = False) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _meta(row: dict) -> dict:
+    import json as _json
+    return _json.loads(row.get("metadata_json") or "{}")
+
+
 class FlakyCtx(FakeCtx):
-    """Publisher that refuses until told otherwise (host admission failure)."""
+    """Host that refuses injection until told otherwise (no live session, missing consent)."""
 
     def __init__(self):
         super().__init__()
         self.fail = True
 
-    def publish_completion(self, **kwargs):
+    def inject_message(self, content, role="user", session_key=None, origin=None):
         if self.fail:
-            raise RuntimeError("completion ledger unavailable")
-        return super().publish_completion(**kwargs)
+            return False
+        return super().inject_message(content, role=role, session_key=session_key, origin=origin)
 
 
-def test_a_refused_publish_is_retried_after_the_watch_closes():
-    """The watch finishing must not take the undelivered notification with it."""
+def test_a_refused_injection_leaves_the_outbox_row_pending():
+    """A host that returns False must leave the row pending with an increased attempt count and a
+    future ``next_attempt_at`` (the exponential backoff used elsewhere in the manager)."""
     ctx = FlakyCtx()
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")),
                        ctx=ctx)
@@ -577,20 +561,45 @@ def test_a_refused_publish_is_retried_after_the_watch_closes():
 
     manager.run_once(now=1_000.0)
 
-    assert ctx.published == []
+    assert ctx.injected == [], "a refused host must not record a delivered message"
     assert _store().get(watch["watch_id"])["state"] == watches.WATCH_COMPLETE
     [pending] = _outbox(watch["watch_id"])
-    assert pending["published_at"] is None and pending["attempts"] == 1
+    assert pending["published_at"] is None, "the row must stay pending for the next flush"
+    assert pending["attempts"] == 1, "the failed attempt must increment the counter"
+    assert pending["next_attempt_at"] > 1_000.0, (
+        "the next attempt must be scheduled in the future, not now"
+    )
     item = _store().get(watch["watch_id"])["items"][0]
-    assert item["published_state"] == "", "a refused publish must not look published"
+    assert item["published_state"] == "", "a refused inject must not look published"
+
+
+def test_a_refused_injection_retries_after_the_host_recovers_and_delivers_once():
+    """Once the host accepts, exactly one message reaches it: idempotency per event id is the
+    outbox's job, not the host's."""
+    ctx = FlakyCtx()
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")),
+                       ctx=ctx)
+    watch = _add(manager)
+    manager.run_once(now=1_000.0)
+    [pending_before] = _outbox(watch["watch_id"])
+    assert pending_before["published_at"] is None
 
     ctx.fail = False
     # Nothing left to poll: the outbox alone must drive the retry once its backoff elapses.
-    manager.run_once(now=1_000.0 + 11.0)
+    manager.run_once(now=pending_before["next_attempt_at"] + 0.001)
 
-    assert [p["event_id"] for p in ctx.published] == [pending["event_id"]]
+    [injected] = ctx.injected
+    assert "done" in injected["content"]
+    assert injected["session_key"] == TARGET_SESSION_KEY
+    [delivered] = _outbox(watch["watch_id"])
+    assert delivered["event_id"] == pending_before["event_id"]
+    assert delivered["published_at"] is not None
     assert _outbox(watch["watch_id"], pending_only=True) == []
     assert _store().get(watch["watch_id"])["items"][0]["published_state"] == "completed"
+
+    # A second sweep with the host still healthy must not inject again.
+    manager.run_once(now=pending_before["next_attempt_at"] + 100.0)
+    assert len(ctx.injected) == 1
 
 
 def test_a_pending_publication_survives_a_restart():
@@ -609,7 +618,8 @@ def test_a_pending_publication_survives_a_restart():
     assert restarted.rehydrate() == 1, "a pending publication must count as work to resume"
     restarted.flush_publications(now=1_000.0 + 3600.0)
 
-    assert [p["event_id"] for p in second.published] == [lost["event_id"]]
+    [injected] = second.injected
+    assert injected["session_key"] == TARGET_SESSION_KEY
 
 
 def test_an_enqueue_failure_leaves_the_item_open_for_the_next_poll():
@@ -637,11 +647,11 @@ def test_an_enqueue_failure_leaves_the_item_open_for_the_next_poll():
     assert _outbox(watch["watch_id"]) == []
 
     assert manager.run_once(now=1_010.0) == 1
-    assert [p["event_id"] for p in ctx.published]
+    assert ctx.injected
     assert _store().get(watch["watch_id"])["items"][0]["completed_at"] is not None
 
 
-def test_a_late_response_from_a_stale_owner_publishes_nothing():
+def test_a_late_response_from_a_stale_owner_injects_nothing():
     """The poll can outlive the lease; the fold must be fenced, not just the item update."""
     clock = [1_000.0]
     store = _store()
@@ -660,21 +670,21 @@ def test_a_late_response_from_a_stale_owner_publishes_nothing():
 
     manager.run_once(now=clock[0])
 
-    assert manager.ctx.published == [], "a stale owner must not publish a superseded observation"
+    assert manager.ctx.injected == [], "a stale owner must not inject a superseded observation"
 
 
-def test_stop_mid_batch_does_not_poll_or_publish_the_next_task():
+def test_stop_mid_batch_does_not_poll_or_inject_the_next_task():
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")))
     watch = _add(manager, tasks=(("peer", "t1"), ("peer", "t2")))
     manager._stop.set()
 
     assert manager.run_once(now=1_000.0) == 0
-    assert manager.ctx.published == []
+    assert manager.ctx.injected == []
     assert _store().get(watch["watch_id"])["items"][0]["completed_at"] is None
 
 
 def test_release_drops_undelivered_publications_and_keeps_the_messages_queued():
-    """A task that leaves a session must not publish into it; the next owner gets the message."""
+    """A task that leaves a session must not be injected into it; the next owner gets the message."""
     ctx = FlakyCtx()
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")),
                        ctx=ctx)
@@ -686,7 +696,8 @@ def test_release_drops_undelivered_publications_and_keeps_the_messages_queued():
     manager.cancel_session("sess-1")  # release / session end
 
     assert _outbox(watch["watch_id"], pending_only=True) == [], (
-        "an undelivered publication must not survive the session that owned the task")
+        "an undelivered publication must not survive the session that owned the task"
+    )
     assert manager.ownership.queued("t1"), "the message stays queued for the next owner"
 
 
@@ -696,19 +707,20 @@ def test_releasing_every_task_also_removes_a_multi_task_expiry_notice():
     with _store()._session() as con:
         con.execute("UPDATE a2a_watches SET expires_at=1 WHERE watch_id=?", (watch["watch_id"],))
     manager.run_once(now=10_000.0)  # aggregate watch-expired notice with tasks=[t1, t2]
-    assert [p["metadata"]["state"] for p in manager.ctx.published] == ["watch-expired"]
+    assert [_meta(r)["state"] for r in _outbox(watch["watch_id"])] == ["watch-expired"]
 
     store = _store()
     store.release("t1", "sess-1")
     store.release("t2", "sess-1")
 
     assert _outbox(watch["watch_id"], pending_only=True) == [], (
-        "an aggregate notice must die with the tasks it describes")
+        "an aggregate notice must die with the tasks it describes"
+    )
     assert manager.flush_publications(now=20_000.0) == 0
 
 
-def test_a_notice_written_after_release_is_never_published():
-    """The outbox insert and the ownership check are separate: the guard re-checks at publish."""
+def test_a_notice_written_after_release_is_never_injected():
+    """The outbox insert and the ownership check are separate: the guard re-checks at inject."""
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)))
     watch = _add(manager, tasks=(("peer", "t1"),))
     assert manager.ownership.release("t1", SESSION_ID)
@@ -720,12 +732,12 @@ def test_a_notice_written_after_release_is_never_published():
             (watch["watch_id"], '{"source": "a2a", "task_id": "t1", "state": "completed"}', 1.0))
 
     assert manager.flush_publications(now=10_000.0) == 0
-    assert manager.ctx.published == []
+    assert manager.ctx.injected == []
     assert _outbox(watch["watch_id"], pending_only=True) == []
 
 
 def test_the_backlog_replay_refuses_a_released_task(monkeypatch):
-    """Release sets owner to "": the former owner must not publish into itself either."""
+    """Release sets owner to "": the former owner must not inject into itself either."""
     ctx = FakeCtx()
     monkeypatch.setattr(tools, "_CTX", ctx)
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)))
@@ -734,10 +746,10 @@ def test_the_backlog_replay_refuses_a_released_task(monkeypatch):
     assert manager.ownership.release("t1", SESSION_ID)
 
     accepted = tools._publish_queued(
-        ctx, "t1", "peer", SESSION_ID, {"target_id": "pct_test"},
+        ctx, "t1", "peer", SESSION_ID, {"session_key": TARGET_SESSION_KEY},
         [{"message_id": "m1", "kind": "result", "text": "result"}])
 
-    assert accepted == [] and ctx.published == []
+    assert accepted == [] and ctx.injected == []
 
 
 def test_the_backlog_replay_refuses_a_task_another_session_owns(monkeypatch):
@@ -750,10 +762,10 @@ def test_the_backlog_replay_refuses_a_task_another_session_owns(monkeypatch):
     assert manager.ownership.acquire("t1", "sess-other")
 
     accepted = tools._publish_queued(
-        ctx, "t1", "peer", SESSION_ID, {"target_id": "pct_test"},
+        ctx, "t1", "peer", SESSION_ID, {"session_key": TARGET_SESSION_KEY},
         [{"message_id": "m1", "kind": "result", "text": "secret result"}])
 
-    assert accepted == [] and ctx.published == []
+    assert accepted == [] and ctx.injected == []
 
 
 def test_history_messages_are_recorded_even_without_a_status_message(monkeypatch):
@@ -788,58 +800,64 @@ def test_release_drops_an_aggregate_notice_naming_peer_slash_task():
 
     assert manager.ownership.release("t1", SESSION_ID)
 
-    assert [p["event_id"] for p in _outbox(watch["watch_id"], pending_only=True)] == []
+    assert [_meta(r)["state"] for r in _outbox(watch["watch_id"], pending_only=True)] == []
 
 
-def test_a_row_deleted_by_release_is_not_published_from_a_stale_snapshot():
+def test_a_row_deleted_by_release_is_not_injected_from_a_stale_snapshot():
     """The flush must re-read under the write lock; a snapshot alone can outlive ownership."""
     ctx = FlakyCtx()
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")),
                        ctx=ctx)
     watch = _add(manager)
-    manager.run_once(now=1_000.0)  # publish refused -> durable outbox row
+    manager.run_once(now=1_000.0)  # inject refused -> durable outbox row
     assert _outbox(watch["watch_id"], pending_only=True)
 
     _store().due_publications(now=2_000.0)  # a flush pass that read the snapshot already
     manager.cancel_session("sess-1")        # release + adoption elsewhere
     ctx.fail = False
     assert manager.flush_publications(now=2_000.0) == 0
-    assert ctx.published == [], "a released task must not publish into the session that gave it up"
+    assert ctx.injected == [], "a released task must not inject into the session that gave it up"
 
 
-def test_an_oversized_result_is_truncated_to_the_publisher_limit():
+def test_an_oversized_result_is_truncated_to_the_host_limit():
     text = "x" * 33_000
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text=text)))
     watch = _add(manager)
 
     manager.run_once(now=1_000.0)
 
-    [published] = manager.ctx.published
-    assert len(published["content"]) < 32_000
-    assert "characters truncated" in published["content"]
+    [injected] = manager.ctx.injected
+    assert len(injected["content"]) < 32_000
+    assert "characters truncated" in injected["content"]
     assert _outbox(watch["watch_id"], pending_only=True) == []
 
 
 def test_a_permanently_refused_publication_is_retired_not_retried():
-    class RejectingCtx(FakeCtx):
-        def __init__(self):
-            super().__init__()
-            self.calls = 0
+    """A host that refuses every retry past the attempt cap is not coming back within the watch's
+    life: the row must be retired so it cannot spin forever."""
 
-        def publish_completion(self, **kwargs):
-            self.calls += 1
-            raise type("CompletionRequestError", (ValueError,), {})("content too large")
+    class RejectingCtx(FakeCtx):
+        def inject_message(self, content, role="user", session_key=None, origin=None):
+            return False  # permanent refusal; never throws
 
     ctx = RejectingCtx()
     manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="done")),
                        ctx=ctx)
     watch = _add(manager)
 
-    manager.run_once(now=1_000.0)
-    manager.run_once(now=2_000.0)
+    # Drive enough flush passes to exceed _MAX_PUBLICATION_ATTEMPTS (12).
+    now = 1_000.0
+    for _ in range(watches._MAX_PUBLICATION_ATTEMPTS + 2):
+        manager.run_once(now=now)
+        now += 10_000.0
 
-    assert ctx.calls == 1, "a permanent refusal must not be retried forever"
-    assert _outbox(watch["watch_id"], pending_only=True) == []
+    # The final row is either retired (published_at non-NULL with a marker) or simply never
+    # injected again; the contract is "no row spinning forever" and "host saw nothing".
+    assert ctx.injected == [], "a permanent refusal must never reach the host's accepted list"
+    for row in _outbox(watch["watch_id"]):
+        assert row["attempts"] <= watches._MAX_PUBLICATION_ATTEMPTS, (
+            "retired rows must not accumulate unbounded attempts"
+        )
 
 
 def test_an_expiring_watch_is_finished_after_a_restart():
@@ -855,7 +873,8 @@ def test_an_expiring_watch_is_finished_after_a_restart():
     fresh = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)))
     fresh.run_once(now=10_000.0)
 
-    assert [p["metadata"]["state"] for p in fresh.ctx.published] == ["watch-expired"]
+    [row] = _outbox(watch["watch_id"])
+    assert _meta(row)["state"] == "watch-expired"
     assert _store().get(watch["watch_id"])["state"] == "expired"
 
 
@@ -880,11 +899,13 @@ def test_an_input_required_notice_that_could_not_be_queued_is_retried():
 
     item = _store().get(watch["watch_id"])["items"][0]
     assert item["state"] != watches.ITEM_PAUSED, (
-        "a task must not stop polling before its notice is durably queued")
-    assert manager.ctx.published == []
+        "a task must not stop polling before its notice is durably queued"
+    )
+    assert manager.ctx.injected == []
 
     manager.run_once(now=1_010.0)
-    assert [p["metadata"]["kind"] for p in manager.ctx.published] == ["input-required"]
+    [injected] = manager.ctx.injected
+    assert "which key?" in injected["content"]
     assert _store().get(watch["watch_id"])["items"][0]["state"] == watches.ITEM_PAUSED
 
 
@@ -894,13 +915,14 @@ def test_a_refused_input_required_notice_is_retried():
                                                  text="which key?")), ctx=ctx)
     watch = _add(manager)
     manager.run_once(now=1_000.0)
-    assert ctx.published == []
+    assert ctx.injected == []
     [pending] = _outbox(watch["watch_id"])
     assert pending["metadata_json"].find("input-required") >= 0
 
     ctx.fail = False
-    manager.run_once(now=1_000.0 + 11.0)
-    assert [p["metadata"]["state"] for p in ctx.published] == ["input-required"]
+    manager.run_once(now=pending["next_attempt_at"] + 0.001)
+    [injected] = ctx.injected
+    assert "which key?" in injected["content"]
 
 
 def test_a_refused_expiry_notice_is_retried():
@@ -910,13 +932,14 @@ def test_a_refused_expiry_notice_is_retried():
     with _store()._session() as con:
         con.execute("UPDATE a2a_watches SET expires_at=1 WHERE watch_id=?", (watch["watch_id"],))
     manager.run_once(now=10_000.0)
-    assert ctx.published == []
+    assert ctx.injected == []
     [pending] = _outbox(watch["watch_id"])
     assert "watch-expired" in pending["metadata_json"]
 
     ctx.fail = False
-    manager.run_once(now=10_000.0 + 11.0)
-    assert [p["metadata"]["state"] for p in ctx.published] == ["watch-expired"]
+    manager.run_once(now=pending["next_attempt_at"] + 0.001)
+    [injected] = ctx.injected
+    assert "watch-expired" in injected["content"] or "expired" in injected["content"].lower()
 
 
 def test_the_lease_is_renewed_between_tasks_and_stale_writes_are_fenced():
@@ -942,7 +965,8 @@ def test_the_lease_is_renewed_between_tasks_and_stale_writes_are_fenced():
     assert manager.run_once(now=clock[0]) == 4
     assert clock[0] > 1_000.0 + watches.LEASE_S, "the batch ran past the initial lease"
     assert interlopers and not any(interlopers), (
-        "the lease expired mid-batch: a second process could take over and double-poll")
+        "the lease expired mid-batch: a second process could take over and double-poll"
+    )
 
     # Only after the lease really lapses may another owner take over ...
     assert store.claim(watch["watch_id"], other.owner, clock[0] + watches.LEASE_S) is True
@@ -951,7 +975,8 @@ def test_the_lease_is_renewed_between_tasks_and_stale_writes_are_fenced():
     manager.store.mark_item(watch["watch_id"], old_item["peer"], old_item["task_id"],
                             watches.ITEM_DONE, owner=manager.owner)
     assert store.get(watch["watch_id"])["items"][0]["completed_at"] is None, (
-        "a write from a process that lost the lease must be fenced out")
+        "a write from a process that lost the lease must be fenced out"
+    )
 
 
 def test_background_work_uses_the_creating_profiles_scope(tmp_path, monkeypatch):

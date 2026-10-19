@@ -65,9 +65,11 @@ with `A2A_UNOWNED_CANCEL_AFTER` and `A2A_UNOWNED_TASK_TTL`.
 
 `a2a_await(background=true)` returns immediately with a `watch_id`. The watch persists in the
 profile's `a2a_tasks.db`, polls the peer off-turn, and publishes the result through Hermes'
-durable plugin completion publisher (`PluginContext.capture_completion_target` /
-`publish_completion`), so the result arrives as a new turn in the session that started the work --
-after the current turn ends, never in the middle of one.
+public plugin injection surface (`PluginContext.inject_message`), so the result arrives as a new
+turn in the session that started the work -- after the current turn ends, never in the middle of
+one. Delivery is durable on OUR side: every message is written to the plugin's outbox first
+(`a2a_tasks.db`), retried with backoff while the host refuses it, and marked published only when a
+live host accepts it. Nothing is written to the host's `state.db`.
 
 ```text
 a2a_await(agent="researcher", task_id="task-1", background=true)
@@ -105,7 +107,17 @@ Tuning: `A2A_WATCH_INTERVAL` (seconds between polls, default 5, minimum 2) and `
 (watch lifetime in seconds, default 604800). Publication retries back off from 5s to 5 minutes;
 finished watches and delivered events are pruned after 7 days.
 
-Requirement: background mode needs a Hermes runtime that exposes the plugin completion publisher.
+Requirement: background mode needs a session that can take a later turn and a runtime whose
+`PluginContext` exposes `inject_message` (any current Hermes). One-shot, worker, cron and stateless
+API sessions are refused up front instead of starting a watch that could never deliver. For a
+messaging or gateway-hosted session, inject into that session is consent-gated per plugin:
+
+```yaml
+plugins:
+  entries:
+    a2a-async:
+      allow_gateway_injection: true
+```
 On an older runtime the tool returns a clear error instead of starting a watch that could never
 deliver; blocking `a2a_await` and `a2a_get_task` keep working there.
 

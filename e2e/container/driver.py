@@ -5,10 +5,9 @@ Runs a real `hermes chat` on a pty against:
   * a scripted OpenAI-compatible LLM endpoint (the agent's model), and
   * a scripted A2A peer (GetTask: WORKING once, then COMPLETED),
 
-then asserts that the background watch published through
-PluginContext.publish_completion, that the CLI delivered it as a new turn in the
-same session (the fake LLM sees a request carrying the plugin completion), and
-that the durable ledger row was acknowledged.
+then asserts that the background watch delivered through the public plugin surface
+PluginContext.inject_message: the live CLI accepted it, the model saw it as a new
+turn in the same session, and the plugin's own outbox marked it published.
 
 Everything is local: two HTTP servers on loopback, one HERMES_HOME under /data.
 Exit 0 = verified; non-zero = the phase named in the failure.
@@ -90,7 +89,9 @@ class CompletionServer(BaseHTTPRequestHandler):
 
     def _conversation(self, request: dict) -> tuple[str, bool]:
         text = json.dumps(request.get("messages") or [], default=str)
-        return text, "[PLUGIN COMPLETION" in text
+        # The plugin's terminal content is what inject_message hands the host; the host delivers
+        # it as a user turn, so this marker proves the injected text reached the model.
+        return text, "on peer 'peer'" in text
 
     def _reply_for(self, request: dict, index: int) -> dict:
         if not request.get("messages"):
@@ -205,6 +206,10 @@ def run_hermes(llm_port: int, peer_port: int, seed: str) -> tuple[subprocess.Pop
         "plugins:\n"
         "  enabled:\n"
         "    - a2a-async\n"
+        "  entries:\n"
+        "    a2a-async:\n"
+        # inject_message into a messaging/gateway session is consent-gated per plugin.
+        "      allow_gateway_injection: true\n"
         "providers:\n"
         "  e2e:\n"
         f"    api: \"http://127.0.0.1:{llm_port}/v1\"\n"
@@ -235,6 +240,8 @@ def run_hermes(llm_port: int, peer_port: int, seed: str) -> tuple[subprocess.Pop
     (HERMES_HOME / "config.yaml").write_text(config)
     _install_plugin()
 
+    # One-shot chat: plugin tools run in the gateway this CLI autostarts, so delivery goes through
+    # the gateway's inject_message path (consent below) into the same session.
     cmd = [HERMES_BIN, "chat", "--yolo", "-q", seed]
     env = dict(os.environ)
     env.update({
@@ -320,17 +327,17 @@ def main() -> int:
     try:
         completion_request = wait_for(
             lambda: next((r for r in CompletionServer.requests
-                          if "[PLUGIN COMPLETION" in json.dumps(r.get("messages") or [])), None),
+                          if "on peer 'peer'" in json.dumps(r.get("messages") or [])), None),
             timeout=240, label="the completion turn at the model")
 
         transcript = "\n".join(output)
         (EVIDENCE / "hermes-output.txt").write_text(transcript)
         completion_text = json.dumps(completion_request.get("messages") or [])
         assert "peer finished t1" in completion_text, "the peer reply was not in the delivered turn"
-        assert "plugin a2a-async" in completion_text, "provenance missing from the delivered turn"
-        row = wait_for(lambda: _delivered_row(), timeout=30, label="the ledger ack")
-        log(f"ledger row: {row['event_id']} state={row['delivery_state']}")
-        assert row["delivery_state"] == "delivered"
+        assert "A2A task t1 on peer 'peer'" in completion_text, "the plugin's own framing is missing"
+        assert "peer finished t1" in completion_text
+        row = wait_for(_published_row, timeout=30, label="the outbox publication")
+        log(f"outbox row: {row['event_id']} published_at={row['published_at']}")
 
         assert any(r.get("method") == "GetTask" for r in PeerServer.seen), "the peer was never polled"
         assert not any(r.get("method") == "CancelTask" for r in PeerServer.seen)
@@ -344,9 +351,9 @@ def main() -> int:
         dump("summary.json", {
             "llm_calls": len(CompletionServer.requests),
             "peer_polls": sum(PeerServer.polls.values()),
-            "ledger": row,
+            "publication": row,
         })
-        log("PASS: background watch published, delivered as a new turn, and acknowledged")
+        log("PASS: background watch injected into the live session and acknowledged")
         return 0
     except AssertionError as exc:
         log(f"FAIL: {exc}")
@@ -395,8 +402,9 @@ def stop_stray_processes() -> None:
             pass
 
 
-def _delivered_row():
-    db = HERMES_HOME / "state.db"
+def _published_row():
+    """The plugin's OWN outbox row, acknowledged by a live host (inject_message returned True)."""
+    db = HERMES_HOME / "a2a_tasks.db"
     if not db.exists():
         return None
     try:
@@ -404,9 +412,8 @@ def _delivered_row():
         con.row_factory = sqlite3.Row
         try:
             row = con.execute(
-                "SELECT event_id, delivery_state, delivery_attempts, delivered_at "
-                "FROM plugin_completions"
-                " WHERE plugin_id='a2a-async' AND delivery_state='delivered'").fetchone()
+                "SELECT event_id, attempts, published_at FROM a2a_watch_publications"
+                " WHERE published_at IS NOT NULL ORDER BY published_at LIMIT 1").fetchone()
         finally:
             con.close()
     except sqlite3.Error:

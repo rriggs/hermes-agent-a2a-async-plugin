@@ -3,7 +3,7 @@
 ``a2a_await(background=True)`` cannot block the agent turn: it captures a completion target from
 the invoking tool call, stores a watch in the profile's ``a2a_tasks.db``, and returns a ``watch_id``.
 A single profile-scoped thread polls the watched tasks and, on an authoritative terminal state,
-publishes one idempotent completion through ``PluginContext.publish_completion`` — the supported
+publishes one message through ``PluginContext.inject_message`` — the supported
 Hermes API that turns plugin background work into a new turn in the session that started it.
 
 The rules this module enforces, and why each exists:
@@ -594,9 +594,11 @@ class WatchStore:
                 # the session that just gave it up, and a bound session must own what it replays.
                 con.rollback()
                 return False
-            publish()
+            # The callback's own verdict matters: a host that REFUSED the message must leave it
+            # queued for the next attempt, not be reported as delivered because we own the task.
+            delivered = publish()
             con.commit()
-            return True
+            return bool(delivered)
         except Exception:
             con.rollback()
             raise
@@ -913,17 +915,21 @@ class WatchManager:
                         "UPDATE a2a_watch_publications SET published_at=? WHERE event_id=?",
                         (now, event_id))
                     continue
+                from . import tools as _tools
+                attempts = int(row.get("attempts", 0))
                 try:
-                    self.ctx.publish_completion(
-                        target=target, event_id=event_id, content=row["content"],
-                        metadata=_load_metadata(row.get("metadata_json")))
-                except Exception as exc:
-                    name = type(exc).__name__
-                    if name.startswith("Completion"):
-                        # The publisher refused this event permanently (content or target
-                        # validation). Retrying cannot succeed; retire the row and say so.
-                        logger.error("A2A watch %s was refused permanently (%s); dropping %s",
-                                     row.get("watch_id"), name, event_id)
+                    accepted = _tools._inject(self.ctx, target, row["content"])
+                except Exception as exc:  # the host itself raised: treat as "not now"
+                    logger.warning("A2A watch could not publish %s: %s", event_id, exc)
+                    accepted = False
+                if not accepted:
+                    if attempts + 1 >= _MAX_PUBLICATION_ATTEMPTS:
+                        # A host that refuses this many times (no live session, missing
+                        # allow_gateway_injection consent, a closed CLI) will not take it later.
+                        # Retire the row so it cannot spin forever; the watch's own notice path
+                        # reports the loss on its next terminal event.
+                        logger.error("A2A watch %s gave up delivering %s after %d attempts",
+                                     row.get("watch_id"), event_id, attempts + 1)
                         con.execute(
                             "UPDATE a2a_watch_publications SET published_at=? WHERE event_id=?",
                             (now, event_id))
@@ -931,8 +937,7 @@ class WatchManager:
                     con.execute(
                         """UPDATE a2a_watch_publications
                               SET attempts=attempts+1, next_attempt_at=? WHERE event_id=?""",
-                        (now + _publication_backoff(int(row.get("attempts", 0)) + 1), event_id))
-                    logger.warning("A2A watch could not publish %s: %s", event_id, exc)
+                        (now + _publication_backoff(attempts + 1), event_id))
                     continue
                 con.execute(
                     "UPDATE a2a_watch_publications SET published_at=?, next_attempt_at=0 "
@@ -1247,6 +1252,11 @@ def _watch_problem_content(peer: str, task_id: str, watch_id: str, problem: str,
 
 def _backoff(errors: int, interval: float) -> float:
     return min(MAX_BACKOFF_S, max(interval, interval * (2 ** min(errors, 6))))
+
+
+# A host that refuses delivery this many times (no live session, no gateway-injection consent, a
+# closed CLI) is not coming back within the watch's life; retire the row instead of spinning.
+_MAX_PUBLICATION_ATTEMPTS = 12
 
 
 def _publication_backoff(attempts: int) -> float:

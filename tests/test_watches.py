@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib.util
 import sqlite3
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,10 @@ spec.loader.exec_module(module)
 protocol = importlib.import_module(f"{PKG}.protocol")  # noqa: E402
 tools = importlib.import_module(f"{PKG}.tools")  # noqa: E402
 watches = importlib.import_module(f"{PKG}.watches")  # noqa: E402
+
+# The autouse fixture patches WatchManager.start out of most tests; the lifecycle regression
+# needs the real implementation.
+_REAL_START = watches.WatchManager.start
 
 SESSION_ID = "sess-1"
 TARGET_SESSION_KEY = "agent:main:telegram:dm:42"
@@ -1056,3 +1061,98 @@ def test_background_work_uses_the_creating_profiles_scope(tmp_path, monkeypatch)
     assert resolved == ["http://10.0.0.2:9901"]
     assert persisted == [str(home_b)], "the reply transcript must land in the creating profile"
     assert str(get_hermes_home()) == str(home_a), "the launch profile's scope must be restored"
+
+# ── Amy PR #9 findings 2-4 ───────────────────────────────────────────────────
+
+def _artifact_payload(state, text, artifact_id="a1", task_id="t1"):
+    return {"id": task_id, "contextId": "ctx-1", "status": {"state": state},
+            "artifacts": [{"artifactId": artifact_id, "parts": [{"text": text}]}]}
+
+
+def test_a_completed_artifact_revision_is_not_dropped_as_a_duplicate():
+    """A stable artifactId identifies an artifact, not one immutable revision.
+
+    Amy's PR #9 finding 2: a working snapshot with "partial" and a completed snapshot with the
+    same id carrying the final answer delivered only "partial", then closed the watch.
+    """
+    ctx = FakeCtx()
+    manager = _manager(ScriptedPoll(
+        _artifact_payload(protocol.STATE_WORKING, "partial"),
+        _artifact_payload(protocol.STATE_COMPLETED, "complete final answer"),
+    ), ctx=ctx)
+    watch = _add(manager)
+
+    manager.run_once(now=1_000.0)   # working snapshot: "partial" is delivered
+    manager.run_once(now=1_005.0)   # completed: same artifact id, new content
+
+    assert any("complete final answer" in m["content"] for m in ctx.injected), (
+        "the final revision of an already-seen artifact must reach the session")
+    assert _store().get(watch["watch_id"])["state"] == watches.WATCH_COMPLETE
+
+
+def test_the_blocking_recorder_keeps_a_new_revision_of_the_same_artifact():
+    """The blocking await shared the artifact-ID-only dedup; both recorders use the revision key."""
+    tools._record_observation(
+        "t1", _artifact_payload(protocol.STATE_WORKING, "partial"), "peer")
+    queued = tools._record_observation(
+        "t1", _artifact_payload(protocol.STATE_COMPLETED, "complete final answer"), "peer")
+
+    assert any("complete final answer" in m["text"] for m in queued)
+    # Re-observing the identical revision stays idempotent.
+    again = tools._record_observation(
+        "t1", _artifact_payload(protocol.STATE_COMPLETED, "complete final answer"), "peer")
+    assert len([m for m in again if "complete final answer" in m["text"]]) == 1
+
+
+def test_a_direct_replay_settles_the_pending_outbox_row():
+    """Amy's PR #9 finding 3: refuse, replay the backlog directly, then the flush must not
+    inject the same durable message a second time."""
+    ctx = FlakyCtx()
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_COMPLETED, text="answer")),
+                       ctx=ctx)
+    watch = _add(manager)
+    manager.run_once(now=1_000.0)  # terminal: the outbox row is written, the host refuses
+    assert _outbox(watch["watch_id"], pending_only=True)
+    queued = manager.ownership.queued("t1")
+    assert queued
+
+    ctx.fail = False
+    accepted = tools._publish_queued(ctx, "t1", "peer", SESSION_ID,
+                                     {"session_key": TARGET_SESSION_KEY}, queued)
+    assert len(accepted) == 1
+    assert len(ctx.injected) == 1
+
+    manager.flush_publications(now=1_000.0 + 10_000.0)
+    assert len(ctx.injected) == 1, (
+        "the replay must settle the matching outbox row, not leave it publishable")
+    assert _outbox(watch["watch_id"], pending_only=True) == []
+    assert manager.ownership.queued("t1") == []
+
+
+def test_stop_does_not_abandon_a_live_poller_for_a_second_one(monkeypatch):
+    """Amy's PR #9 finding 4: a timed-out stop dropped the handle, start() cleared the shared
+    stop flag, and two pollers ran under one lease-owner token."""
+    monkeypatch.setattr(watches.WatchManager, "start", _REAL_START)
+    in_poll, release = threading.Event(), threading.Event()
+
+    def poll(*_args):
+        in_poll.set()
+        assert release.wait(10)
+        return {"id": "t1", "status": {"state": protocol.STATE_WORKING}}
+
+    manager = watches.WatchManager(FakeCtx(), store=_store(), poll=poll, interval=0.01,
+                                   ttl_s=3600)
+    _add(manager)
+    old = manager._thread
+    try:
+        assert old is not None and in_poll.wait(5), "the poller must be inside a peer request"
+        manager.stop(timeout=0.01)
+        assert old.is_alive(), "the stop timed out; the old poller is still in flight"
+        manager.start()
+        assert manager._thread is old, "a second poller must not start beside the live one"
+    finally:
+        manager.stop(timeout=0.0)  # cancel the deferred hand-over
+        release.set()
+        manager.stop(timeout=5.0)
+        old.join(timeout=5)
+    assert not old.is_alive()

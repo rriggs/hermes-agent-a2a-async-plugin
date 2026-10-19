@@ -747,9 +747,7 @@ def _record_observation(task_id: str, payload: dict, peer: str) -> list[dict]:
             text = _text_of_message(artifact)
             if not text:
                 continue
-            artifact_id = str(artifact.get("artifactId") or artifact.get("artifact_id")
-                              or f"artifact:{index}:{_digest(text)}")
-            store.add_message(task_id, artifact_id, "result", text)
+            store.add_message(task_id, _artifact_message_id(artifact, index, text), "result", text)
         if state in protocol.TERMINAL_STATES and not any(
                 m["kind"] == "result" for m in store.queued(task_id)):
             store.add_message(task_id, f"state:{state}", "result",
@@ -777,6 +775,22 @@ def _digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
 
 
+def _artifact_message_id(artifact: dict, index: int, text: str) -> str:
+    """Key an artifact message by identity AND content revision.
+
+    An ``artifactId`` is stable across snapshots: a working poll can expose it with partial text
+    and the completed poll re-emit the same id with the final answer. Keying only on the id made
+    ``INSERT OR IGNORE`` drop the final revision (Amy's PR #9 finding 2), so the revision is part
+    of the message id: re-polling identical content stays idempotent, changed content is a new
+    message.
+    """
+    artifact_id = str(artifact.get("artifactId") or artifact.get("artifact_id") or "")
+    revision = _digest(text)
+    if not artifact_id:
+        return f"artifact:{index}:{revision}"
+    return f"{artifact_id}#{revision}"
+
+
 def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: Any,
                     messages: list[dict]) -> list[str]:
     """Publish undelivered peer messages; returns the message ids the host accepted."""
@@ -798,7 +812,8 @@ def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: 
             logger.warning("A2A: could not publish %s/%s: %s", task_id, msg["message_id"], exc)
             continue
         if not accepted:
-            logger.info("A2A: %s no longer owns %s; its backlog stays queued", session_id, task_id)
+            logger.info("A2A: %s/%s was not published (ownership changed or already delivered)",
+                        task_id, msg["message_id"])
             continue
         published.append(str(msg["message_id"]))
     return published
@@ -896,6 +911,15 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                            if str(m.get("kind")) == "result" and str(m.get("text") or "").strip()]
                 text = "\n\n".join(results) if results else (
                     _reply_text_from_result(payload) or "(no text reply)")
+                # Fence FIRST: ownership is verified and the backlog acknowledged in one
+                # transaction before the shared task record or the transcript is written. A
+                # release+adoption in flight must leave the adopter's task and transcript alone,
+                # and the old code wrote both before discovering it had lost the task.
+                if not _ownership().consume_if_owned(
+                        task_id, session_id or "", [m["message_id"] for m in queued_now]):
+                    return (f"[{agent} · task {task_id} · ownership changed]\n"
+                            "Another session took this task while the result was in flight; it "
+                            "was not consumed here.")
                 if state in protocol.TERMINAL_STATES:
                     _task_store().complete(task_id, state, text)
                 else:
@@ -909,14 +933,6 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                 if reply_ctx and text:
                     protocol.persist_message(reply_ctx, "agent", security.filter_inbound(text),
                                              task_id, peer=agent)
-                # Everything the peer said is in this return value: mark it delivered so a later
-                # background await does not repeat it -- but only while this session still owns
-                # the task, fenced in the same transaction as the mark.
-                if not _ownership().consume_if_owned(
-                        task_id, session_id or "", [m["message_id"] for m in queued_now]):
-                    return (f"[{agent} · task {task_id} · ownership changed]\n"
-                            "Another session took this task while the result was in flight; it "
-                            "was not consumed here.")
                 header = f"[{agent} · task {payload.get('id', task_id)} · {short}]"
                 body = text
                 if short == "input-required":

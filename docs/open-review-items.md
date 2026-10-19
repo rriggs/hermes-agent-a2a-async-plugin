@@ -4,19 +4,25 @@ Known, deliberately unfixed items. Recorded so a later session treats them as kn
 
 Does not block a canary deployment on a friendly account.
 
-## 1. Plugin, MAJOR -- blocking `a2a_await` has a check-then-consume race
+## 1. Plugin, MAJOR -- blocking `a2a_await` has a check-then-consume race -- RESOLVED
 
 `a2a_async_plugin/tools.py::a2a_await` (ownership re-check after `GetTask`), `ownership.py`.
 
-Ownership is re-checked after the peer call returns, but result recording, backlog acknowledgement
-and the return value are not serialized with a release/adoption, and the check is skipped entirely
-when `session_id` is empty. A release followed by adoption in that gap lets the former owner
-receive the result and empty the new owner's backlog.
+Was: ownership was re-checked after the peer call returned, but result recording, backlog
+acknowledgement and the return value were not serialized with a release/adoption, and the check was
+skipped entirely when `session_id` is empty. A release followed by adoption in that gap let the
+former owner receive the result and empty the new owner's backlog.
 
-Fix: a store-level `consume_if_owned(task_id, session_id, message_ids)` that under the store write
-lock verifies the live owner equals the bound session (or that the task is unowned for an unbound
-caller) and marks the backlog delivered in the same transaction; the await path then calls it
-instead of check-then-mark. Needs a release plus an adoption inside one GetTask round trip.
+Resolved in two places:
+
+* `consume_if_owned(task_id, session_id, message_ids)` now takes the SQLite write lock
+  (`BEGIN IMMEDIATE`) *before* reading ownership, and repeats the ownership condition on each
+  backlog mark. Release/acquire are UPDATEs and need the same lock, so they cannot interleave.
+* The blocking await calls it before writing the shared task record or the transcript, so a lost
+  task leaves both untouched instead of writing the result and then reporting the loss.
+
+Regression: `tests/test_ownership.py::test_consume_if_owned_holds_the_write_lock_before_reading_ownership`
+and the adoption-during-poll test in the same file.
 
 ## Resolved: the core-publisher branch is superseded
 

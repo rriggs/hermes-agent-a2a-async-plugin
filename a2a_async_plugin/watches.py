@@ -607,6 +607,19 @@ class WatchStore:
                 # the session that just gave it up, and a bound session must own what it replays.
                 con.rollback()
                 return False
+            if ids:
+                # Publish only what is still undelivered. The outbox flush and a direct backlog
+                # replay are two paths for the same durable message; whichever loses this check
+                # must not inject a second copy (Amy's PR #9 finding 3).
+                marks = ",".join("?" for _ in ids)
+                pending = con.execute(
+                    f"""SELECT 1 FROM a2a_task_messages
+                         WHERE task_id=? AND message_id IN ({marks}) AND delivered_at IS NULL
+                         LIMIT 1""",
+                    (task_id, *ids)).fetchone()
+                if pending is None:
+                    con.rollback()
+                    return False
             # The callback's own verdict matters: a host that REFUSED the message must leave it
             # queued for the next attempt, not be reported as delivered because we own the task.
             delivered = publish()
@@ -618,6 +631,15 @@ class WatchStore:
                               SET delivered_at=?, delivered_to_session=?
                             WHERE task_id=? AND message_id=? AND delivered_at IS NULL""",
                         (now, session_id, task_id, message_id))
+                    # Settle the matching outbox row in the SAME commit. Leaving it pending let
+                    # the next flush deliver a message this path already accepted.
+                    con.execute(
+                        """UPDATE a2a_watch_publications
+                              SET published_at=?, next_attempt_at=0
+                            WHERE published_at IS NULL
+                              AND json_extract(metadata_json, '$.task_id')=?
+                              AND json_extract(metadata_json, '$.message_id')=?""",
+                        (now, task_id, message_id))
             con.commit()
             return bool(delivered)
         except Exception:
@@ -802,30 +824,56 @@ class WatchManager:
             "unowned_task_ttl_s", "A2A_UNOWNED_TASK_TTL", DEFAULT_UNOWNED_TTL_S)
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._lifecycle = threading.Lock()
+        self._restart_requested = False
 
     # -- lifecycle --------------------------------------------------------
     def start(self) -> "WatchManager":
-        if self._thread is not None and self._thread.is_alive():
+        with self._lifecycle:
+            if self._thread is not None and self._thread.is_alive():
+                if self._stop.is_set():
+                    # stop() could not join the old generation (it is inside a peer request).
+                    # Clearing the shared stop flag for a second thread would leave two pollers
+                    # under one lease-owner token; defer instead and let the exiting thread
+                    # hand over (Amy's PR #9 finding 4).
+                    self._restart_requested = True
+                return self
+            self._stop = threading.Event()
+            stop = self._stop
+            self._thread = threading.Thread(
+                target=self._loop, args=(stop,), name="a2a-watch-manager", daemon=True)
+            self._thread.start()
             return self
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._loop, name="a2a-watch-manager", daemon=True)
-        self._thread.start()
-        return self
 
     def stop(self, timeout: float = 5.0) -> None:
-        self._stop.set()
         thread = self._thread
+        with self._lifecycle:
+            self._stop.set()
+            # A stop after a deferred start cancels the hand-over: the caller wants it stopped.
+            self._restart_requested = False
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
-        self._thread = None
+        with self._lifecycle:
+            # Keep the handle while the thread is still alive. Dropping it here is what let
+            # start() clear the shared stop flag and run a second poller beside the original.
+            if self._thread is thread and (thread is None or not thread.is_alive()):
+                self._thread = None
 
-    def _loop(self) -> None:
-        while not self._stop.wait(self.interval):
-            try:
-                self.run_once()
-            except Exception:  # a watcher bug must not kill the poller
-                logger.exception("A2A watch manager iteration failed")
+    def _loop(self, stop: threading.Event) -> None:
+        try:
+            while not stop.wait(self.interval):
+                try:
+                    self.run_once(stop=stop)
+                except Exception:  # a watcher bug must not kill the poller
+                    logger.exception("A2A watch manager iteration failed")
+        finally:
+            with self._lifecycle:
+                if self._thread is threading.current_thread():
+                    self._thread = None
+                restart = self._restart_requested
+                self._restart_requested = False
+            if restart:
+                self.start()
 
     def _scope(self):
         return profile_scope(self.profile_home)
@@ -900,9 +948,16 @@ class WatchManager:
             self.start()
         return pending
 
-    def run_once(self, now: Optional[float] = None) -> int:
-        """Poll every due watch and drain the outbox; returns the number of tasks polled."""
+    def run_once(self, now: Optional[float] = None, *,
+                 stop: Optional[threading.Event] = None) -> int:
+        """Poll every due watch and drain the outbox; returns the number of tasks polled.
+
+        ``stop`` is the generation event of the calling poller. A restarted manager gets a fresh
+        event, so an in-flight iteration from the old generation must check the one it started
+        with, never ``self._stop``.
+        """
         polls = 0
+        stop = self._stop if stop is None else stop
         with self._scope():
             now = self.clock() if now is None else now
             for expired in self.store.expire(now):
@@ -914,7 +969,7 @@ class WatchManager:
                 if not self.store.claim(watch["watch_id"], self.owner, now):
                     continue
                 try:
-                    polls += self._poll_watch(watch, now)
+                    polls += self._poll_watch(watch, now, stop)
                 finally:
                     self.store.release(watch["watch_id"], self.owner)
             self.flush_publications(now)
@@ -945,6 +1000,15 @@ class WatchManager:
                         (now, event_id))
                     continue
                 from . import tools as _tools
+                meta = _load_metadata(row.get("metadata_json"))
+                if self._message_already_delivered(con, meta):
+                    # A direct backlog replay accepted this durable message after this row was
+                    # written. The backlog mark is authoritative; injecting again would duplicate.
+                    logger.info("A2A watch: %s was already delivered by a backlog replay", event_id)
+                    con.execute(
+                        "UPDATE a2a_watch_publications SET published_at=?, next_attempt_at=0 "
+                        "WHERE event_id=?", (now, event_id))
+                    continue
                 attempts = int(row.get("attempts", 0))
                 try:
                     accepted = _tools._inject(self.ctx, target, row["content"])
@@ -971,7 +1035,6 @@ class WatchManager:
                 con.execute(
                     "UPDATE a2a_watch_publications SET published_at=?, next_attempt_at=0 "
                     "WHERE event_id=?", (now, event_id))
-                meta = _load_metadata(row.get("metadata_json"))
                 if meta.get("peer") and meta.get("task_id") and meta.get("state"):
                     con.execute(
                         """UPDATE a2a_watch_items SET published_state=?, updated_at=?
@@ -993,13 +1056,26 @@ class WatchManager:
                 published += 1
         return published
 
+    @staticmethod
+    def _message_already_delivered(con: sqlite3.Connection, meta: dict) -> bool:
+        """True when the outbox row's durable message was already accepted by another path."""
+        task_id = str(meta.get("task_id") or "")
+        message_id = str(meta.get("message_id") or "")
+        if not task_id or not message_id:
+            return False
+        row = con.execute(
+            """SELECT 1 FROM a2a_task_messages
+                WHERE task_id=? AND message_id=? AND delivered_at IS NOT NULL""",
+            (task_id, message_id)).fetchone()
+        return row is not None
+
     # -- internals --------------------------------------------------------
-    def _poll_watch(self, watch: dict, now: float) -> int:
+    def _poll_watch(self, watch: dict, now: float, stop: threading.Event) -> int:
         watch_id = watch["watch_id"]
         polls = 0
         items = [dict(r) for r in con_items(self.store.db_path, watch_id)]
         for item in items:
-            if self._stop.is_set():
+            if stop.is_set():
                 return polls  # unload asked us to stop; never start another poll
             if item["completed_at"] is not None:
                 continue
@@ -1034,7 +1110,7 @@ class WatchManager:
             # The poll can outlive the lease: another process then owns this watch. Re-check
             # before the observation is folded, so a late response cannot record or publish a
             # result the new owner has already superseded.
-            if self._stop.is_set() or not self.store.renew(watch_id, self.owner, self.clock()):
+            if stop.is_set() or not self.store.renew(watch_id, self.owner, self.clock()):
                 return polls
             self._apply_payload(watch, item, payload, now)
         self.store.settle(watch_id, now=now)
@@ -1122,10 +1198,9 @@ class WatchManager:
             text = tools._text_of_message(artifact)
             if not text:
                 continue
-            artifact_id = str(artifact.get("artifactId") or artifact.get("artifact_id")
-                              or f"artifact:{index}:{tools._digest(text)}")
             kind = "input-required" if raw_state == protocol.STATE_INPUT_REQUIRED else "result"
-            self.ownership.add_message(task_id, artifact_id, kind, text)
+            self.ownership.add_message(
+                task_id, tools._artifact_message_id(artifact, index, text), kind, text)
         if raw_state in protocol.TERMINAL_STATES and not self.ownership.has_kind(task_id, "result"):
             self.ownership.add_message(
                 task_id, f"state:{raw_state}", "result",

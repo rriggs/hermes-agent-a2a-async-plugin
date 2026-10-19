@@ -8,6 +8,7 @@ it lost; adoption is final; only unowned tasks can be adopted; no cross-profile 
 from __future__ import annotations
 
 import importlib.util
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -378,6 +379,61 @@ def test_consuming_the_backlog_is_fenced_on_live_ownership():
         "the former owner must not consume the adopter's backlog")
     assert store.consume_if_owned("t1", SESSION_B, ["m1"]) is True
     assert store.queued("t1") == []
+
+
+def test_consume_if_owned_holds_the_write_lock_before_reading_ownership():
+    """Ownership must be read under the write lock, not before it.
+
+    Amy's PR #9 finding 1: the SELECT ran outside a transaction, so a release plus an adoption
+    could commit between the ownership check and the marks. The fence is proven from outside: a
+    second connection trying to write while the ownership row is being read must be refused.
+    """
+    _task("t1")
+    store = _store()
+    assert store.acquire("t1", SESSION_A)
+    store.add_message("t1", "m1", "result", "the result")
+    real_connect = store._connect
+    blocked: list[bool] = []
+
+    class Cursor:
+        def __init__(self, cursor, con):
+            self.cursor, self.con = cursor, con
+
+        def fetchone(self):
+            row = self.cursor.fetchone()
+            self.cursor.close()
+            if not blocked:
+                rival = sqlite3.connect(store.db_path, timeout=0.05)
+                try:
+                    with pytest.raises(sqlite3.OperationalError):
+                        rival.execute(
+                            "UPDATE a2a_tasks SET owner_session_id=? WHERE task_id=?",
+                            (SESSION_B, "t1"))
+                        rival.commit()
+                finally:
+                    rival.close()
+                blocked.append(True)
+            return row
+
+    class Connection:
+        def __init__(self, con):
+            self.con = con
+
+        def __getattr__(self, key):
+            return getattr(self.con, key)
+
+        def execute(self, sql, params=()):
+            result = self.con.execute(sql, params)
+            if sql.strip().startswith("SELECT owner_session_id") and not blocked:
+                return Cursor(result, self.con)
+            return result
+
+    store._connect = lambda: Connection(real_connect())
+    assert store.consume_if_owned("t1", SESSION_A, ["m1"]) is True
+    assert blocked, "the ownership read must hold the write lock"
+    fresh = ownership.OwnershipStore()
+    assert fresh.owner("t1") == SESSION_A, "the rival write must not land inside the fence"
+    assert fresh.queued("t1") == []
 
 
 def test_each_profile_gets_its_own_watch_manager(tmp_path, monkeypatch):

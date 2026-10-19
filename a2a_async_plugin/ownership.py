@@ -253,15 +253,25 @@ class OwnershipStore:
         """
         now = time.time()
         with self._session() as con:
+            # Take the write lock BEFORE reading ownership. Under sqlite3's default deferred
+            # transactions the SELECT starts no transaction at all, so a release+adoption could
+            # commit between this check and the marks below (Amy's PR #9 finding 1). Release and
+            # acquire are UPDATEs, so they need the same lock and cannot interleave now.
+            if not con.in_transaction:
+                con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT owner_session_id FROM a2a_tasks WHERE task_id=?", (task_id,)).fetchone()
             if row is None or str(row[0] or "") != str(session_id or ""):
                 return False
             for message_id in message_ids:
+                # The ownership condition is repeated on the UPDATE itself so the mark stays
+                # fenced even if a caller ever runs this inside an already-open transaction.
                 con.execute(
                     """UPDATE a2a_task_messages SET delivered_at=?, delivered_to_session=?
-                        WHERE task_id=? AND message_id=? AND delivered_at IS NULL""",
-                    (now, session_id, task_id, message_id))
+                        WHERE task_id=? AND message_id=? AND delivered_at IS NULL
+                          AND EXISTS (SELECT 1 FROM a2a_tasks
+                                       WHERE task_id=? AND owner_session_id=?)""",
+                    (now, session_id, task_id, message_id, task_id, session_id))
             return True
 
     def mark_delivered(self, task_id: str, message_ids: Iterable[str], session_id: str,

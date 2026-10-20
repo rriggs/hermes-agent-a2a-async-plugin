@@ -150,7 +150,7 @@ Run 2026-10-19, branch `feat/inject-message-delivery`, plugin `0.3.1`.
 |---|---|
 | Host targeted matrix (section B) | 43 passed |
 | Host full suite (`pytest tests -q`) | 277 passed, 3 skipped |
-| Container full suite (same tree, image `localhost/hermes-e2e:local`) | 267 passed, 5 skipped, 2 known-limitation failures (D) |
+| Container full suite (same tree, image `localhost/hermes-e2e:local`) | 273 passed, 5 skipped, 2 known-limitation failures (D) |
 | Container end-to-end (`run-container.sh`) | PASS, 8 model calls, 2 peer polls, outbox `attempts=0` (`a2a:t1:artifact-pos:0`) |
 | `hermes plugins validate` (clean export) | Validation passed (2 warnings, section A) |
 | `hermes plugins doctor` (clean export) | OK: discovery, manifest, import, registration; 13 tools, 3 hooks |

@@ -564,7 +564,7 @@ def test_a_failed_target_capture_claims_no_tasks(monkeypatch):
 
     out = tools._start_background_watch({"agent": "peer", "task_id": "t1"}, SESSION_A)
 
-    assert "cannot receive a later turn" in out
+    assert "cannot display a background result" in out
     assert _store().owner("t1") == ""
 
 

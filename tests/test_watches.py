@@ -79,6 +79,7 @@ class FakeCtx:
         self.unload_callbacks: list = []
         self.accept = True
         self.surface = "telegram"
+        self.delivery_visible = True
 
     def inject_message(self, content, role="user", session_key=None, origin=None):
         self.injected.append({
@@ -91,6 +92,9 @@ class FakeCtx:
 
     def session_surface(self) -> str:
         return self.surface
+
+    def async_delivery_visible(self) -> bool:
+        return bool(self.delivery_visible)
 
     def on_unload(self, callback):
         self.unload_callbacks.append(callback)
@@ -195,7 +199,7 @@ def test_background_await_refuses_a_runtime_without_inject_message(monkeypatch):
     )
 
 
-def test_background_await_refuses_a_session_that_cannot_receive_a_later_turn(monkeypatch):
+def test_background_await_refuses_a_session_that_cannot_display_a_result(monkeypatch):
     import gateway.session_context as sc
 
     monkeypatch.setattr(tools, "_CTX", FakeCtx())
@@ -206,7 +210,32 @@ def test_background_await_refuses_a_session_that_cannot_receive_a_later_turn(mon
                              session_id=SESSION_ID)
 
     assert result.startswith("Error:")
-    assert "cannot receive a later turn" in result
+    assert "cannot display a background result" in result
+
+
+def test_background_await_refuses_a_host_without_visible_delivery(monkeypatch):
+    """The capability, not the surface string, decides: a host that reports no visible path
+    (the current classic-CLI gateway session) is refused, while the same surface with the
+    capability true is allowed. When core learns to display plugin admissions in the CLI it
+    flips the capability and this plugin works unchanged."""
+    ctx = FakeCtx()
+    ctx.surface = "cli"
+    ctx.delivery_visible = False
+    monkeypatch.setattr(tools, "_CTX", ctx)
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+
+    result = tools.a2a_await({"agent": "peer", "task_id": "t1", "background": True},
+                             session_id=SESSION_ID)
+
+    assert result.startswith("Error:")
+    assert "cannot display a background result" in result
+    assert "transcript" in result
+    assert _store().resumable_count_readonly() == 0
+
+    ctx.delivery_visible = True
+    allowed = tools.a2a_await({"agent": "peer", "task_id": "t2", "background": True},
+                              session_id=SESSION_ID)
+    assert allowed.startswith("[watch ")
 
 
 def test_background_await_validates_peers_and_arguments(monkeypatch):

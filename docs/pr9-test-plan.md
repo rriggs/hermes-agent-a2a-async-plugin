@@ -96,6 +96,8 @@ PYTHONPATH=<hermes checkout> python -m pytest -q \
 | A2-1 | P1 | A replay acknowledged an artifact revision it never sent: a poll revised the artifact (and refreshed its outbox row) between the replay's snapshot and the publish, so the mark settled the new content while the host only saw the old text | `tests/test_watches.py::test_a_replay_must_not_acknowledge_a_revision_it_did_not_send`, `::test_flush_skips_an_outbox_body_the_artifact_has_outgrown` |
 | A2-2 | P2 | Both history recorders lowercased the role and accepted only `agent`/`assistant`, dropping A2A v1.0 `ROLE_AGENT` messages | `tests/test_watches.py::test_v1_role_agent_history_reaches_both_recorders` |
 | A2-3 | P2 | The blocking await's transport-error, RPC-error and timeout exits ignored the ownership-fence verdict and returned the old caller's backlog snapshot | `tests/test_watches.py::test_a_poll_error_after_losing_ownership_does_not_return_the_backlog`, `::test_a_peer_rpc_error_after_losing_ownership_does_not_return_the_backlog`, `::test_a_timeout_after_losing_ownership_does_not_return_the_backlog` |
+| A3-1 | P1 | The blocking await acknowledged backlog by message id only: a watch poll that revised an artifact between the recorder's snapshot and consumption was marked delivered while the turn returned the old text. The terminal, transport-error, RPC-error and timeout exits all consumed a snapshot without a revision fence | `tests/test_watches.py::test_a_blocking_await_returns_the_revision_it_acknowledges`, `::test_a_transport_error_does_not_acknowledge_a_revised_backlog`, `::test_an_rpc_error_does_not_acknowledge_a_revised_backlog`, `::test_a_timeout_does_not_acknowledge_a_revised_backlog`, `tests/test_ownership.py::test_consume_refuses_a_revision_it_did_not_read` |
+| A3-2 | P2 | The artifact upsert compared text only: INPUT_REQUIRED -> COMPLETED with the same artifactId and body kept the obsolete kind, producing a false no-text placeholder after an accepted notice or a stale "needs input" after a refused one | `tests/test_watches.py::test_a_same_text_artifact_refreshes_its_kind_on_completion`, `::test_a_refused_input_notice_does_not_survive_completion`, `tests/test_ownership.py::test_an_identical_artifact_revision_stays_idempotent_but_a_kind_change_reopens` |
 | API-1 | -- | `provides_hooks` missing from `plugin.yaml`; plugin API validate failed | `hermes plugins validate` (section A) |
 | API-2 | -- | Validate on a working tree flags the gitignored SDK venv as dangerous | environment: run validate on a clean export (section A) |
 | ENV-1 | -- | In the e2e image, `test_real_runtime_registration_via_hermes_plugins_list` finds no installed plugin | environment limitation, identical on `f3ddaaa` (see D) |
@@ -144,10 +146,10 @@ Run 2026-10-19, branch `feat/inject-message-delivery`, plugin `0.5.0`.
 
 | Check | Result |
 |---|---|
-| Host targeted matrix (section B) | 29 passed |
-| Host full suite (`pytest tests -q`) | 263 passed, 3 skipped |
-| Container full suite (same tree, image `localhost/hermes-e2e:local`) | 259 passed, 5 skipped, 2 known-limitation failures (D) |
-| Container end-to-end (`run-container.sh`) | PASS, 8 model calls, 2 peer polls, outbox `attempts=0` |
+| Host targeted matrix (section B) | 37 passed |
+| Host full suite (`pytest tests -q`) | 271 passed, 3 skipped |
+| Container full suite (same tree, image `localhost/hermes-e2e:local`) | 267 passed, 5 skipped, 2 known-limitation failures (D) |
+| Container end-to-end (`run-container.sh`) | PASS, 8 model calls, 2 peer polls, outbox `attempts=0` (`a2a:t1:artifact-pos:0`) |
 | `hermes plugins validate` (clean export) | Validation passed (2 warnings, section A) |
 | `hermes plugins doctor` (clean export) | OK: discovery, manifest, import, registration; 13 tools, 3 hooks |
 | `hermes plugins list --json` (user install, enabled) | `a2a-async`, source `user`, status `enabled`, version `0.5.0` |

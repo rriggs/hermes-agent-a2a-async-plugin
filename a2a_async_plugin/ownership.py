@@ -61,6 +61,20 @@ class OwnershipConflict(RuntimeError):
         self.owner = owner
 
 
+class RevisionConflict(RuntimeError):
+    """A message moved to a revision the caller did not read; nothing was acknowledged.
+
+    Raised from ``consume_if_owned`` under the write lock, before any task-state or delivery
+    write, so a caller that catches it can re-read and return the newer content instead.
+    """
+
+    def __init__(self, task_id: str, message_ids: list[str]) -> None:
+        self.task_id = task_id
+        self.message_ids = list(message_ids)
+        super().__init__(
+            f"task {task_id}: revision changed for {', '.join(self.message_ids)}")
+
+
 class OwnershipStore:
     """Profile-scoped ownership + message queue for A2A task records."""
 
@@ -232,7 +246,9 @@ class OwnershipStore:
 
         ``update_existing`` is for artifacts, whose id is stable while their content changes
         between snapshots: a changed body updates the row in place and re-queues it (a delivered
-        working revision must not hide the final one), an identical body is a no-op.
+        working revision must not hide the final one), an identical body is a no-op. The
+        lifecycle classification is part of the revision: INPUT_REQUIRED -> COMPLETED can carry
+        the same artifact id and text, and the stale kind must not survive it (Amy round 3, P2).
         """
         if not task_id or not message_id:
             return False
@@ -248,7 +264,8 @@ class OwnershipStore:
                            text=excluded.text,
                            delivered_at=NULL,
                            delivered_to_session=''
-                       WHERE a2a_task_messages.text <> excluded.text""",
+                       WHERE a2a_task_messages.text <> excluded.text
+                          OR a2a_task_messages.kind <> excluded.kind""",
                     (task_id, message_id, kind or "progress", text or "", now))
             else:
                 cur = con.execute(
@@ -277,12 +294,18 @@ class OwnershipStore:
 
     def consume_if_owned(self, task_id: str, session_id: str,
                          message_ids: list[str], *, state: Optional[str] = None,
-                         reply: str = "") -> bool:
+                         reply: str = "",
+                         expected_revisions: Optional[dict[str, tuple[str, str]]] = None) -> bool:
         """Mark backlog delivered in ONE transaction, fenced on live ownership.
 
         The blocking await records and acknowledges its results as separate statements; a release
         plus an adoption in between would otherwise let the former owner consume the new owner's
         backlog. ``False`` means ownership changed and NOTHING was marked.
+
+        ``expected_revisions`` maps every message id about to be marked to the ``(text, kind)``
+        the caller actually returned. They are verified under the same write lock, BEFORE any
+        state/reply write or delivery mark; a moved revision raises ``RevisionConflict`` and
+        rolls the whole transaction back, so the newer content stays queued (Amy round 3, P1).
 
         ``state``/``reply`` fold the task-record transition into the same transaction. Without it
         a crash between the acknowledgement and ``TaskStore.complete`` consumed the only durable
@@ -300,6 +323,24 @@ class OwnershipStore:
                 "SELECT owner_session_id FROM a2a_tasks WHERE task_id=?", (task_id,)).fetchone()
             if row is None or str(row[0] or "") != str(session_id or ""):
                 return False
+            if expected_revisions is not None:
+                ids = [str(m) for m in message_ids]
+                marks = ",".join("?" for _ in ids)
+                current = {
+                    str(r["message_id"]): (str(r["text"] or ""),
+                                           str(r["kind"] or "progress"))
+                    for r in con.execute(
+                        f"""SELECT message_id, text, kind FROM a2a_task_messages
+                             WHERE task_id=? AND message_id IN ({marks})""",
+                        (task_id, *ids)).fetchall()
+                } if ids else {}
+                stale = [message_id for message_id in ids
+                         if current.get(message_id) != expected_revisions.get(message_id)]
+                if stale:
+                    # The caller is holding content the row no longer has. Acknowledge nothing:
+                    # the transaction rolls back in _session(), leaving the newest revision
+                    # queued for the caller's re-read.
+                    raise RevisionConflict(task_id, stale)
             if state:
                 # Mirror TaskStore.complete/set_state: both refuse a transition out of a terminal
                 # state, so a later poll that re-reports a different state cannot overwrite (or

@@ -30,7 +30,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional, TypedDict
+from typing import Any, Callable, Optional, TypedDict
 
 from . import protocol, security
 
@@ -699,6 +699,48 @@ def _mark_backlog_delivered(task_id: str, messages: list[dict], session_id: str)
         logger.debug("A2A: backlog delivery marker failed", exc_info=True)
 
 
+def _revision_of(message: dict) -> tuple[str, str]:
+    """The exact revision a turn returns for one message: (text, lifecycle kind)."""
+    return str(message.get("text") or ""), str(message.get("kind") or "progress")
+
+
+def _consume_fenced(task_id: str, session_id: str, messages: list[dict], *,
+                    state: Optional[str] = None,
+                    reply_for: Optional[Callable[[list[dict]], str]] = None,
+                    ) -> tuple[str, list[dict], str]:
+    """Acknowledge exactly the revisions this turn returned.
+
+    Ownership alone is not enough: a watch poll or another await can revise an artifact between
+    the snapshot and the acknowledgement, and marking by message id then delivers NEW while the
+    caller returns OLD (Amy round 3, P1). The fence verifies ``(text, kind)`` under the same write
+    lock that writes state/reply.
+
+    One conflict re-reads the backlog and retries with the newest snapshot, so the turn can
+    return what it acknowledges. A second conflict acknowledges nothing and returns the newest
+    backlog with the ``"revision"`` outcome: it stays queued for the next await.
+
+    Returns ``(outcome, snapshot, reply)`` where outcome is ``"ok"``, ``"ownership"`` or
+    ``"revision"``; ``snapshot`` is the backlog the decision was made on.
+    """
+    from . import ownership
+    snapshot = list(messages)
+    reply = ""
+    for attempt in (0, 1):
+        reply = reply_for(snapshot) if reply_for else ""
+        expected = {str(m["message_id"]): _revision_of(m) for m in snapshot}
+        try:
+            ok = _ownership().consume_if_owned(
+                task_id, session_id or "", [str(m["message_id"]) for m in snapshot],
+                state=state, reply=reply, expected_revisions=expected)
+        except ownership.RevisionConflict:
+            if attempt == 0:
+                snapshot = _queued_backlog(task_id)
+                continue
+            return "revision", snapshot, reply
+        return ("ok" if ok else "ownership"), snapshot, reply
+    return "revision", snapshot, reply
+
+
 def _ensure_maintenance(ctx: Any = None) -> None:
     """The auto-cancel/TTL timers run in the watch poller; start it after an ownership change."""
     try:
@@ -900,7 +942,6 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
     if not ok:
         return refusal
     backlog = _queued_backlog(task_id)
-    preface = _backlog_lines(backlog)
 
     deadline = time.time() + timeout
     last_state = ""
@@ -909,17 +950,24 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
             resp = _rpc_request(peer, "GetTask", {"id": task_id}, timeout=30)
         except Exception as e:
             # The fence verdict decides whether this caller may still hand back the backlog it
-            # snapshotted. Ignoring it leaked the adopter's messages to the old session.
-            if not _ownership().consume_if_owned(task_id, session_id or "",
-                                                 [m["message_id"] for m in backlog]):
+            # snapshotted. Ignoring it leaked the adopter's messages to the old session, and a
+            # revision moved mid-error must not be acknowledged unseen (Amy round 3, P1).
+            outcome, refreshed, _ignored = _consume_fenced(task_id, session_id or "", backlog)
+            if outcome == "ownership":
                 return _ownership_changed_result(agent, task_id)
-            prefix = ("\n".join(preface) + "\n\n") if preface else ""
+            prefix = ("\n".join(_backlog_lines(refreshed)) + "\n\n") if refreshed else ""
+            if outcome == "revision":
+                prefix += ("(A queued message changed while this error was being returned; its "
+                           "newest revision was not acknowledged and stays queued.)\n\n")
             return prefix + f"Error: poll of '{agent}' failed — {e}."
         if "error" in resp:
-            if not _ownership().consume_if_owned(task_id, session_id or "",
-                                                 [m["message_id"] for m in backlog]):
+            outcome, refreshed, _ignored = _consume_fenced(task_id, session_id or "", backlog)
+            if outcome == "ownership":
                 return _ownership_changed_result(agent, task_id)
-            prefix = ("\n".join(preface) + "\n\n") if preface else ""
+            prefix = ("\n".join(_backlog_lines(refreshed)) + "\n\n") if refreshed else ""
+            if outcome == "revision":
+                prefix += ("(A queued message changed while this error was being returned; its "
+                           "newest revision was not acknowledged and stays queued.)\n\n")
             return prefix + _peer_rpc_error(resp, agent)
         payload = resp.get("result", {})
         if session_id and _ownership().owner(task_id) != session_id:
@@ -936,32 +984,41 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
             short = _short_state(state)
             queued_now = _record_observation(task_id, payload, agent)
             if short in ("completed", "failed", "canceled", "rejected", "input-required"):
-                # Our own "task reached X with no text reply" placeholder is not peer content:
-                # storing it as the durable reply would let it masquerade as a real answer and
-                # block the answer that arrives later (local review round 3).
-                results = [str(m.get("text") or "").strip() for m in queued_now
-                           if str(m.get("kind")) == "result"
-                           and not str(m.get("message_id") or "").startswith("state:")
-                           and str(m.get("text") or "").strip()]
-                text = "\n\n".join(results) if results else (
-                    _reply_text_from_result(payload) or "")
-                if not text and state in protocol.TERMINAL_STATES:
-                    # The backlog can already be empty because an earlier attempt delivered the
-                    # reply and died before the turn returned. The task row holds the text, so
-                    # recover it instead of reporting "no text reply" (local review, D1).
-                    stored = _task_store().get(task_id) or {}
-                    if str(stored.get("state") or "") == state:
-                        text = str(stored.get("reply") or "")
-                # An empty text stays empty in the task row: the guard must be able to accept the
-                # real answer later. Only the tool output names the absence.
-                # Fence AND record in one transaction: ownership is verified, the task row goes
-                # terminal with the reply, and the backlog is acknowledged together. Recording
-                # after the acknowledgement (the first cut of this fix) meant a crash in between
-                # consumed the only durable copy of the peer's text (local review, D1).
-                if not _ownership().consume_if_owned(
-                        task_id, session_id or "", [m["message_id"] for m in queued_now],
-                        state=state, reply=text):
+                def reply_for(messages: list[dict]) -> str:
+                    # Our own "task reached X with no text reply" placeholder is not peer content:
+                    # storing it as the durable reply would let it masquerade as a real answer and
+                    # block the answer that arrives later (local review round 3).
+                    results = [str(m.get("text") or "").strip() for m in messages
+                               if str(m.get("kind")) == "result"
+                               and not str(m.get("message_id") or "").startswith("state:")
+                               and str(m.get("text") or "").strip()]
+                    reply = "\n\n".join(results) if results else (
+                        _reply_text_from_result(payload) or "")
+                    if not reply and state in protocol.TERMINAL_STATES:
+                        # The backlog can already be empty because an earlier attempt delivered
+                        # the reply and died before the turn returned. The task row holds the
+                        # text, so recover it instead of reporting "no text reply" (D1).
+                        stored = _task_store().get(task_id) or {}
+                        if str(stored.get("state") or "") == state:
+                            reply = str(stored.get("reply") or "")
+                    return reply
+
+                # Fence AND record in one transaction: ownership is verified, the returned
+                # revisions are verified, the task row goes terminal with the reply, and the
+                # backlog is acknowledged together. A revision that moved between the snapshot
+                # and this call is re-read once so the turn returns what it acknowledges
+                # (Amy round 3, P1).
+                outcome, observed, text = _consume_fenced(
+                    task_id, session_id or "", queued_now, state=state, reply_for=reply_for)
+                if outcome == "ownership":
                     return _ownership_changed_result(agent, task_id)
+                if outcome == "revision":
+                    prefix = "\n".join(_backlog_lines(observed))
+                    note = (f"[{agent} · task {task_id} · revision changed]\n"
+                            "The peer revised this result while it was being returned, so "
+                            "nothing was acknowledged. The newest revision stays queued; call "
+                            "a2a_await again to receive it.")
+                    return f"{prefix}\n\n{note}" if prefix else note
                 # Mirror the committed transition into the in-memory TaskStore (the transaction
                 # above already wrote the row, so this is cache coherence, not durability).
                 if state in protocol.TERMINAL_STATES:
@@ -989,17 +1046,20 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                     ctx = str(payload.get("contextId", ""))
                     body += f"\n\n(Peer needs input — reply via a2a_submit with context_id '{ctx}'.)"
                 progress = _backlog_lines(
-                    [m for m in queued_now if str(m.get("kind")) != "result"])
-                prefix = "\n".join(preface + progress)
+                    [m for m in observed if str(m.get("kind")) != "result"])
+                prefix = "\n".join(progress)
                 return f"{prefix}\n\n{header}\n{body}" if prefix else f"{header}\n{body}"
         if time.time() >= deadline:
-            observed = _queued_backlog(task_id)
-            if not _ownership().consume_if_owned(task_id, session_id or "",
-                                                 [m["message_id"] for m in observed]):
+            outcome, observed, _ignored = _consume_fenced(
+                task_id, session_id or "", _queued_backlog(task_id))
+            if outcome == "ownership":
                 return _ownership_changed_result(agent, task_id)
-            prefix = "\n".join(preface + _backlog_lines(observed))
+            prefix = "\n".join(_backlog_lines(observed))
             note = (f"[{agent} · task {task_id} · still working after {timeout}s]\n"
                     f"Call a2a_await again or check a2a_get_task.")
+            if outcome == "revision":
+                note = ("(A queued message changed while the timeout result was being returned; "
+                        "its newest revision was not acknowledged and stays queued.)\n\n" + note)
             return f"{prefix}\n\n{note}" if prefix else note
         time.sleep(interval)
 

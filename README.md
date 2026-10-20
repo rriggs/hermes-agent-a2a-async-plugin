@@ -119,7 +119,8 @@ rather than using keyless injection (the host would pick whichever session is ca
 time when several CLI sessions share the gateway process). One-shot, worker, cron and stateless
 API sessions are refused up front instead of starting a watch that could never deliver.
 
-For a messaging or gateway-hosted session, injection is consent-gated per plugin by Hermes core:
+Injection is consent-gated per plugin by Hermes core for every gateway-routed session, including a
+classic CLI session (0.22.2+ runs those turns in the gateway):
 
 ```yaml
 plugins:

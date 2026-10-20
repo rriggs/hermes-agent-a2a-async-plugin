@@ -99,6 +99,7 @@ PYTHONPATH=<hermes checkout> python -m pytest -q \
 | A3-1 | P1 | The blocking await acknowledged backlog by message id only: a watch poll that revised an artifact between the recorder's snapshot and consumption was marked delivered while the turn returned the old text. The terminal, transport-error, RPC-error and timeout exits all consumed a snapshot without a revision fence | `tests/test_watches.py::test_a_blocking_await_returns_the_revision_it_acknowledges`, `::test_a_transport_error_does_not_acknowledge_a_revised_backlog`, `::test_an_rpc_error_does_not_acknowledge_a_revised_backlog`, `::test_a_timeout_does_not_acknowledge_a_revised_backlog`, `tests/test_ownership.py::test_consume_refuses_a_revision_it_did_not_read` |
 | A3-2 | P2 | The artifact upsert compared text only: INPUT_REQUIRED -> COMPLETED with the same artifactId and body kept the obsolete kind, producing a false no-text placeholder after an accepted notice or a stale "needs input" after a refused one | `tests/test_watches.py::test_a_same_text_artifact_refreshes_its_kind_on_completion`, `::test_a_refused_input_notice_does_not_survive_completion`, `tests/test_ownership.py::test_an_identical_artifact_revision_stays_idempotent_but_a_kind_change_reopens` |
 | A4-1 | P1 | Hermes 0.21.x binds no route key for an interactive CLI, so `a2a_await(background=true)` refused every CLI session with "no route key". Keyless injection is unsafe with several CLI sessions sharing the gateway process; background mode now requires Hermes >=0.22.2 and refuses clearly on older cores | `tests/test_watches.py::test_a_session_without_a_route_key_is_refused` |
+| A4-3 | P1 | Two concurrent CLI sessions each capture their own route key; a result for one session is injected with that key and cannot land in the other | `tests/test_watches.py::test_two_cli_sessions_capture_distinct_route_keys` |
 | A4-2 | P1 | Background publications injected peer text as a `role="user"` turn with no untrusted framing and no injection filtering, unlike inbound A2A dispatch | `tests/test_watches.py::test_background_publication_frames_peer_text_as_untrusted`, `::test_a_watch_result_is_injected_as_untrusted_peer_content` |
 | API-1 | -- | `provides_hooks` missing from `plugin.yaml`; plugin API validate failed | `hermes plugins validate` (section A) |
 | API-2 | -- | Validate on a working tree flags the gitignored SDK venv as dangerous | environment: run validate on a clean export (section A) |
@@ -148,9 +149,9 @@ Run 2026-10-19, branch `feat/inject-message-delivery`, plugin `0.3.2`.
 
 | Check | Result |
 |---|---|
-| Host targeted matrix (section B) | 40 passed |
-| Host full suite (`pytest tests -q`) | 274 passed, 3 skipped |
-| Container full suite (same tree, image `localhost/hermes-e2e:local`) | 270 passed, 5 skipped, 2 known-limitation failures (D) |
+| Host targeted matrix (section B) | 41 passed |
+| Host full suite (`pytest tests -q`) | 275 passed, 3 skipped |
+| Container full suite (same tree, image `localhost/hermes-e2e:local`) | 271 passed, 5 skipped, 2 known-limitation failures (D) |
 | Container end-to-end (`run-container.sh`) | PASS, 8 model calls, 2 peer polls, outbox `attempts=0` (`a2a:t1:artifact-pos:0`) |
 | `hermes plugins validate` (clean export) | Validation passed (2 warnings, section A) |
 | `hermes plugins doctor` (clean export) | OK: discovery, manifest, import, registration; 13 tools, 3 hooks |

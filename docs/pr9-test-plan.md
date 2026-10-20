@@ -56,7 +56,7 @@ Expected: `Validation passed.` with two warnings, both accepted:
 pass; 13 tools, 3 hooks.
 
 `hermes plugins list --json` after `plugins enable` expected: `name=a2a-async`, `source=user`,
-`status=enabled`, `version=0.5.0`.
+`status=enabled`, `version=0.3.0`.
 
 Defect found by this gate and fixed here: `plugin.yaml` declared `provides_tools` but no
 `provides_hooks`, while `register()` registers `on_session_start`, `on_session_reset` and
@@ -142,7 +142,7 @@ podman run --rm --entrypoint /bin/bash -v "$PWD":/plugin:ro,z localhost/hermes-e
 
 ## E. Results at this commit
 
-Run 2026-10-19, branch `feat/inject-message-delivery`, plugin `0.5.0`.
+Run 2026-10-19, branch `feat/inject-message-delivery`, plugin `0.3.0`.
 
 | Check | Result |
 |---|---|
@@ -152,7 +152,7 @@ Run 2026-10-19, branch `feat/inject-message-delivery`, plugin `0.5.0`.
 | Container end-to-end (`run-container.sh`) | PASS, 8 model calls, 2 peer polls, outbox `attempts=0` (`a2a:t1:artifact-pos:0`) |
 | `hermes plugins validate` (clean export) | Validation passed (2 warnings, section A) |
 | `hermes plugins doctor` (clean export) | OK: discovery, manifest, import, registration; 13 tools, 3 hooks |
-| `hermes plugins list --json` (user install, enabled) | `a2a-async`, source `user`, status `enabled`, version `0.5.0` |
+| `hermes plugins list --json` (user install, enabled) | `a2a-async`, source `user`, status `enabled`, version `0.3.0` |
 
 ## F. Accepted trade-offs (documented, not defects)
 

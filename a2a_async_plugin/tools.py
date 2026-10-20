@@ -479,15 +479,24 @@ def _watch_manager(ctx: Any = None):
 
 
 def _delivery_capable(ctx: Any) -> bool:
-    """Whether this session can receive a later turn and the runtime can inject one.
+    """Whether this session can receive a later turn that the operator will actually see.
 
-    Delivery uses the public plugin surface ``PluginContext.inject_message``: the host routes the
-    text to the live CLI, TUI/desktop session or messaging chat. The session must also be one that
-    can take a later turn at all -- a one-shot/worker/stateless session accepts nothing later, so a
-    watch there would be a promise we cannot keep.
+    ``inject_message`` accepting text is not enough: a classic CLI session served by the gateway
+    runs the injected turn in its transcript but never displays it. Core exposes
+    ``async_delivery_visible()`` for exactly that distinction; when it says no, background mode
+    refuses instead of promising a result nobody can see. On a core without the capability, fall
+    back to the older async-delivery check.
     """
     if not callable(getattr(ctx, "inject_message", None)):
         return False
+    visible = getattr(ctx, "async_delivery_visible", None)
+    if callable(visible):
+        try:
+            if not bool(visible()):
+                return False
+        except Exception:
+            logger.debug("A2A: async delivery visibility probe failed", exc_info=True)
+            return False
     try:
         from gateway.session_context import async_delivery_supported
         return bool(async_delivery_supported())
@@ -575,10 +584,11 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
     # to be refused for a runtime/session reason must not leave tasks claimed.
     if not _delivery_capable(ctx):
         return (
-            "Error: this session cannot receive a later turn (one-shot, cron, Kanban/worker, a "
-            "stateless API session, or a runtime without PluginContext.inject_message), so a "
-            "background watch has nowhere to deliver its result. Use blocking a2a_await or poll "
-            "with a2a_get_task.")
+            "Error: this session cannot display a background result. The host may accept a later "
+            "turn, but it has no visible delivery path for one here (classic CLI, one-shot, cron, "
+            "Kanban/worker, a stateless API session, or a runtime without "
+            "PluginContext.inject_message), so the result would run unseen in the transcript. "
+            "Use blocking a2a_await, or run the watch in a TUI/Desktop/messaging session.")
     target = _capture_target(ctx)
     if not target["session_key"]:
         # Background delivery needs a durable route key. Hermes 0.22.2+ binds one for an

@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import os
 import pty
-import re
 import select
 import signal
 import sqlite3
@@ -325,35 +324,30 @@ def main() -> int:
     threading.Thread(target=pump, args=(master, output), daemon=True).start()
 
     try:
-        completion_request = wait_for(
+        # The classic CLI has no visible async host. The tool must refuse before it creates a
+        # watch, and the refusal must reach the model as the tool result.
+        tool_request = wait_for(
             lambda: next((r for r in CompletionServer.requests
-                          if "on peer 'peer'" in json.dumps(r.get("messages") or [])), None),
-            timeout=240, label="the completion turn at the model")
+                          if any(m.get("role") == "tool" for m in r.get("messages") or [])), None),
+            timeout=120, label="the a2a_await tool result at the model")
 
         transcript = "\n".join(output)
         (EVIDENCE / "hermes-output.txt").write_text(transcript)
-        completion_text = json.dumps(completion_request.get("messages") or [])
-        assert "peer finished t1" in completion_text, "the peer reply was not in the delivered turn"
-        assert "A2A task t1 on peer 'peer'" in completion_text, "the plugin's own framing is missing"
-        assert "peer finished t1" in completion_text
-        row = wait_for(_published_row, timeout=30, label="the outbox publication")
-        log(f"outbox row: {row['event_id']} published_at={row['published_at']}")
-
-        assert any(r.get("method") == "GetTask" for r in PeerServer.seen), "the peer was never polled"
-        assert not any(r.get("method") == "CancelTask" for r in PeerServer.seen)
-        # Watch id must have been returned by the tool: it is in the second LLM request's tool result.
-        second = next((r for r in CompletionServer.requests
-                       if any(m.get("role") == "tool" for m in r.get("messages") or [])), None)
-        assert second is not None, "the tool result never reached the model"
-        tool_text = json.dumps(second["messages"])
-        assert re.search(r"\[watch watch_[0-9a-f]+", tool_text), "a2a_await did not return a watch_id"
+        tool_text = json.dumps(tool_request.get("messages") or [])
+        assert "cannot display a background result" in tool_text, \
+            "the classic CLI did not refuse background delivery with the capability error"
+        assert "transcript" in tool_text, "the refusal did not explain the unseen transcript"
+        assert "TUI/Desktop/messaging" in tool_text, "the refusal did not name a usable surface"
+        assert _watch_rows() == 0, "a watch was persisted for a refusal"
+        assert not PeerServer.seen, "the peer was polled for a refusal"
 
         dump("summary.json", {
+            "refused": True,
             "llm_calls": len(CompletionServer.requests),
             "peer_polls": sum(PeerServer.polls.values()),
-            "publication": row,
+            "watch_rows": 0,
         })
-        log("PASS: background watch injected into the live session and acknowledged")
+        log("PASS: classic CLI refused background delivery as designed")
         return 0
     except AssertionError as exc:
         log(f"FAIL: {exc}")
@@ -402,23 +396,19 @@ def stop_stray_processes() -> None:
             pass
 
 
-def _published_row():
-    """The plugin's OWN outbox row, acknowledged by a live host (inject_message returned True)."""
+def _watch_rows() -> int:
+    """Number of persisted watches in this run's home; a refusal must leave zero."""
     db = HERMES_HOME / "a2a_tasks.db"
     if not db.exists():
-        return None
+        return 0
     try:
         con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
-        con.row_factory = sqlite3.Row
         try:
-            row = con.execute(
-                "SELECT event_id, attempts, published_at FROM a2a_watch_publications"
-                " WHERE published_at IS NOT NULL ORDER BY published_at LIMIT 1").fetchone()
+            return int(con.execute("SELECT COUNT(*) FROM a2a_watches").fetchone()[0])
         finally:
             con.close()
     except sqlite3.Error:
-        return None
-    return dict(row) if row else None
+        return 0
 
 
 if __name__ == "__main__":

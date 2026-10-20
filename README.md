@@ -113,11 +113,17 @@ Tuning: `A2A_WATCH_INTERVAL` (seconds between polls, default 5, minimum 2) and `
 finished watches and delivered events are pruned after 7 days.
 
 Requirement: background mode needs a session that can take a later turn, a runtime whose
-`PluginContext` exposes `inject_message`, and a durable route key for that session. Hermes
-0.22.2 or newer binds one for an interactive CLI; older cores do not, and the plugin refuses
-rather than using keyless injection (the host would pick whichever session is calling at flush
-time when several CLI sessions share the gateway process). One-shot, worker, cron and stateless
-API sessions are refused up front instead of starting a watch that could never deliver.
+`PluginContext` exposes `inject_message`, a durable route key for that session, and a host path
+that actually displays the result. The plugin asks core's
+`PluginContext.async_delivery_visible()` and refuses before creating a watch when that says no.
+A classic CLI session served by the gateway currently reports no visible path: the turn runs in
+the transcript but the attached terminal does not display it. TUI/Desktop and messaging sessions
+report visible, as does an in-process classic CLI. If core later adopts plugin admissions in the
+classic CLI, the capability flips and background mode works there with no plugin change. Hermes
+0.22.2 or newer binds the durable route key; older cores are refused rather than using keyless
+injection (the host would pick whichever session is calling at flush time when several CLI
+sessions share the gateway process). One-shot, worker, cron and stateless API sessions are
+refused up front instead of starting a watch that could never deliver.
 
 Injection is consent-gated per plugin by Hermes core for every gateway-routed session, including a
 classic CLI session (0.22.2+ runs those turns in the gateway):

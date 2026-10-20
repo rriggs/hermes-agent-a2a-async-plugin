@@ -523,8 +523,18 @@ def _inject(ctx: Any, target: Any, content: str) -> bool:
     ``inject_message`` is the public plugin surface: the host routes the text to the live CLI, the
     owning TUI/desktop session or the messaging chat, and returns True only when a host accepted
     it. Durability, retries and de-duplication are ours (the watch outbox), not the host's.
+
+    A keyless CLI target is process-bound: on cores that bind no route key for an interactive
+    CLI, ``inject_message`` queues to the attached CLI reference. A persisted watch rehydrated
+    in another process must not deliver into that process's different CLI session.
     """
-    session_key = str((target or {}).get("session_key") or "") if isinstance(target, dict) else ""
+    if isinstance(target, dict) and target.get("keyless_cli"):
+        if int(target.get("creator_pid") or 0) != os.getpid():
+            logger.info("A2A: dropping a process-bound CLI publication created by another process")
+            return False
+        session_key = ""
+    else:
+        session_key = str((target or {}).get("session_key") or "") if isinstance(target, dict) else ""
     try:
         return bool(ctx.inject_message(content, session_key=session_key or None))
     except Exception as exc:
@@ -581,11 +591,17 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
             "with a2a_get_task.")
     target = _capture_target(ctx)
     if not target["session_key"]:
-        # inject_message with no key is the host's "keyless" mode: it routes by whatever session
-        # is calling at flush time, which may be a different live session. Never arm a watcher
-        # that cannot be addressed back to THIS session.
-        return ("Error: this session has no route key, so a background result cannot be addressed "
-                "back to it. Use blocking a2a_await or poll with a2a_get_task.")
+        if str(target.get("surface") or "") != "cli":
+            # inject_message with no key on a gateway is keyless routing: it picks the chat
+            # from whatever session is calling at flush time, which may be a different live
+            # session. Never arm a watcher that cannot be addressed back to THIS session.
+            return ("Error: this session has no route key, so a background result cannot be "
+                    "addressed back to it. Use blocking a2a_await or poll with a2a_get_task.")
+        # 0.21.x interactive CLI: the core binds no route key, but PluginContext.inject_message
+        # queues to the attached CLI reference. The target is process-bound: a persisted watch
+        # must never be injected into a different CLI process (see _inject).
+        target["keyless_cli"] = True
+        target["creator_pid"] = os.getpid()
     manager = _watch_manager(ctx)
     owners_before = {task_id: _ownership().owner(task_id) for _agent, task_id in entries}
     try:
@@ -902,7 +918,10 @@ def _peer_message_content(peer: str, task_id: str, kind: str, text: str) -> str:
         head = f"A2A task {task_id} on peer '{peer}' reported a problem."
     else:
         head = f"A2A task {task_id} on peer '{peer}' sent a progress note."
-    return f"{head}\n\n{_bound(text)}"
+    # Background results are injected as a user turn. Peer text must carry the same untrusted
+    # boundary as inbound A2A dispatch (PRIVACY_PREFIX + injection filtering), or a peer's status
+    # text reads as if the operator said it.
+    return security.wrap_inbound(peer, f"{head}\n\n{_bound(text)}")
 
 
 def _ownership_changed_result(agent: str, task_id: str) -> str:

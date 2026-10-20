@@ -114,8 +114,14 @@ finished watches and delivered events are pruned after 7 days.
 
 Requirement: background mode needs a session that can take a later turn and a runtime whose
 `PluginContext` exposes `inject_message` (any current Hermes). One-shot, worker, cron and stateless
-API sessions are refused up front instead of starting a watch that could never deliver. For a
-messaging or gateway-hosted session, inject into that session is consent-gated per plugin:
+API sessions are refused up front instead of starting a watch that could never deliver.
+
+On Hermes 0.21.x an interactive CLI session binds no route key. The plugin still supports
+background mode there by injecting through the attached CLI reference: the target is marked
+`keyless_cli` and is process-bound, so a watch is never delivered into a different CLI process
+after a restart. A normal session end cancels its watches; a hard kill leaves them to expire.
+
+For a messaging or gateway-hosted session, injection is consent-gated per plugin:
 
 ```yaml
 plugins:
@@ -123,8 +129,11 @@ plugins:
     a2a-async:
       allow_gateway_injection: true
 ```
-On an older runtime the tool returns a clear error instead of starting a watch that could never
-deliver; blocking `a2a_await` and `a2a_get_task` keep working there.
+
+Background publications are framed with the same untrusted boundary as inbound A2A dispatch
+(`security.wrap_inbound`): the peer's text is prefixed as remote-agent content and injection
+markers are filtered before it reaches the session as a user turn. Blocking `a2a_await` and
+`a2a_get_task` do not use the injection rail.
 
 Peers are configured in `config.yaml` under `a2a_agents`. Authentication and endpoint configuration remain owned by the built-in A2A integration.
 

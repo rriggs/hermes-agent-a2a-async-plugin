@@ -56,7 +56,7 @@ Expected: `Validation passed.` with two warnings, both accepted:
 pass; 13 tools, 3 hooks.
 
 `hermes plugins list --json` after `plugins enable` expected: `name=a2a-async`, `source=user`,
-`status=enabled`, `version=0.3.0`.
+`status=enabled`, `version=0.3.1`.
 
 Defect found by this gate and fixed here: `plugin.yaml` declared `provides_tools` but no
 `provides_hooks`, while `register()` registers `on_session_start`, `on_session_reset` and
@@ -98,6 +98,8 @@ PYTHONPATH=<hermes checkout> python -m pytest -q \
 | A2-3 | P2 | The blocking await's transport-error, RPC-error and timeout exits ignored the ownership-fence verdict and returned the old caller's backlog snapshot | `tests/test_watches.py::test_a_poll_error_after_losing_ownership_does_not_return_the_backlog`, `::test_a_peer_rpc_error_after_losing_ownership_does_not_return_the_backlog`, `::test_a_timeout_after_losing_ownership_does_not_return_the_backlog` |
 | A3-1 | P1 | The blocking await acknowledged backlog by message id only: a watch poll that revised an artifact between the recorder's snapshot and consumption was marked delivered while the turn returned the old text. The terminal, transport-error, RPC-error and timeout exits all consumed a snapshot without a revision fence | `tests/test_watches.py::test_a_blocking_await_returns_the_revision_it_acknowledges`, `::test_a_transport_error_does_not_acknowledge_a_revised_backlog`, `::test_an_rpc_error_does_not_acknowledge_a_revised_backlog`, `::test_a_timeout_does_not_acknowledge_a_revised_backlog`, `tests/test_ownership.py::test_consume_refuses_a_revision_it_did_not_read` |
 | A3-2 | P2 | The artifact upsert compared text only: INPUT_REQUIRED -> COMPLETED with the same artifactId and body kept the obsolete kind, producing a false no-text placeholder after an accepted notice or a stale "needs input" after a refused one | `tests/test_watches.py::test_a_same_text_artifact_refreshes_its_kind_on_completion`, `::test_a_refused_input_notice_does_not_survive_completion`, `tests/test_ownership.py::test_an_identical_artifact_revision_stays_idempotent_but_a_kind_change_reopens` |
+| A4-1 | P1 | Hermes 0.21.x binds no route key for an interactive CLI, so `a2a_await(background=true)` refused every CLI session with "no route key". Keyless CLI delivery through the attached CLI works on that core; the target is process-bound so a rehydrated watch cannot inject into a different CLI process | `tests/test_watches.py::test_a_keyless_cli_session_can_start_a_background_watch`, `::test_a_gateway_session_without_a_route_key_is_still_refused`, `::test_a_keyless_cli_publication_uses_the_attached_cli`, `::test_a_keyless_cli_publication_from_another_process_is_refused` |
+| A4-2 | P1 | Background publications injected peer text as a `role="user"` turn with no untrusted framing and no injection filtering, unlike inbound A2A dispatch | `tests/test_watches.py::test_background_publication_frames_peer_text_as_untrusted`, `::test_a_watch_result_is_injected_as_untrusted_peer_content` |
 | API-1 | -- | `provides_hooks` missing from `plugin.yaml`; plugin API validate failed | `hermes plugins validate` (section A) |
 | API-2 | -- | Validate on a working tree flags the gitignored SDK venv as dangerous | environment: run validate on a clean export (section A) |
 | ENV-1 | -- | In the e2e image, `test_real_runtime_registration_via_hermes_plugins_list` finds no installed plugin | environment limitation, identical on `f3ddaaa` (see D) |
@@ -142,17 +144,17 @@ podman run --rm --entrypoint /bin/bash -v "$PWD":/plugin:ro,z localhost/hermes-e
 
 ## E. Results at this commit
 
-Run 2026-10-19, branch `feat/inject-message-delivery`, plugin `0.3.0`.
+Run 2026-10-19, branch `feat/inject-message-delivery`, plugin `0.3.1`.
 
 | Check | Result |
 |---|---|
-| Host targeted matrix (section B) | 37 passed |
-| Host full suite (`pytest tests -q`) | 271 passed, 3 skipped |
+| Host targeted matrix (section B) | 43 passed |
+| Host full suite (`pytest tests -q`) | 277 passed, 3 skipped |
 | Container full suite (same tree, image `localhost/hermes-e2e:local`) | 267 passed, 5 skipped, 2 known-limitation failures (D) |
 | Container end-to-end (`run-container.sh`) | PASS, 8 model calls, 2 peer polls, outbox `attempts=0` (`a2a:t1:artifact-pos:0`) |
 | `hermes plugins validate` (clean export) | Validation passed (2 warnings, section A) |
 | `hermes plugins doctor` (clean export) | OK: discovery, manifest, import, registration; 13 tools, 3 hooks |
-| `hermes plugins list --json` (user install, enabled) | `a2a-async`, source `user`, status `enabled`, version `0.3.0` |
+| `hermes plugins list --json` (user install, enabled) | `a2a-async`, source `user`, status `enabled`, version `0.3.1` |
 
 ## F. Accepted trade-offs (documented, not defects)
 

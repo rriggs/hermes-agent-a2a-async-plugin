@@ -112,16 +112,14 @@ Tuning: `A2A_WATCH_INTERVAL` (seconds between polls, default 5, minimum 2) and `
 (watch lifetime in seconds, default 604800). Publication retries back off from 5s to 5 minutes;
 finished watches and delivered events are pruned after 7 days.
 
-Requirement: background mode needs a session that can take a later turn and a runtime whose
-`PluginContext` exposes `inject_message` (any current Hermes). One-shot, worker, cron and stateless
+Requirement: background mode needs a session that can take a later turn, a runtime whose
+`PluginContext` exposes `inject_message`, and a durable route key for that session. Hermes
+0.22.2 or newer binds one for an interactive CLI; older cores do not, and the plugin refuses
+rather than using keyless injection (the host would pick whichever session is calling at flush
+time when several CLI sessions share the gateway process). One-shot, worker, cron and stateless
 API sessions are refused up front instead of starting a watch that could never deliver.
 
-On Hermes 0.21.x an interactive CLI session binds no route key. The plugin still supports
-background mode there by injecting through the attached CLI reference: the target is marked
-`keyless_cli` and is process-bound, so a watch is never delivered into a different CLI process
-after a restart. A normal session end cancels its watches; a hard kill leaves them to expire.
-
-For a messaging or gateway-hosted session, injection is consent-gated per plugin:
+For a messaging or gateway-hosted session, injection is consent-gated per plugin by Hermes core:
 
 ```yaml
 plugins:

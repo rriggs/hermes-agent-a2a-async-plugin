@@ -523,18 +523,8 @@ def _inject(ctx: Any, target: Any, content: str) -> bool:
     ``inject_message`` is the public plugin surface: the host routes the text to the live CLI, the
     owning TUI/desktop session or the messaging chat, and returns True only when a host accepted
     it. Durability, retries and de-duplication are ours (the watch outbox), not the host's.
-
-    A keyless CLI target is process-bound: on cores that bind no route key for an interactive
-    CLI, ``inject_message`` queues to the attached CLI reference. A persisted watch rehydrated
-    in another process must not deliver into that process's different CLI session.
     """
-    if isinstance(target, dict) and target.get("keyless_cli"):
-        if int(target.get("creator_pid") or 0) != os.getpid():
-            logger.info("A2A: dropping a process-bound CLI publication created by another process")
-            return False
-        session_key = ""
-    else:
-        session_key = str((target or {}).get("session_key") or "") if isinstance(target, dict) else ""
+    session_key = str((target or {}).get("session_key") or "") if isinstance(target, dict) else ""
     try:
         return bool(ctx.inject_message(content, session_key=session_key or None))
     except Exception as exc:
@@ -591,17 +581,13 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
             "with a2a_get_task.")
     target = _capture_target(ctx)
     if not target["session_key"]:
-        if str(target.get("surface") or "") != "cli":
-            # inject_message with no key on a gateway is keyless routing: it picks the chat
-            # from whatever session is calling at flush time, which may be a different live
-            # session. Never arm a watcher that cannot be addressed back to THIS session.
-            return ("Error: this session has no route key, so a background result cannot be "
-                    "addressed back to it. Use blocking a2a_await or poll with a2a_get_task.")
-        # 0.21.x interactive CLI: the core binds no route key, but PluginContext.inject_message
-        # queues to the attached CLI reference. The target is process-bound: a persisted watch
-        # must never be injected into a different CLI process (see _inject).
-        target["keyless_cli"] = True
-        target["creator_pid"] = os.getpid()
+        # Background delivery needs a durable route key. Hermes 0.22.2+ binds one for an
+        # interactive CLI session; older cores do not, and keyless injection is unsafe when
+        # several CLI sessions share the gateway process (the host would pick whichever
+        # session is calling at flush time). Refuse instead of guessing a target.
+        return ("Error: this session has no route key, so a background result cannot be addressed "
+                "back to it. Background mode requires Hermes 0.22.2 or newer. Use blocking "
+                "a2a_await or poll with a2a_get_task.")
     manager = _watch_manager(ctx)
     owners_before = {task_id: _ownership().owner(task_id) for _agent, task_id in entries}
     try:

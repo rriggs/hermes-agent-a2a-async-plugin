@@ -10,7 +10,6 @@ assert both the injected content and the durable outbox row.
 from __future__ import annotations
 
 import importlib.util
-import os
 import sqlite3
 import sys
 import threading
@@ -1805,38 +1804,15 @@ def test_a_refused_input_notice_does_not_survive_completion():
     assert manager.ownership.queued("t1") == []
 
 
-# ── Production-core findings (Hermes 0.21.x CLI, consent, untrusted text) ────
+# ── Production-core findings (route keys, untrusted text) ───────────────────
 
-def _keyless_cli_ctx(monkeypatch):
-    """A CLI host on a core that binds no route key for the session."""
+def test_a_session_without_a_route_key_is_refused(monkeypatch):
+    """0.21.x binds no route key for an interactive CLI. Keyless injection is unsafe when
+    several CLI sessions share the gateway process, so background mode must refuse rather
+    than guess a target. Background mode requires 0.22.2+ (which binds a CLI route key)."""
     from gateway.session_context import clear_session_vars
     ctx = FakeCtx()
     ctx.surface = "cli"
-    clear_session_vars([])  # 0.21.x: an interactive CLI binds no HERMES_SESSION_KEY
-    monkeypatch.setattr(tools, "_CTX", ctx)
-    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
-    return ctx
-
-
-def test_a_keyless_cli_session_can_start_a_background_watch(monkeypatch):
-    """0.21.x binds no route key for an interactive CLI. Keyless delivery through the
-    attached CLI is supported by inject_message, so the watch must not be refused."""
-    ctx = _keyless_cli_ctx(monkeypatch)
-
-    result = tools.a2a_await({"agent": "peer", "task_id": "t1", "background": True}, SESSION_ID)
-
-    assert result.startswith("[watch "), result
-    watch_id = result.split()[1]
-    target = _store().get(watch_id)["target"]
-    assert target["session_key"] == ""
-    assert target["keyless_cli"] is True
-    assert target["creator_pid"] == os.getpid()
-
-
-def test_a_gateway_session_without_a_route_key_is_still_refused(monkeypatch):
-    from gateway.session_context import clear_session_vars
-    ctx = FakeCtx()
-    ctx.surface = "telegram"
     clear_session_vars([])
     monkeypatch.setattr(tools, "_CTX", ctx)
     monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
@@ -1844,27 +1820,7 @@ def test_a_gateway_session_without_a_route_key_is_still_refused(monkeypatch):
     result = tools.a2a_await({"agent": "peer", "task_id": "t1", "background": True}, SESSION_ID)
 
     assert "no route key" in result
-
-
-def test_a_keyless_cli_publication_uses_the_attached_cli():
-    ctx = FakeCtx()
-    target = {"session_key": "", "surface": "cli", "keyless_cli": True,
-              "creator_pid": os.getpid()}
-
-    assert tools._inject(ctx, target, "peer text") is True
-    assert ctx.injected[0]["session_key"] is None
-
-
-def test_a_keyless_cli_publication_from_another_process_is_refused():
-    """A persisted keyless CLI target is process-bound: a new process must not inject it
-    into a different CLI session."""
-    ctx = FakeCtx()
-    target = {"session_key": "", "surface": "cli", "keyless_cli": True,
-              "creator_pid": os.getpid() + 1}
-
-    assert tools._inject(ctx, target, "peer text") is False
-    assert ctx.injected == []
-
+    assert "0.22.2" in result
 
 def test_background_publication_frames_peer_text_as_untrusted():
     content = tools._peer_message_content(

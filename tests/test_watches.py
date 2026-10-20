@@ -1638,3 +1638,167 @@ def test_a_timeout_after_losing_ownership_does_not_return_the_backlog(monkeypatc
 
     assert "ownership changed" in out
     assert "the adopter's result" not in out
+
+
+# ── Amy round 3 (P1 blocking revision fence, P2 kind refresh) ───────────────
+
+def test_a_blocking_await_returns_the_revision_it_acknowledges(monkeypatch):
+    """P1: consumption marked by message id alone.
+
+    The recorder returns its snapshot, a concurrent poll revises that artifact, and the
+    terminal acknowledgement marked the NEW row delivered while the turn returned OLD. The
+    caller must never acknowledge a revision it did not return.
+    """
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "unused")))
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+    monkeypatch.setattr(
+        tools, "_rpc_request",
+        lambda *a, **k: {"result": _artifact_payload(protocol.STATE_COMPLETED, "OLD")})
+    original_record = tools._record_observation
+
+    def record_then_revise(task_id, payload, peer):
+        snapshot = original_record(task_id, payload, peer)
+        manager.ownership.add_message(task_id, snapshot[0]["message_id"], "result", "NEW",
+                                      update_existing=True)
+        return snapshot
+
+    monkeypatch.setattr(tools, "_record_observation", record_then_revise)
+
+    out = tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5},
+                          SESSION_ID)
+
+    assert "NEW" in out, f"the newest revision was not returned: {out!r}"
+    assert "OLD" not in out, f"the turn returned a revision it did not acknowledge: {out!r}"
+    assert manager.ownership.queued("t1") == [], "NEW was acknowledged without being returned"
+    record = protocol.TaskStore().get("t1")
+    assert record["reply"] == "NEW", "the durable reply must be the revision that was returned"
+
+
+def test_a_transport_error_does_not_acknowledge_a_revised_backlog(monkeypatch):
+    """P1: the error exits consumed the pre-loop backlog snapshot too. A revision that lands
+    while GetTask fails must not be marked delivered with the old text."""
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "unused")))
+    _owned_task_with_backlog(manager, "OLD")
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+
+    def rpc(*_a, **_k):
+        manager.ownership.add_message("t1", "m1", "result", "NEW", update_existing=True)
+        raise RuntimeError("transport went away")
+
+    monkeypatch.setattr(tools, "_rpc_request", rpc)
+
+    out = tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5},
+                          SESSION_ID)
+
+    assert "NEW" in out
+    assert "OLD" not in out, f"the error exit returned a revision it did not acknowledge: {out!r}"
+    assert manager.ownership.queued("t1") == [], "NEW was acknowledged without being returned"
+
+
+def test_an_rpc_error_does_not_acknowledge_a_revised_backlog(monkeypatch):
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "unused")))
+    _owned_task_with_backlog(manager, "OLD")
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+
+    def rpc(*_a, **_k):
+        manager.ownership.add_message("t1", "m1", "result", "NEW", update_existing=True)
+        return {"error": {"code": -32603, "message": "peer exploded"}}
+
+    monkeypatch.setattr(tools, "_rpc_request", rpc)
+
+    out = tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5},
+                          SESSION_ID)
+
+    assert "NEW" in out
+    assert "OLD" not in out
+    assert manager.ownership.queued("t1") == []
+
+
+def test_a_timeout_does_not_acknowledge_a_revised_backlog(monkeypatch):
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_WORKING, "x")))
+    _owned_task_with_backlog(manager, "OLD")
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+
+    real_time = time.time
+    clock = {"offset": 0.0}
+    monkeypatch.setattr(tools.time, "time", lambda: real_time() + clock["offset"])
+
+    real_record = tools._record_observation
+
+    def record_then_expire(task_id, payload, peer):
+        recorded = real_record(task_id, payload, peer)
+        clock["offset"] = 3600.0  # the deadline passes after the observation
+        return recorded
+
+    monkeypatch.setattr(tools, "_record_observation", record_then_expire)
+
+    real_queued = tools._queued_backlog
+    calls = {"n": 0}
+
+    def queued_then_revise(task_id):
+        snapshot = real_queued(task_id)
+        calls["n"] += 1
+        if calls["n"] == 2:  # the timeout exit's read; the await-start read is first
+            manager.ownership.add_message(task_id, "m1", "result", "NEW", update_existing=True)
+        return snapshot
+
+    monkeypatch.setattr(tools, "_queued_backlog", queued_then_revise)
+
+    def rpc(*_a, **_k):
+        return {"result": {"id": "t1", "contextId": "ctx-1",
+                           "status": {"state": protocol.STATE_WORKING}}}
+
+    monkeypatch.setattr(tools, "_rpc_request", rpc)
+
+    out = tools.a2a_await({"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5},
+                          SESSION_ID)
+
+    assert "still working" in out
+    assert "NEW" in out
+    assert "OLD" not in out, f"the timeout exit returned a revision it did not acknowledge: {out!r}"
+    assert manager.ownership.queued("t1") == []
+
+
+def test_a_same_text_artifact_refreshes_its_kind_on_completion():
+    """P2: the artifact upsert compared text only, so INPUT_REQUIRED -> COMPLETED with the same
+    artifactId and body kept kind='input-required'. The completion then looked like a task with
+    no result and published a false placeholder."""
+    ctx = FakeCtx()
+    manager = _manager(
+        ScriptedPoll(_artifact_payload(protocol.STATE_INPUT_REQUIRED, "SAME")), ctx=ctx)
+    _add(manager)
+    manager.run_once(now=1_000.0)
+    assert any("needs input" in item["content"] for item in ctx.injected)
+    ctx.injected.clear()
+
+    manager.poll = ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "SAME"))
+    _add(manager)
+    manager.run_once(now=2_000.0)
+
+    assert any("returned a result" in item["content"] and "SAME" in item["content"]
+               for item in ctx.injected), f"the completion was replaced: {ctx.injected}"
+    assert not any("no text reply" in item["content"] for item in ctx.injected), (
+        "a real artifact must not trigger the no-text placeholder")
+    assert manager.ownership.queued("t1") == []
+
+
+def test_a_refused_input_notice_does_not_survive_completion():
+    """P2: a refused INPUT_REQUIRED notice kept kind='input-required' after the same-text
+    completion, so accepting delivery then sent 'needs input ...' for a finished task."""
+    ctx = FlakyCtx()
+    manager = _manager(
+        ScriptedPoll(_artifact_payload(protocol.STATE_INPUT_REQUIRED, "SAME")), ctx=ctx)
+    _add(manager)
+    manager.run_once(now=1_000.0)
+    assert ctx.injected == []
+
+    ctx.fail = False
+    manager.poll = ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "SAME"))
+    _add(manager)
+    manager.run_once(now=2_000.0)
+
+    assert not any("needs input" in item["content"] for item in ctx.injected), (
+        f"a finished task falsely requests further input: {ctx.injected}")
+    assert any("returned a result" in item["content"] and "SAME" in item["content"]
+               for item in ctx.injected), f"the real result was not delivered: {ctx.injected}"
+    assert manager.ownership.queued("t1") == []

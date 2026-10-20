@@ -699,3 +699,50 @@ def test_a_malformed_publication_row_cannot_block_a_release():
             "SELECT event_id FROM a2a_watch_publications")}
     assert "evt-valid" not in remaining, "a valid pending publication must still be dropped"
     assert "evt-bad" in remaining, "an unreadable row cannot be attributed and is left alone"
+
+
+# ── Amy round 3: revision fences ────────────────────────────────────────────
+
+def test_consume_refuses_a_revision_it_did_not_read():
+    """P1: acknowledgement is fenced on the exact revisions the caller returned.
+
+    A revision that moved between the snapshot and the transaction must not be marked
+    delivered; the caller re-reads and returns the newer content instead.
+    """
+    _task("t1")
+    store = _store()
+    assert store.acquire("t1", SESSION_A)
+    store.add_message("t1", "m1", "result", "OLD")
+    [snapshot] = store.queued("t1")
+    store.add_message("t1", "m1", "result", "NEW", update_existing=True)
+
+    with pytest.raises(ownership.RevisionConflict):
+        store.consume_if_owned(
+            "t1", SESSION_A, ["m1"],
+            expected_revisions={"m1": (snapshot["text"], snapshot["kind"])})
+    assert [m["text"] for m in store.queued("t1")] == ["NEW"], (
+        "nothing may be acknowledged when the revision moved")
+
+    assert store.consume_if_owned(
+        "t1", SESSION_A, ["m1"],
+        expected_revisions={"m1": ("NEW", "result")}) is True
+    assert store.queued("t1") == []
+
+
+def test_an_identical_artifact_revision_stays_idempotent_but_a_kind_change_reopens():
+    """P2: the revision predicate is (text, kind), not text alone."""
+    _task("t1")
+    store = _store()
+    assert store.acquire("t1", SESSION_A)
+    assert store.add_message("t1", "a1", "input-required", "SAME",
+                             update_existing=True) is True
+    store.mark_delivered("t1", ["a1"], SESSION_A)
+
+    assert store.add_message("t1", "a1", "input-required", "SAME",
+                             update_existing=True) is False
+    assert store.queued("t1") == [], "an identical revision must not requeue a delivered message"
+
+    assert store.add_message("t1", "a1", "result", "SAME", update_existing=True) is True
+    [row] = store.queued("t1")
+    assert (row["kind"], row["text"]) == ("result", "SAME"), (
+        "the lifecycle classification is part of the revision")

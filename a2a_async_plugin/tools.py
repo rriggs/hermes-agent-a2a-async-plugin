@@ -1345,9 +1345,20 @@ def a2a_cancel(args: dict, **_: Any) -> str:
     if "error" in resp:
         return _peer_rpc_error(resp, agent)
     payload = resp.get("result", {})
-    state = ""
+    raw_state = ""
     if isinstance(payload, dict):
-        state = _short_state(str((payload.get("status") or {}).get("state", "")))
+        raw_state = str((payload.get("status") or {}).get("state") or "")
+    state = _short_state(raw_state)
+    if raw_state:
+        # CancelTask returns the task the peer now holds (A2A v1.0), so this is an authoritative
+        # observation, not a guess. Fold it into the local snapshot: without this, a successful
+        # cancel leaves a2a_list reporting the pre-cancel state (working/submitted) until some
+        # later poll happens to reconcile the row. complete() is idempotent, so a row that is
+        # already terminal locally is never rewritten by a stale peer reply.
+        if raw_state in protocol.TERMINAL_STATES:
+            _task_store().complete(task_id, raw_state, _reply_text_from_result(payload))
+        else:
+            _task_store().set_state(task_id, raw_state)
     return f"[{agent} · task {task_id} · {state or 'cancel requested'}]"
 
 

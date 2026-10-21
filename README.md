@@ -110,6 +110,9 @@ Semantics:
   peers, credentials and transcripts resolve against that profile even in a multiplexed gateway.
 - `a2a_watch_cancel(watch_id)` stops local polling only. The remote task keeps running;
   `a2a_cancel(agent, task_id)` remains the separate, best-effort remote cancellation request.
+  A `CancelTask` reply carries the task the peer now holds, so that state is folded into the local
+  snapshot: `a2a_list` shows a successful cancel immediately instead of the pre-cancel state. A
+  bare success with no task body changes nothing, because it is not evidence of any state.
 - A local watch expiry (default 7 days), cancellation, or repeated polling failure describes the
   watcher, not the peer: it publishes a `watch-error` / `watch-expired` notice and never marks the
   remote task failed. After 12 consecutive polling errors with exponential backoff the task is

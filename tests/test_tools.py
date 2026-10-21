@@ -227,3 +227,87 @@ def test_a2a_list_does_not_wait_for_the_write_lock(monkeypatch, tmp_path):
 
     assert "t-profile" in out
     assert elapsed < 5.0, f"the listing blocked on the writer for {elapsed:.1f}s"
+
+
+def _seed_outbound(task_id: str, state: str = "") -> None:
+    store = tools.protocol.TaskStore()
+    store.create(task_id, f"ctx-{task_id}", "peer", direction="outbound", ownership="remote",
+                 remote_state=tools.protocol.STATE_SUBMITTED)
+    if state:
+        store.set_state(task_id, state)
+
+
+def test_cancel_records_the_peers_terminal_state(monkeypatch):
+    """A successful CancelTask carries the task the peer now holds. Fold it into the local
+    snapshot, or a2a_list keeps reporting the pre-cancel state until some later poll."""
+    server, _url = peer_server(monkeypatch)
+    try:
+        _seed_outbound("task-c1", tools.protocol.STATE_WORKING)
+        Peer.response = {"id": "task-c1", "contextId": "ctx-task-c1",
+                         "status": {"state": tools.protocol.STATE_CANCELED}}
+
+        out = tools.a2a_cancel({"agent": "peer", "task_id": "task-c1"})
+
+        assert "canceled" in out, out
+        rec = tools.protocol.TaskStore().get("task-c1")
+        assert rec["state"] == tools.protocol.STATE_CANCELED
+        assert rec["remote_state"] == tools.protocol.STATE_CANCELED
+        listed = tools.a2a_list({"kind": "tasks"})
+        assert "state=canceled" in listed, listed
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_cancel_records_a_nonterminal_peer_state(monkeypatch):
+    """A peer may accept the cancel while the task is still running. Record that observation
+    instead of inventing a terminal state."""
+    server, _url = peer_server(monkeypatch)
+    try:
+        _seed_outbound("task-c2")
+        Peer.response = {"id": "task-c2", "contextId": "ctx-task-c2",
+                         "status": {"state": tools.protocol.STATE_WORKING}}
+
+        tools.a2a_cancel({"agent": "peer", "task_id": "task-c2"})
+
+        rec = tools.protocol.TaskStore().get("task-c2")
+        assert rec["state"] == tools.protocol.STATE_WORKING
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_cancel_without_a_task_body_leaves_the_snapshot_alone(monkeypatch):
+    """A bare success is not evidence of any state: do not guess one."""
+    server, _url = peer_server(monkeypatch)
+    try:
+        _seed_outbound("task-c3")
+        Peer.response = {}
+
+        out = tools.a2a_cancel({"agent": "peer", "task_id": "task-c3"})
+
+        assert "cancel requested" in out, out
+        assert tools.protocol.TaskStore().get("task-c3")["state"] == tools.protocol.STATE_SUBMITTED
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_cancel_does_not_rewrite_a_locally_terminal_row(monkeypatch):
+    """complete() is idempotent: a stale peer reply cannot overwrite a terminal local row."""
+    server, _url = peer_server(monkeypatch)
+    try:
+        _seed_outbound("task-c4")
+        tools.protocol.TaskStore().complete(
+            "task-c4", tools.protocol.STATE_COMPLETED, "final answer")
+        Peer.response = {"id": "task-c4", "contextId": "ctx-task-c4",
+                         "status": {"state": tools.protocol.STATE_CANCELED}}
+
+        tools.a2a_cancel({"agent": "peer", "task_id": "task-c4"})
+
+        rec = tools.protocol.TaskStore().get("task-c4")
+        assert rec["state"] == tools.protocol.STATE_COMPLETED
+        assert rec["reply"] == "final answer"
+    finally:
+        server.shutdown()
+        server.server_close()

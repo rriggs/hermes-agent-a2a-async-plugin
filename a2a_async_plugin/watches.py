@@ -1074,8 +1074,12 @@ class WatchStatusLine:
             return f"{glyph} a2a {peer} · {item_state or state}"
         shown = outcomes[:STATUS_MAX_PEERS]
         extra = f" +{len(outcomes) - len(shown)}" if len(outcomes) > len(shown) else ""
+        states = {item_state for _peer, item_state in outcomes}
+        glyph = ("!" if "input-required" in states
+                 else "✗" if states & {"failed", "rejected"}
+                 else "✓" if states == {"completed"} else "⧗")
         summary = " · ".join(f"{peer} {item_state or 'done'}" for peer, item_state in shown)
-        return f"⧗ a2a {len(outcomes)} done · {summary}{extra}"
+        return f"{glyph} a2a {len(outcomes)} done · {summary}{extra}"
 
 
 # --------------------------------------------------------------------------

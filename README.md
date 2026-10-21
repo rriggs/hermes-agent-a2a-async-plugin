@@ -76,6 +76,13 @@ if the process dies in that window the message is delivered again on the next at
 is preferable to a silently dropped result, and the host treats a repeated result as another
 message, not as a protocol duplicate.
 
+Every injected turn starts with a one-line locator, for example
+`[A2A result · researcher · task t1]`, followed by the untrusted-input frame and then the peer's
+text. The locator exists because the TUI collapses a queued prompt to a single truncated line,
+which used to be the identical frame for every result. It carries plugin-authored metadata only:
+peer, task and kind are charset-checked, and a task id that fails the check or is over-long shows
+as `?` rather than being partially sanitized into text above the boundary.
+
 ```text
 a2a_await(agent="researcher", task_id="task-1", background=true)
 a2a_await(background=true, tasks=[{agent: "researcher", task_id: "task-1"},

@@ -923,6 +923,24 @@ def _publish_queued(ctx: Any, task_id: str, peer: str, session_id: str, target: 
 # with room for the header: an oversized result must arrive truncated, not retry forever.
 MAX_NOTIFICATION_CHARS = 24_000
 
+# Characters allowed in the one-line locator that sits ABOVE the untrusted boundary.
+_LOCATOR_SAFE = frozenset("._:-")
+
+
+def _locator_token(value: Any, limit: int = 40) -> str:
+    """Reduce a value to a short token that is safe to place above the untrusted boundary.
+
+    Task ids come from the peer. Anything outside a conservative charset (or over the length
+    cap) is replaced wholesale instead of partially sanitized: a fragment of peer text above the
+    frame is exactly what the frame exists to prevent.
+    """
+    raw = str(value or "").strip()
+    if not raw or len(raw) > limit:
+        return "?"
+    if not all(ch.isalnum() or ch in _LOCATOR_SAFE for ch in raw):
+        return "?"
+    return raw
+
 
 def _bound(text: str, limit: int = MAX_NOTIFICATION_CHARS) -> str:
     body = str(text or "")
@@ -944,7 +962,14 @@ def _peer_message_content(peer: str, task_id: str, kind: str, text: str) -> str:
     # Background results are injected as a user turn. Peer text must carry the same untrusted
     # boundary as inbound A2A dispatch (PRIVACY_PREFIX + injection filtering), or a peer's status
     # text reads as if the operator said it.
-    return security.wrap_inbound(peer, f"{head}\n\n{_bound(text)}")
+    #
+    # The locator line exists because the TUI collapses a queued prompt to one truncated line:
+    # every message used to begin with the identical frame, so queued results were
+    # indistinguishable. It carries plugin-authored metadata only, reduced to safe tokens.
+    label = {"result": "A2A result", "input-required": "A2A input needed",
+             "error": "A2A error"}.get(kind, "A2A progress")
+    locator = f"[{label} · {_locator_token(peer)} · task {_locator_token(task_id)}]"
+    return locator + "\n" + security.wrap_inbound(peer, f"{head}\n\n{_bound(text)}")
 
 
 def _ownership_changed_result(agent: str, task_id: str) -> str:

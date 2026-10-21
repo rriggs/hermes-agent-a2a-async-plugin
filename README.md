@@ -112,6 +112,28 @@ Tuning: `A2A_WATCH_INTERVAL` (seconds between polls, default 5, minimum 2) and `
 (watch lifetime in seconds, default 604800). Publication retries back off from 5s to 5 minutes;
 finished watches and delivered events are pruned after 7 days.
 
+### Live status line
+
+While a watch runs, the session that started it gets one editable status notice through
+`PluginContext.post_message` / `PluginMessage.edit`. On a TUI that is a status-bar line; a
+messaging chat gets an editable message when the adapter supports editing. The line is rebuilt
+from the watch store and updated in place:
+
+```text
+⧗ a2a 2 tasks · working · dev-a 1m02s · dev-b 0m31s
+✓ a2a dev-a · completed
+```
+
+State changes (a terminal result, `input-required`, cancellation, expiry) repaint immediately;
+elapsed-time refreshes are throttled to every 15s, so a 5s poll does not repaint the status bar.
+It is one notice per session: a second watch edits the same line instead of stacking another.
+
+The line is presentation only. A host without `post_message`, a refused post, or a surface that
+cannot show notices still gets the durable completion turn. A gateway restart drops the notice
+handle: the watch keeps polling and still delivers, but the line does not come back until a new
+watch starts in that session. `a2a_list(kind="watches")` reports the same state on demand,
+restart included.
+
 Requirement: background mode needs a session that can take a later turn, a runtime whose
 `PluginContext` exposes `inject_message`, a durable route key for that session, and a host path
 that actually displays the result. The plugin asks core's

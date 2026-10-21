@@ -62,6 +62,11 @@ LEASE_S = 90.0
 # exponential backoff capped at MAX_BACKOFF_S. The remote task is never marked failed by this.
 MAX_CONSECUTIVE_ERRORS = 12
 MAX_BACKOFF_S = 600.0
+# The live status line is a status-bar notice: it is edited in place, so it must not repaint the
+# TUI on every 5s poll. State changes bypass this; elapsed-time refreshes wait for it.
+STATUS_REFRESH_S = 15.0
+# Status lines are one truncated line in the status rule; show at most this many peers by name.
+STATUS_MAX_PEERS = 2
 # Publication retries are independent of polling: a failed publish is retried every few seconds,
 # backing off to five minutes, and survives restarts.
 PUBLICATION_BACKOFF_S = 5.0
@@ -219,6 +224,69 @@ class WatchStore:
         watch["target"] = _load_target(watch.get("target_json"))
         return watch
 
+    def status_rows(self, session_id: str) -> list[dict]:
+        """This session's live watches with their unfinished items, oldest watch first.
+
+        Input for the status line only: finished items are omitted (the watch is settling or
+        already settled), and no target is decoded because the summary never shows it.
+        """
+        if not session_id:
+            return []
+        with self._session() as con:
+            watches = [dict(r) for r in con.execute(
+                """SELECT watch_id, state, created_at FROM a2a_watches
+                    WHERE session_id=? AND state IN (?, ?) ORDER BY created_at""",
+                (session_id, WATCH_ACTIVE, WATCH_EXPIRING)).fetchall()]
+            for watch in watches:
+                watch["items"] = [dict(r) for r in con.execute(
+                    """SELECT peer, task_id, state, errors, completed_at FROM a2a_watch_items
+                        WHERE watch_id=? AND completed_at IS NULL ORDER BY peer, task_id""",
+                    (watch["watch_id"],)).fetchall()]
+        return watches
+
+    def last_watch(self, session_id: str) -> Optional[dict]:
+        """The most recently settled watch of one session, with every item and its outcome."""
+        if not session_id:
+            return None
+        with self._session() as con:
+            row = con.execute(
+                """SELECT * FROM a2a_watches
+                    WHERE session_id=? AND state NOT IN (?, ?)
+                    ORDER BY updated_at DESC LIMIT 1""",
+                (session_id, WATCH_ACTIVE, WATCH_EXPIRING)).fetchone()
+            if row is None:
+                return None
+            watch = dict(row)
+            watch["items"] = [dict(r) for r in con.execute(
+                """SELECT peer, task_id, state, short_state, completed_at FROM a2a_watch_items
+                    WHERE watch_id=? ORDER BY peer, task_id""",
+                (watch["watch_id"],)).fetchall()]
+        return watch
+
+    def active_sessions(self) -> list[str]:
+        """Distinct session ids with a live watch (status-line refresh target)."""
+        with self._session() as con:
+            rows = con.execute(
+                """SELECT DISTINCT session_id FROM a2a_watches
+                    WHERE state IN (?, ?) AND session_id<>''""",
+                (WATCH_ACTIVE, WATCH_EXPIRING)).fetchall()
+        return [str(r["session_id"]) for r in rows]
+
+    def list_watches(self, limit: int = 50) -> list[dict]:
+        """Every persisted watch, live ones first, then the most recently touched."""
+        with self._session() as con:
+            watches = [dict(r) for r in con.execute(
+                """SELECT * FROM a2a_watches
+                    ORDER BY (state IN (?, ?)) DESC, updated_at DESC LIMIT ?""",
+                (WATCH_ACTIVE, WATCH_EXPIRING, max(1, int(limit)))).fetchall()]
+            for watch in watches:
+                watch["items"] = [dict(r) for r in con.execute(
+                    """SELECT peer, task_id, state, short_state, errors, completed_at,
+                              updated_at
+                        FROM a2a_watch_items WHERE watch_id=? ORDER BY peer, task_id""",
+                    (watch["watch_id"],)).fetchall()]
+            return watches
+
     def active_count(self) -> int:
         with self._session() as con:
             row = con.execute(
@@ -326,11 +394,11 @@ class WatchStore:
         with self._session() as con:
             con.execute(
                 f"""UPDATE a2a_watch_items
-                      SET state=?, context_id=COALESCE(NULLIF(?, ''), context_id),
+                      SET state=?, short_state=?, context_id=COALESCE(NULLIF(?, ''), context_id),
                           errors=0, next_poll_at=?, updated_at=?
                     WHERE watch_id=? AND peer=? AND task_id=?{fence_sql}""",
-                (state or "", context_id or "", next_poll_at, now, watch_id, peer, task_id,
-                 *fence_params))
+                (state or "", _short_state(state) if state else "",
+                 context_id or "", next_poll_at, now, watch_id, peer, task_id, *fence_params))
             con.commit()
 
     def record_error(self, watch_id: str, peer: str, task_id: str, message: str,
@@ -354,17 +422,19 @@ class WatchStore:
         return int(row["errors"]) if row else 0
 
     def mark_item(self, watch_id: str, peer: str, task_id: str, item_state: str,
-                  published_state: str = "", owner: Optional[str] = None) -> None:
+                  published_state: str = "", owner: Optional[str] = None,
+                  short_state: str = "") -> None:
         now = time.time()
         fence_sql, fence_params = self._fence(owner)
         with self._session() as con:
             con.execute(
                 f"""UPDATE a2a_watch_items
                       SET state=?, published_state=CASE WHEN ?='' THEN published_state ELSE ? END,
+                          short_state=CASE WHEN ?='' THEN short_state ELSE ? END,
                           errors=0, next_poll_at=?, completed_at=?, updated_at=?
                     WHERE watch_id=? AND peer=? AND task_id=?{fence_sql}""",
-                (item_state, published_state, published_state, now, now, now,
-                 watch_id, peer, task_id, *fence_params))
+                (item_state, published_state, published_state, short_state, short_state,
+                 now, now, now, watch_id, peer, task_id, *fence_params))
             con.commit()
 
     def settle(self, watch_id: str, now: Optional[float] = None) -> str:
@@ -837,6 +907,177 @@ def _reply_text(payload: dict) -> str:
     return (tools._reply_text_from_result(payload) or "").strip()
 
 
+def _age(seconds: float) -> str:
+    """Compact elapsed label: 42s, 3m07s, 2h05m."""
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, sec = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+# --------------------------------------------------------------------------
+# Status line
+# --------------------------------------------------------------------------
+
+class WatchStatusLine:
+    """One editable status notice per session: what that session's watches are doing.
+
+    Delivery uses the public plugin message surface, not Hermes internals:
+    ``PluginContext.post_message`` returns a handle bound to the calling session, and
+    ``PluginMessage.edit`` replaces that same sticky notice in place. The handle is created inside
+    the tool call, the only place a session is bound, and the poller thread edits it later (edits
+    are thread-safe and hop to the gateway loop).
+
+    Everything here is best-effort presentation. A host without ``post_message``, a refused post
+    (classic CLI, messaging adapter without editing), or a closed viewer means no line -- never a
+    failed watch. The completion delivery is a separate, durable path.
+    """
+
+    def __init__(self, manager: "WatchManager", *, clock: Callable[[], float] = time.time,
+                 min_interval: float = STATUS_REFRESH_S) -> None:
+        self.manager = manager
+        self.clock = clock
+        self.min_interval = max(0.0, float(min_interval))
+        self._handles: dict[str, Any] = {}
+        self._text: dict[str, str] = {}
+        self._posted_at: dict[str, float] = {}
+
+    # -- publishing -------------------------------------------------------
+    def post(self, session_id: str, text: str) -> bool:
+        """Create the session's status notice; False when this host cannot show one."""
+        ctx = getattr(self.manager, "ctx", None)
+        post = getattr(ctx, "post_message", None)
+        if not session_id or not text or not callable(post):
+            return False
+        if self._handles.get(session_id) is not None:
+            # A second watch in the same session updates the line instead of stacking a new
+            # notice behind the first (the TUI shows one notice at a time anyway).
+            return self.refresh(session_id, force=True, text=text)
+        try:
+            handle = post(text)
+        except Exception:
+            logger.debug("A2A: status post failed", exc_info=True)
+            return False
+        if not getattr(handle, "ok", False):
+            logger.debug("A2A: status post refused: %s", getattr(handle, "error", "?"))
+            return False
+        self._handles[session_id] = handle
+        self._text[session_id] = text
+        self._posted_at[session_id] = self.clock()
+        return True
+
+    def live(self, session_id: str) -> bool:
+        """Whether this session currently has a status notice we can still edit."""
+        return session_id in self._handles
+
+    def refresh(self, session_id: str, *, force: bool = False,
+                text: Optional[str] = None) -> bool:
+        """Recompute (or accept) the summary and edit the notice when it changed.
+
+        ``force`` is for state changes (a terminal result, a pause, a cancellation): they must
+        land now. Without it the edit waits for ``min_interval`` so a 5s poll does not repaint the
+        status bar on every pass.
+        """
+        handle = self._handles.get(session_id)
+        if handle is None:
+            return False
+        text = self.render(session_id) if text is None else text
+        if not text or text == self._text.get(session_id):
+            return False
+        now = self.clock()
+        if not force and now - self._posted_at.get(session_id, 0.0) < self.min_interval:
+            return False
+        try:
+            result = handle.edit(text)
+        except Exception:
+            logger.debug("A2A: status edit failed", exc_info=True)
+            return False
+        if not isinstance(result, dict) or not result.get("ok"):
+            logger.debug("A2A: status edit refused: %s",
+                         result.get("error") if isinstance(result, dict) else result)
+            return False
+        self._text[session_id] = text
+        self._posted_at[session_id] = now
+        return True
+
+    def render(self, session_id: str) -> str:
+        """The line for this session: live watches first, else the last settled one."""
+        try:
+            active = self.manager.store.status_rows(session_id)
+        except Exception:
+            logger.debug("A2A: status read failed", exc_info=True)
+            return ""
+        if active:
+            return self._render_active(active, self.clock())
+        try:
+            last = self.manager.store.last_watch(session_id)
+        except Exception:
+            return ""
+        return self._render_settled(last) if last else ""
+
+    def forget(self, session_id: str) -> None:
+        """Drop the handle (the notice itself cannot be cleared by a plugin)."""
+        self._handles.pop(session_id, None)
+        self._text.pop(session_id, None)
+        self._posted_at.pop(session_id, None)
+
+    def reset(self) -> None:
+        """Forget every handle: the manager is being torn down or reloaded."""
+        self._handles.clear()
+        self._text.clear()
+        self._posted_at.clear()
+
+    # -- rendering --------------------------------------------------------
+    @staticmethod
+    def _render_active(watches: list[dict], now: float) -> str:
+        items: list[tuple[str, str, str]] = []
+        for watch in watches:
+            age = _age(now - float(watch.get("created_at") or now))
+            for item in watch.get("items") or []:
+                peer = str(item.get("peer") or "?")
+                raw_state = str(item.get("state") or "")
+                state = _short_state(raw_state) if raw_state else "working"
+                items.append((peer, state.replace("-", " "), age))
+        if not items:
+            return ""
+        states = {state for _peer, state, _age_text in items}
+        if len(items) == 1:
+            peer, state, age = items[0]
+            return f"⧗ a2a {peer} · {state} · {age}"
+        state = states.pop() if len(states) == 1 else "watching"
+        shown = items[:STATUS_MAX_PEERS]
+        extra = f" +{len(items) - len(shown)}" if len(items) > len(shown) else ""
+        peers = " · ".join(f"{peer} {age}" for peer, _state, age in shown)
+        return f"⧗ a2a {len(items)} tasks · {state} · {peers}{extra}"
+
+    @staticmethod
+    def _render_settled(watch: dict) -> str:
+        state = str(watch.get("state") or "")
+        if state == WATCH_CANCELED:
+            return "⧗ a2a watch stopped"
+        if state == WATCH_EXPIRED:
+            return "⧗ a2a watch expired"
+        outcomes = [(str(item.get("peer") or "?"),
+                     _short_state(str(item.get("short_state") or item.get("state") or "")))
+                    for item in watch.get("items") or []]
+        if not outcomes:
+            return ""
+        if len(outcomes) == 1:
+            peer, item_state = outcomes[0]
+            glyph = ("✓" if item_state == "completed"
+                     else "✗" if item_state in ("failed", "rejected")
+                     else "!" if item_state == "input-required" else "⊘")
+            return f"{glyph} a2a {peer} · {item_state or state}"
+        shown = outcomes[:STATUS_MAX_PEERS]
+        extra = f" +{len(outcomes) - len(shown)}" if len(outcomes) > len(shown) else ""
+        summary = " · ".join(f"{peer} {item_state or 'done'}" for peer, item_state in shown)
+        return f"⧗ a2a {len(outcomes)} done · {summary}{extra}"
+
+
 # --------------------------------------------------------------------------
 # Manager
 # --------------------------------------------------------------------------
@@ -879,6 +1120,11 @@ class WatchManager:
         # and invalidates the request, so a poller cannot outlive a stop() that already returned.
         self._stop_epoch = 0
         self._restart_epoch = 0
+        # The live status line: one editable notice per session. `_status_dirty` carries the
+        # sessions whose state changed this pass so their edit skips the repaint throttle.
+        self._status = WatchStatusLine(self, clock=self.clock)
+        self._status_dirty: set[str] = set()
+        self._status_lock = threading.Lock()
 
     # -- lifecycle --------------------------------------------------------
     def start(self) -> "WatchManager":
@@ -910,6 +1156,9 @@ class WatchManager:
             self._stop_epoch += 1
             # A stop after a deferred start cancels the hand-over: the caller wants it stopped.
             self._restart_requested = False
+        # The handles belong to this process's gateway loop; a teardown or reload must not edit
+        # a notice through a stale target.
+        self._status.reset()
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
         with self._lifecycle:
@@ -976,7 +1225,39 @@ class WatchManager:
                 acquired.append(task_id)
             watch = self.store.get(watch_id) or {"watch_id": watch_id}
         self.start()
+        # Post the live line from INSIDE the tool call: this is the only context where a session
+        # is bound, and the returned handle is what the poller edits afterwards.
+        if str(session_id or "") and callable(getattr(self.ctx, "post_message", None)):
+            self._status.post(str(session_id), self._status.render(str(session_id)))
         return watch
+
+    def status_live(self, session_id: str) -> bool:
+        """Whether this session has a live status notice (diagnostics and the tool reply)."""
+        return self._status.live(str(session_id or ""))
+
+    # -- status line ------------------------------------------------------
+    def _mark_status_dirty(self, session_id: str) -> None:
+        if not session_id:
+            return
+        with self._status_lock:
+            self._status_dirty.add(session_id)
+
+    def _refresh_status(self) -> None:
+        """Refresh every session with live work, forcing the ones whose state just changed."""
+        with self._status_lock:
+            dirty = set(self._status_dirty)
+            self._status_dirty.clear()
+        try:
+            sessions = set(self.store.active_sessions())
+        except Exception:
+            logger.debug("A2A: status session probe failed", exc_info=True)
+            sessions = set()
+        # A session whose last watch just settled has no active row left; `dirty` still names it
+        # so its final line lands now rather than on the next poll.
+        for session_id in sessions | dirty:
+            if not self._status.live(session_id):
+                continue
+            self._status.refresh(session_id, force=session_id in dirty)
 
     def publish_if_owned(self, session_id: str, task_id: str, publish,
                          mark_messages: Iterable[str] = (),
@@ -988,12 +1269,20 @@ class WatchManager:
 
     def cancel(self, watch_id: str, *, session_id: str = "") -> Optional[str]:
         with self._scope():
-            return self.store.cancel(watch_id, session_id=session_id)
+            watch = self.store.get(watch_id) or {}
+            prior = self.store.cancel(watch_id, session_id=session_id)
+        if prior == WATCH_ACTIVE:
+            # The caller is in a tool call with a live viewer: show the stop now.
+            self._status.refresh(str(watch.get("session_id") or session_id or ""), force=True)
+        return prior
 
     def cancel_session(self, session_id: str, task_ids: Optional[Iterable[str]] = None) -> int:
         """Stop polling what a session no longer owns (session end or an ownership release)."""
         with self._scope():
-            return self.store.cancel_session(session_id, task_ids=task_ids)
+            stopped = self.store.cancel_session(session_id, task_ids=task_ids)
+        if stopped:
+            self._status.refresh(str(session_id or ""), force=True)
+        return stopped
 
     def rehydrate(self) -> int:
         """Resume persisted watches, undelivered publications and unowned-task timers.
@@ -1029,6 +1318,7 @@ class WatchManager:
                 # leaves the watch in 'expiring', which the next pass finishes.
                 self._enqueue_expiry(expired)
                 self.store.mark_expired(expired["watch_id"], now)
+                self._mark_status_dirty(str(expired.get("session_id") or ""))
             for watch in self.store.due(now):
                 if not self.store.claim(watch["watch_id"], self.owner, now):
                     continue
@@ -1038,6 +1328,7 @@ class WatchManager:
                     self.store.release(watch["watch_id"], self.owner)
             self.flush_publications(now)
             self._maintain_unowned(now)
+            self._refresh_status()
             self.store.prune(now)
         return polls
 
@@ -1219,18 +1510,19 @@ class WatchManager:
         raw_state = str((payload.get("status") or {}).get("state") or "")
         context_id = str(payload.get("contextId") or "")
         task_id, peer, watch_id = item["task_id"], item["peer"], watch["watch_id"]
+        session_id = str(watch.get("session_id") or "")
         text = _reply_text(payload)
 
         if raw_state in protocol.TERMINAL_STATES:
             self._reconcile_local_task(task_id, raw_state, text, context_id, peer)
+            self._mark_status_dirty(session_id)
         elif raw_state == protocol.STATE_INPUT_REQUIRED:
-            pass  # paused after the notice is durably queued (a failed enqueue must retry)
+            self._mark_status_dirty(session_id)
         else:
             self.store.record_working(watch_id, peer, task_id, raw_state, context_id,
                                       next_poll_at=now + self.interval, owner=self.owner)
 
         queued = self._record_messages(task_id, peer, payload, raw_state)
-        session_id = str(watch.get("session_id") or "")
         delivered: list[str] = []
         enqueue_failed = False
         # Artifacts are deliverables, not progress notes: a streaming peer that grows one
@@ -1264,13 +1556,15 @@ class WatchManager:
         # failed enqueue leaves the item open, so the next poll retries it instead of losing the
         # completion with the item already closed.
         if raw_state in protocol.TERMINAL_STATES and not enqueue_failed:
-            self.store.mark_item(watch_id, peer, task_id, ITEM_DONE, owner=self.owner)
+            self.store.mark_item(watch_id, peer, task_id, ITEM_DONE,
+                                 short_state=_short_state(raw_state), owner=self.owner)
         elif raw_state == protocol.STATE_INPUT_REQUIRED and not enqueue_failed:
             # Non-terminal by design: the peer needs a follow-up before it can finish. Only now,
             # with the notice queued, is it safe to stop polling this task.
             self.store.record_working(watch_id, peer, task_id, raw_state, context_id,
                                       next_poll_at=float("inf"), owner=self.owner)
-            self.store.mark_item(watch_id, peer, task_id, ITEM_PAUSED, owner=self.owner)
+            self.store.mark_item(watch_id, peer, task_id, ITEM_PAUSED,
+                                 short_state=_short_state(raw_state), owner=self.owner)
 
     def _record_messages(self, task_id: str, peer: str, payload: dict,
                          raw_state: str) -> list[dict]:
@@ -1373,6 +1667,7 @@ class WatchManager:
                       "remote_state": item["state"], "error": message[:300]})
         self.store.mark_item(watch["watch_id"], item["peer"], item["task_id"], ITEM_UNWATCHED,
                              owner=self.owner)
+        self._mark_status_dirty(str(watch.get("session_id") or ""))
 
     def _enqueue_expiry(self, watch: dict) -> None:
         watch_id = watch["watch_id"]

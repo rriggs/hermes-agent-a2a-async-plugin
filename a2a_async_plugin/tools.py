@@ -47,6 +47,31 @@ def _task_store() -> protocol.TaskStore:
     return protocol.TaskStore(_plugin_db_path(_CTX))
 
 
+def _watch_store(ctx: Any = None):
+    """Read-only watch view for the profile's database (never starts a poller)."""
+    from . import watches
+    ctx = ctx if ctx is not None else _CTX
+    return watches.WatchStore(_plugin_db_path(ctx))
+
+
+def _age_label(seconds: Any) -> str:
+    """Compact age for listings: 42s, 3m07s, 2h05m, 4d03h."""
+    try:
+        total = max(0, int(float(seconds)))
+    except (TypeError, ValueError):
+        return "?"
+    if total < 60:
+        return f"{total}s"
+    minutes, sec = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{sec:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h{minutes:02d}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d{hours:02d}h"
+
+
 # --------------------------------------------------------------------------
 # Peer resolution
 # --------------------------------------------------------------------------
@@ -645,6 +670,8 @@ def _start_background_watch(args: dict, session_id: Optional[str]) -> str:
         f"these tasks yourself. a2a_watch_cancel(watch_id='{watch_id}') stops local watching "
         f"without cancelling remote work.",
     ]
+    if manager.status_live(session_id or ""):
+        lines.append("A live status line in this session tracks the watch until it settles.")
     return "\n".join(lines)
 
 
@@ -1401,8 +1428,8 @@ def a2a_list(args: dict | None = None, session_id: Optional[str] = None, **_: An
         limit = max(1, min(int(args.get("limit") or 50), 100))
     except (ValueError, TypeError):
         limit = 50
-    if kind not in ("all", "peers", "conversations", "tasks"):
-        return "Error: 'kind' must be one of: all, peers, conversations, tasks."
+    if kind not in ("all", "peers", "conversations", "tasks", "watches"):
+        return "Error: 'kind' must be one of: all, peers, conversations, tasks, watches."
     if state_filter not in ("all", "working", "terminal"):
         return "Error: 'state' must be one of: all, working, terminal."
     if direction_filter not in ("all", "inbound", "outbound"):
@@ -1459,8 +1486,45 @@ def a2a_list(args: dict | None = None, session_id: Optional[str] = None, **_: An
         if not records:
             lines.append("  (none)")
 
+    if kind in ("all", "watches"):
+        try:
+            watch_rows = _watch_store().list_watches(limit=limit)
+        except Exception:
+            logger.debug("A2A: watch listing failed", exc_info=True)
+            watch_rows = []
+        lines.append("")
+        lines.append(f"Watches ({len(watch_rows)}):")
+        if not watch_rows:
+            lines.append("  (none)")
+        now = time.time()
+        for w in watch_rows:
+            state = str(w.get("state") or "?")
+            if session_id and w.get("session_id") == session_id:
+                owner = "this-session"
+            elif w.get("session_id"):
+                owner = "another-session"
+            else:
+                owner = "unowned"
+            try:
+                age = _age_label(now - float(w.get("created_at") or now))
+            except (TypeError, ValueError):
+                age = "?"
+            items = w.get("items") or []
+            lines.append(f"  - {w.get('watch_id')} state={state} age={age} session={owner} "
+                         f"tasks={len(items)}")
+            for item in items:
+                item_state = str(item.get("short_state") or _short_state(str(item.get("state") or "")))
+                if item.get("completed_at") and not item_state:
+                    item_state = "done"
+                status = item_state or "waiting"
+                errors = int(item.get("errors") or 0)
+                lines.append(f"    - {item.get('peer')}/{item.get('task_id')} {status}"
+                             + (f" errors={errors}" if errors else ""))
+
     if kind == "tasks":
         return _take_notes() + ("\n".join(lines) if lines else "No A2A tasks found.")
+    if kind == "watches":
+        return _take_notes() + ("\n".join(lines) if lines else "No A2A watches found.")
 
     # Show metrics snapshot
     m = protocol.metrics.snapshot()
@@ -1690,11 +1754,11 @@ _SCHEMAS: dict[str, _ToolSchema] = {
         "type": "function",
         "function": {
             "name": "a2a_list",
-            "description": "List configured A2A peers, persisted conversations, durable tasks, and metrics. Filters are local and read-only.",
+            "description": "List configured A2A peers, persisted conversations, durable tasks, background watches, and metrics. Filters are local and read-only.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "kind": {"type": "string", "enum": ["all", "peers", "conversations", "tasks"]},
+                    "kind": {"type": "string", "enum": ["all", "peers", "conversations", "tasks", "watches"]},
                     "state": {"type": "string", "enum": ["all", "working", "terminal"]},
                     "direction": {"type": "string", "enum": ["all", "inbound", "outbound"]},
                     "peer": {"type": "string"},

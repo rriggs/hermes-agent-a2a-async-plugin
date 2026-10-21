@@ -1898,3 +1898,135 @@ def test_a_watch_result_is_injected_as_untrusted_peer_content():
     assert "untrusted external input" in content
     assert "ignore all previous instructions" not in content
     assert "[filtered]" in content
+
+
+# ── Live status line (PluginContext.post_message / PluginMessage.edit) ───────
+
+class FakeStatusMessage:
+    """Stand-in for ``hermes_cli.plugin_messages.PluginMessage``: ok/edit, records edits."""
+
+    def __init__(self, ctx, text):
+        self.ctx = ctx
+        self.ok = True
+        self.error = None
+        self.text = text
+        self.edits: list[str] = []
+
+    def edit(self, text):
+        self.text = text
+        self.edits.append(text)
+        self.ctx.edits.append(text)
+        return {"ok": True, "edited": True}
+
+
+class StatusCtx(FakeCtx):
+    """FakeCtx plus the public post_message surface (a TUI sticky notice in production)."""
+
+    def __init__(self):
+        super().__init__()
+        self.posts: list[str] = []
+        self.edits: list[str] = []
+        self.post_ok = True
+
+    def post_message(self, text):
+        handle = FakeStatusMessage(self, text)
+        if not self.post_ok:
+            handle.ok = False
+            handle.error = "no_conversation"
+            return handle
+        self.posts.append(text)
+        return handle
+
+
+def test_watch_posts_a_live_status_line_and_updates_it_on_completion():
+    ctx = StatusCtx()
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "ok")), ctx=ctx)
+    _add(manager)
+
+    assert len(ctx.posts) == 1, ctx.posts
+    assert ctx.posts[0].startswith("⧗ a2a peer"), ctx.posts[0]
+    assert "working" in ctx.posts[0], ctx.posts[0]
+
+    manager.run_once(now=time.time() + 1)
+
+    assert ctx.edits, "a terminal state must update the status line immediately"
+    assert ctx.edits[-1].startswith("✓ a2a peer · completed"), ctx.edits[-1]
+
+
+def test_status_line_throttles_elapsed_updates_but_forces_state_changes():
+    clock = [time.time()]
+    ctx = StatusCtx()
+    manager = watches.WatchManager(ctx, store=_store(), poll=ScriptedPoll(task_payload()),
+                                   interval=5.0, ttl_s=3600, clock=lambda: clock[0])
+    _add(manager)
+    assert len(ctx.posts) == 1
+
+    clock[0] += 5.0
+    manager.run_once(now=clock[0])
+    assert ctx.edits == [], "a 5s poll must not repaint the status line (15s throttle)"
+
+    clock[0] += 20.0
+    manager.run_once(now=clock[0])
+    assert len(ctx.edits) == 1, ctx.edits
+
+    manager.poll = ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "done"))
+    clock[0] += 6.0
+    manager.run_once(now=clock[0])
+    assert ctx.edits[-1].startswith("✓ a2a peer"), ctx.edits
+
+
+def test_two_watches_in_one_session_share_one_status_notice():
+    ctx = StatusCtx()
+    manager = _manager(ScriptedPoll(task_payload()), ctx=ctx)
+    _add(manager, tasks=(("dev-a", "t1"),))
+    _add(manager, tasks=(("dev-b", "t2"),))
+
+    assert len(ctx.posts) == 1, "a second watch must edit the existing notice, not stack another"
+    assert ctx.edits, ctx.edits
+    assert "2 tasks" in ctx.edits[-1], ctx.edits[-1]
+    assert "dev-a" in ctx.edits[-1] and "dev-b" in ctx.edits[-1], ctx.edits[-1]
+
+
+def test_status_line_is_best_effort_when_the_host_refuses_the_post():
+    ctx = StatusCtx()
+    ctx.post_ok = False
+    manager = _manager(ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "ok")), ctx=ctx)
+    _add(manager)
+
+    assert ctx.posts == [] and ctx.edits == []
+    manager.run_once(now=time.time() + 1)
+    assert len(ctx.injected) == 1, "delivery must not depend on the status line"
+
+
+def test_cancelling_a_watch_updates_the_status_line():
+    ctx = StatusCtx()
+    manager = _manager(ScriptedPoll(task_payload()), ctx=ctx)
+    watch = _add(manager)
+
+    manager.cancel(watch["watch_id"], session_id=SESSION_ID)
+
+    assert ctx.edits[-1] == "⧗ a2a watch stopped", ctx.edits
+
+
+def test_a2a_list_reports_watches_and_their_task_states(monkeypatch):
+    ctx = StatusCtx()
+    monkeypatch.setattr(tools, "_CTX", ctx)
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+
+    result = tools.a2a_await({"agent": "peer", "task_id": "t1", "background": True}, SESSION_ID)
+    assert "live status line" in result, result
+    watch_id = result.split()[1]
+
+    listed = tools.a2a_list({"kind": "watches"}, session_id=SESSION_ID)
+    assert watch_id in listed, listed
+    assert "state=active" in listed, listed
+    assert "session=this-session" in listed, listed
+    assert "peer/t1 waiting" in listed, listed
+
+    manager = tools._watch_manager(ctx)
+    manager.poll = ScriptedPoll(_artifact_payload(protocol.STATE_COMPLETED, "done"))
+    manager.run_once(now=time.time() + 1)
+
+    listed = tools.a2a_list({"kind": "watches"}, session_id=SESSION_ID)
+    assert "state=complete" in listed, listed
+    assert "peer/t1 completed" in listed, listed

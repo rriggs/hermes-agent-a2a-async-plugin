@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end verification of plugin completion publishing + a2a background watch in a container.
+# Classic-CLI end-to-end check: background mode must refuse when the host cannot display a turn.
 #
 #   ./run-container.sh [data-dir]
 #
@@ -7,8 +7,10 @@
 #   podman build --ignorefile ignore.txt -t hermes-e2e:local -f Containerfile "$HERMES_CHECKOUT"
 #
 # The container runs a real `hermes chat` (autostarted gateway + CLI client), a scripted
-# OpenAI-compatible model endpoint and a scripted A2A peer; the driver asserts delivery into the
-# originating session and the durable ledger ack. Evidence lands in $DATA/evidence.
+# OpenAI-compatible model endpoint and a scripted A2A peer. The driver asserts the refusal
+# reached the model, no watch was persisted and the peer was never polled. For the delivery
+# path use ./run-tui.sh (real gateway owner + `source=tui` websocket client).
+# Evidence lands in $DATA/evidence.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

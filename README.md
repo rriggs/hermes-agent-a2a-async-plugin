@@ -61,6 +61,31 @@ An unowned task is cancelled remotely after `a2a.unowned_cancel_after_s` (defaul
 and abandoned after `a2a.unowned_task_ttl_s` (default 604800s, seven days). Both can also be set
 with `A2A_UNOWNED_CANCEL_AFTER` and `A2A_UNOWNED_TASK_TTL`.
 
+## Operator commands
+
+Two user surfaces over the same task store. Neither is an agent tool.
+
+```bash
+hermes a2a-tasks list   [--session <id>] [--unowned] [--task <id> ...]
+hermes a2a-tasks release --session <id> (--all | --task <id> ...) [--yes]
+hermes a2a-tasks transfer --from <session> --to <session> [--task <id> ...] [--yes]
+```
+
+In a session, the same grammar is available as `/a2a tasks ...`, with `--session` defaulting to
+the session the command is typed in:
+
+```text
+/a2a tasks list
+/a2a tasks release --all --yes
+/a2a tasks transfer --from <old-session> --to <new-session> --yes
+```
+
+`release` clears ownership, stops that session's watches for the tasks, and drops its pending
+deliveries; queued peer messages stay for the next owner. `transfer` moves ownership in one
+transaction with the same cleanup for the previous owner. Both require `--yes`; without it, the
+shell command prompts on a TTY and refuses when non-interactive. Neither command needs a running
+gateway. This is how an operator clears a stuck owner without taking over the session that holds it.
+
 ## Background awaits
 
 `a2a_await(background=true)` returns immediately with a `watch_id`. The watch persists in the

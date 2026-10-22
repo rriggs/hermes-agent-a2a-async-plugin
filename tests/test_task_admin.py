@@ -194,6 +194,15 @@ def test_slash_lists_only_the_bound_session_by_default():
     assert "t1" in text and "t2" not in text
 
 
+def test_slash_list_unowned_does_not_default_to_the_bound_session():
+    _task("t1", session=SESSION_A)
+    _task("t2")
+
+    text = task_admin.slash_command("tasks list --unowned", session_id=SESSION_A)
+
+    assert "t2" in text and "t1" not in text
+
+
 def test_slash_rejects_an_unknown_subcommand_without_changing_anything():
     _task("t1", session=SESSION_A)
 

@@ -414,7 +414,9 @@ def slash_command(raw_args: str, session_id: str = "", **_: object) -> str:
     action = values["command"]
     current = str(session_id or "")
     if action == "list":
-        return list_tasks(session=values.get("session") or current,
+        # --unowned is its own filter; it must not inherit the bound session and collide with it.
+        session = values.get("session") or ("" if values.get("unowned") else current)
+        return list_tasks(session=session,
                           unowned=values.get("unowned", False),
                           task_ids=values.get("task") or []).text
     if action == "release":

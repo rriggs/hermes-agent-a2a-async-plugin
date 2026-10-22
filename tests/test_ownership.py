@@ -746,3 +746,108 @@ def test_an_identical_artifact_revision_stays_idempotent_but_a_kind_change_reope
     [row] = store.queued("t1")
     assert (row["kind"], row["text"]) == ("result", "SAME"), (
         "the lifecycle classification is part of the revision")
+
+
+def test_blocking_lost_owner_does_not_replace_new_owners_answer(monkeypatch):
+    """P1: the ownership fence must cover recording, not only acknowledgement.
+
+    A blocking await reads GetTask, then records the observation, then consumes it. If another
+    session adopts the task in between, an ownership check only at consume time refuses the old
+    caller AFTER its record has already rewritten the adopter's queued answer.
+    """
+    _task("t1")
+
+    def rpc(*_args, **_kwargs):
+        return {"result": {"id": "t1", "contextId": "ctx-1",
+                           "status": {"state": protocol.STATE_COMPLETED},
+                           "artifacts": [{"artifactId": "a",
+                                          "parts": [{"text": "STALE ANSWER"}]}]}}
+
+    real_record = tools._record_observation
+
+    def adopt_before_recording(task_id, payload, peer, *args, **kwargs):
+        # The exact window: release, adoption and the adopter's answer commit after the poll and
+        # before this caller records what it polled.
+        store = ownership.OwnershipStore()
+        assert store.release(task_id, SESSION_A)
+        assert store.acquire(task_id, SESSION_B)
+        store.add_message(task_id, "artifact-id:a", "result", "NEW ANSWER", update_existing=True)
+        return real_record(task_id, payload, peer, *args, **kwargs)
+
+    monkeypatch.setattr(tools, "_resolve_peer", lambda _agent: {"url": "http://unused.invalid"})
+    monkeypatch.setattr(tools, "_rpc_request", rpc)
+    monkeypatch.setattr(tools, "_ensure_maintenance", lambda ctx=None: None)
+    monkeypatch.setattr(tools, "_record_observation", adopt_before_recording)
+
+    out = tools.a2a_await({"agent": "peer", "task_id": "t1"}, session_id=SESSION_A)
+
+    assert "ownership changed" in out, out
+    queued = _store().queued("t1")
+    assert [m["text"] for m in queued] == ["NEW ANSWER"], (
+        f"the stale caller rewrote the adopter's backlog: {queued}")
+
+
+def test_failed_batch_preserves_tasks_already_owned(monkeypatch):
+    """P2: a batch conflict may roll back only what THIS call acquired.
+
+    t1 is already owned (with a pending publication). t2 is claimed by another session between
+    the batch's preflight and its acquisition. The failed batch must not release t1 or delete its
+    pending event.
+    """
+    for task_id in ("t1", "t2"):
+        _task(task_id)
+    manager = watches.WatchManager(None, store=watches.WatchStore())
+    owned = manager.ownership
+    assert owned.acquire("t1", SESSION_A)
+    owned.add_message("t1", "m1", "result", "existing answer")
+    manager.store.create(watch_id="existing", session_id=SESSION_A,
+                         target={"session_key": "route"}, tasks=[("peer", "t1")])
+    manager.store.enqueue_publication(watch_id="existing", event_id="existing-event",
+                                      content="existing answer", metadata={"task_id": "t1"})
+
+    real_acquire = owned.acquire
+
+    def race(task_id, session_id, now=None):
+        if task_id == "t2":
+            assert ownership.OwnershipStore().acquire(task_id, SESSION_B)
+        return real_acquire(task_id, session_id, now)
+
+    monkeypatch.setattr(owned, "acquire", race)
+    monkeypatch.setattr(watches.WatchManager, "start", lambda self: self)
+    monkeypatch.setattr(tools, "_watch_manager", lambda ctx=None: manager)
+    monkeypatch.setattr(tools, "_delivery_capable", lambda ctx: True)
+    monkeypatch.setattr(tools, "_capture_target", lambda ctx: {"session_key": "route"})
+    monkeypatch.setattr(tools, "_resolve_peer", lambda _agent: {"url": "http://unused.invalid"})
+
+    out = tools.a2a_await(
+        {"background": True, "tasks": [{"agent": "peer", "task_id": "t1"},
+                                       {"agent": "peer", "task_id": "t2"}]},
+        session_id=SESSION_A)
+
+    assert "owned by another session" in out, out
+    assert owned.owner("t1") == SESSION_A, "the failed batch released a task it already owned"
+    with manager.store._session() as con:
+        row = con.execute(
+            "SELECT 1 FROM a2a_watch_publications WHERE event_id='existing-event'").fetchone()
+    assert row is not None, "the failed batch deleted a pending publication it did not create"
+
+
+def test_explicit_acquire_then_session_end_starts_maintenance(monkeypatch):
+    """P2: releasing a task creates timer work, so the maintenance poller must run.
+
+    Explicit acquisition is the only path that can create an owned task with no watch and no
+    await. Session end then releases it, and its auto-cancel/TTL work needs the poller in this
+    process, not at some later unrelated activity.
+    """
+    starts: list[object] = []
+    monkeypatch.setattr(watches.WatchManager, "start",
+                        lambda self: starts.append(self) or self)
+    monkeypatch.setattr(tools, "_resolve_peer", lambda _agent: {"url": "http://unused.invalid"})
+
+    out = tools.a2a_acquire_task_ownership({"agent": "peer", "task_id": "t1"},
+                                           session_id=SESSION_A)
+
+    assert "acquired" in out, out
+    tools._on_session_end(None, {"old_session_id": SESSION_A}, boundary="reset")
+    assert _store().owner("t1") == ""
+    assert starts, "released task has timer work but no scheduler was started"

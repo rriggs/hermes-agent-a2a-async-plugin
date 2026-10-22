@@ -1648,8 +1648,8 @@ def test_a_timeout_after_losing_ownership_does_not_return_the_backlog(monkeypatc
 
     monkeypatch.setattr(tools.time, "time", fake_time)
 
-    def record_then_swap(task_id, payload, peer):
-        recorded = real_record(task_id, payload, peer)
+    def record_then_swap(task_id, payload, peer, session_id=""):
+        recorded = real_record(task_id, payload, peer, session_id)
         manager.ownership.release(task_id, SESSION_ID)
         manager.ownership.acquire(task_id, "sess-B")
         clock["offset"] = 3600.0   # the deadline passes after the swap
@@ -1685,8 +1685,8 @@ def test_a_blocking_await_returns_the_revision_it_acknowledges(monkeypatch):
         lambda *a, **k: {"result": _artifact_payload(protocol.STATE_COMPLETED, "OLD")})
     original_record = tools._record_observation
 
-    def record_then_revise(task_id, payload, peer):
-        snapshot = original_record(task_id, payload, peer)
+    def record_then_revise(task_id, payload, peer, session_id=""):
+        snapshot = original_record(task_id, payload, peer, session_id)
         manager.ownership.add_message(task_id, snapshot[0]["message_id"], "result", "NEW",
                                       update_existing=True)
         return snapshot
@@ -1754,8 +1754,8 @@ def test_a_timeout_does_not_acknowledge_a_revised_backlog(monkeypatch):
 
     real_record = tools._record_observation
 
-    def record_then_expire(task_id, payload, peer):
-        recorded = real_record(task_id, payload, peer)
+    def record_then_expire(task_id, payload, peer, session_id=""):
+        recorded = real_record(task_id, payload, peer, session_id)
         clock["offset"] = 3600.0  # the deadline passes after the observation
         return recorded
 

@@ -802,13 +802,21 @@ def _backlog_lines(messages: list[dict]) -> list[str]:
     return lines
 
 
-def _record_observation(task_id: str, payload: dict, peer: str) -> list[dict]:
-    """Store every new peer message on the task; returns the ones still queued (all of them)."""
+def _record_observation(task_id: str, payload: dict, peer: str,
+                        session_id: str = "") -> Optional[list[dict]]:
+    """Store every new peer message on the task; returns the queued rows, or None if refused.
+
+    ``None`` means this caller may no longer record here: ownership moved to another session (or
+    an owner is required and the task is unowned). Recording and the ownership check share one
+    write transaction, so a stale caller cannot rewrite an adopter's queued answer and only then
+    be refused by the consumption fence.
+    """
     from . import ownership
     store = ownership.OwnershipStore(_plugin_db_path(_CTX))
     state = str((payload.get("status") or {}).get("state") or "")
     context_id = str(payload.get("contextId") or "")
     _ensure_task_record(task_id, peer, context_id, state)
+    entries: list[tuple[str, str, str, bool]] = []
     try:
         # History first (chronology), peer-originated only: ROLE_USER is OUR request.
         for index, message in enumerate(payload.get("history") or []):
@@ -819,27 +827,30 @@ def _record_observation(task_id: str, payload: dict, peer: str) -> list[dict]:
                 continue
             message_id = str(message.get("messageId") or message.get("message_id")
                              or f"history:{index}:{_digest(text)}")
-            store.add_message(task_id, message_id, "progress", text)
+            entries.append((message_id, "progress", text, False))
         status_msg = (payload.get("status") or {}).get("message") or {}
         message_id = str(status_msg.get("messageId") or status_msg.get("message_id") or "")
         status_text = _text_of_message(status_msg)
         if status_text:
             kind = "input-required" if state == protocol.STATE_INPUT_REQUIRED else "progress"
-            store.add_message(task_id, message_id or f"status:{_digest(status_text)}", kind, status_text)
+            entries.append((message_id or f"status:{_digest(status_text)}", kind, status_text, False))
         for index, artifact in enumerate(payload.get("artifacts") or []):
             text = _text_of_message(artifact)
             if not text:
                 continue
-            store.add_message(task_id, _artifact_message_id(artifact, index, text), "result",
-                              text, update_existing=True)
-        if state in protocol.TERMINAL_STATES and not store.has_kind(task_id, "result"):
+            entries.append((_artifact_message_id(artifact, index, text), "result", text, True))
+        if (state in protocol.TERMINAL_STATES
+                and not any(kind == "result" for _mid, kind, _text, _update in entries)
+                and not store.has_kind(task_id, "result")):
             # Check DELIVERED rows too: a reply consumed by an earlier attempt still exists, and
             # fabricating "no text reply" would hide it from a re-await (local review, D1).
-            store.add_message(task_id, f"state:{state}", "result",
-                              f"task reached {_short_state(state)} with no text reply")
+            entries.append((f"state:{state}", "result",
+                            f"task reached {_short_state(state)} with no text reply", False))
+        return store.record_messages(task_id, entries, session_id=session_id,
+                                     require_owner=bool(session_id))
     except Exception:
         logger.debug("A2A: message recording failed", exc_info=True)
-    return store.queued(task_id)
+        return store.queued(task_id)
 
 
 def _peer_role(role: Any) -> bool:
@@ -1038,10 +1049,10 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
             return prefix + _peer_rpc_error(resp, agent)
         payload = resp.get("result", {})
         if session_id and _ownership().owner(task_id) != session_id:
-            # Released or adopted while this GetTask was in flight. The result belongs to the
-            # session that owns the task now; consuming it here would empty the adopter's backlog.
-            return (f"[{agent} · task {task_id} · ownership changed]\n"
-                    "Another session owns this task now; its result was not delivered here.")
+            # Early refusal only: the authoritative fence is the ownership read inside
+            # ``record_messages``, in the same transaction as the writes. This read keeps a
+            # caller that is already visibly stale from even attempting the record.
+            return _ownership_changed_result(agent, task_id)
         if isinstance(payload, dict):
             status = payload.get("status") or {}
             state = str(status.get("state", ""))
@@ -1049,7 +1060,12 @@ def a2a_await(args: dict, session_id: Optional[str] = None, **_: Any) -> str:
                 logger.debug("A2A await: task %s now %s", task_id, state)
                 last_state = state
             short = _short_state(state)
-            queued_now = _record_observation(task_id, payload, agent)
+            queued_now = _record_observation(task_id, payload, agent, session_id or "")
+            if queued_now is None:
+                # Ownership was released or adopted while this GetTask was in flight. The record
+                # is fenced in the same transaction as the ownership read, so nothing was written
+                # for the new owner; its result was not delivered here.
+                return _ownership_changed_result(agent, task_id)
             if short in ("completed", "failed", "canceled", "rejected", "input-required"):
                 def reply_for(messages: list[dict]) -> str:
                     # Our own "task reached X with no text reply" placeholder is not peer content:
@@ -1165,6 +1181,7 @@ def a2a_acquire_task_ownership(args: dict, session_id: Optional[str] = None, **_
         return f"Error: {exc}"
     store = _ownership()
     lines: list[str] = []
+    acquired_any = False
     for agent_name, task_id in entries:
         peer = _resolve_peer(agent_name)
         if not peer or not peer.get("url"):
@@ -1179,9 +1196,15 @@ def a2a_acquire_task_ownership(args: dict, session_id: Optional[str] = None, **_
             lines.append(f"  - {agent_name} / {task_id}: REFUSED — owned by another session")
             continue
         if store.acquire(task_id, session_id):
+            acquired_any = True
             lines.append(f"  - {agent_name} / {task_id}: acquired")
         else:
             lines.append(f"  - {agent_name} / {task_id}: REFUSED — claimed by another session")
+    if acquired_any:
+        # Acquisition is the only path that can create an owned task with no watch and no
+        # blocking await. Its later release creates unowned timer work, so the maintenance
+        # poller must already be running in this process.
+        _ensure_maintenance()
     return "A2A task ownership:\n" + "\n".join(lines)
 
 
@@ -1297,6 +1320,10 @@ def _on_session_end(ctx: Any, payload: dict, *, boundary: str = "reset") -> None
         logger.debug("A2A: ownership release on session end failed", exc_info=True)
         return
     if released:
+        # Releasing creates unowned timer work (auto-cancel and TTL). Start the poller here: a
+        # session that acquired explicitly and never watched or awaited has none running, and
+        # the timers must not wait for some unrelated activity or a restart.
+        _ensure_maintenance(ctx)
         logger.info("A2A: released %d task(s) owned by ended session %s", released, session_id)
 
 

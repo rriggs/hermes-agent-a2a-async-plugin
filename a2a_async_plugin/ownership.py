@@ -275,6 +275,62 @@ class OwnershipStore:
                     (task_id, message_id, kind or "progress", text or "", now))
             return cur.rowcount == 1
 
+    def record_messages(self, task_id: str,
+                        messages: Iterable[tuple[str, str, str, bool]],
+                        *, session_id: str = "",
+                        require_owner: bool = False) -> Optional[list[dict]]:
+        """Apply one observation's message upserts under the ownership write lock.
+
+        ``messages`` is ``(message_id, kind, text, update_existing)`` per peer message. Recording
+        is the first write a poller does, so an ownership check only at acknowledgement time is
+        too late: a release and adoption that commit in between would let the old owner overwrite
+        the adopter's queued answer before being refused. ``BEGIN IMMEDIATE`` here takes the same
+        lock ``release``/``acquire`` take, and the owner is read inside it.
+
+        Returns the still-undelivered rows, or ``None`` when this caller may not record: another
+        session owns the task, or ``require_owner`` is set and the task is unowned. A session-less
+        caller (``session_id=""``, ``require_owner=False``) may record an unowned task's backlog;
+        it never records into a session's task.
+        """
+        entries = [entry for entry in messages if entry and entry[0]]
+        now = time.time()
+        with self._session() as con:
+            if not con.in_transaction:
+                con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT owner_session_id FROM a2a_tasks WHERE task_id=?",
+                (task_id,)).fetchone()
+            owner = str(row["owner_session_id"] or "") if row else ""
+            if owner != str(session_id or ""):
+                if owner or require_owner:
+                    return None
+            for message_id, kind, text, update_existing in entries:
+                if update_existing:
+                    con.execute(
+                        """INSERT INTO a2a_task_messages
+                               (task_id, message_id, kind, text, created_at)
+                           VALUES (?, ?, ?, ?, ?)
+                           ON CONFLICT(task_id, message_id) DO UPDATE SET
+                               kind=excluded.kind,
+                               text=excluded.text,
+                               delivered_at=NULL,
+                               delivered_to_session=''
+                           WHERE a2a_task_messages.text <> excluded.text
+                              OR a2a_task_messages.kind <> excluded.kind""",
+                        (task_id, message_id, kind or "progress", text or "", now))
+                else:
+                    con.execute(
+                        """INSERT OR IGNORE INTO a2a_task_messages
+                               (task_id, message_id, kind, text, created_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (task_id, message_id, kind or "progress", text or "", now))
+            rows = con.execute(
+                """SELECT * FROM a2a_task_messages
+                    WHERE task_id=? AND delivered_at IS NULL
+                    ORDER BY created_at, message_id""",
+                (task_id,)).fetchall()
+            return [dict(r) for r in rows]
+
     def queued(self, task_id: str) -> list[dict]:
         """Undelivered messages for one task, oldest first."""
         with self._session() as con:

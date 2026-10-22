@@ -1203,8 +1203,9 @@ class WatchManager:
         with self._scope():
             # Atomic acquisition: a watch for another session's task can never deliver, and
             # ignoring the failed acquire handed its backlog to the wrong session.
+            owners_before = self.ownership.owners([task_id for _peer, task_id in items])
             for _peer, task_id in items:
-                owner = self.ownership.owner(task_id)
+                owner = owners_before.get(task_id, "")
                 if owner and owner != (session_id or ""):
                     raise ownership_mod.OwnershipConflict(task_id, owner)
             self.store.create(watch_id=watch_id, session_id=session_id or "", target=target,
@@ -1214,19 +1215,23 @@ class WatchManager:
             # acquire here covers direct manager use and makes the record exist before the first
             # poll so messages have somewhere to land.
             task_store = protocol.TaskStore(self.store.db_path)
-            acquired: list[str] = []
+            # Rollback is limited to ownership THIS call created. Releasing a task the session
+            # already owned would drop that task's pending publication and break an existing
+            # watch for a batch that failed on a later item (Amy's PR #9 finding 2).
+            newly_acquired: list[str] = []
             for peer, task_id in items:
                 if task_store.get(task_id) is None:
                     task_store.create(task_id, task_id, peer, direction="outbound",
                                       remote_state=protocol.STATE_SUBMITTED)
                 if session_id and not self.ownership.acquire(task_id, session_id):
-                    # Undo what THIS call already took: a task owned by a session with no watch
-                    # would never be polled or released.
-                    for claimed in acquired:
+                    # Undo only what THIS call took: a task it already owned has a live watch
+                    # and pending delivery of its own.
+                    for claimed in newly_acquired:
                         self.ownership.release(claimed, session_id)
                     self.store.cancel(watch_id)
                     raise ownership_mod.OwnershipConflict(task_id, self.ownership.owner(task_id))
-                acquired.append(task_id)
+                if session_id and owners_before.get(task_id, "") != session_id:
+                    newly_acquired.append(task_id)
             watch = self.store.get(watch_id) or {"watch_id": watch_id}
         self.start()
         # Post the live line from INSIDE the tool call: this is the only context where a session
@@ -1526,7 +1531,13 @@ class WatchManager:
             self.store.record_working(watch_id, peer, task_id, raw_state, context_id,
                                       next_poll_at=now + self.interval, owner=self.owner)
 
-        queued = self._record_messages(task_id, peer, payload, raw_state)
+        queued = self._record_messages(task_id, peer, payload, raw_state, session_id)
+        if queued is None:
+            # The task was released and adopted while this poll was in flight. Recording is
+            # fenced inside the ownership transaction, so the new owner's backlog is untouched.
+            logger.debug("A2A watch: %s/%s changed owner; observation not recorded",
+                         task_id, peer)
+            return
         delivered: list[str] = []
         enqueue_failed = False
         # Artifacts are deliverables, not progress notes: a streaming peer that grows one
@@ -1571,9 +1582,15 @@ class WatchManager:
                                  short_state=_short_state(raw_state), owner=self.owner)
 
     def _record_messages(self, task_id: str, peer: str, payload: dict,
-                         raw_state: str) -> list[dict]:
-        """Store every new peer message on the task; returns the still-undelivered ones."""
+                         raw_state: str, session_id: str = "") -> Optional[list[dict]]:
+        """Store every new peer message on the task; returns the undelivered rows.
+
+        ``None`` means another session owns the task now: the observation is refused and nothing
+        is written, so an adopted task's queued answer cannot be overwritten by this watch's
+        stale poll. An unowned task still records (its backlog waits for the adopter).
+        """
         from . import tools
+        entries: list[tuple[str, str, str, bool]] = []
         # History first (chronology), peer-originated only: ROLE_USER entries are OUR requests,
         # not peer progress, and status/artifacts are the newest messages.
         for index, message in enumerate(payload.get("history") or []):
@@ -1584,27 +1601,26 @@ class WatchManager:
                 continue
             message_id = str(message.get("messageId") or message.get("message_id")
                              or f"history:{index}:{tools._digest(text)}")
-            self.ownership.add_message(task_id, message_id, "progress", text)
+            entries.append((message_id, "progress", text, False))
         status_msg = (payload.get("status") or {}).get("message") or {}
         status_text = tools._text_of_message(status_msg)
         if status_text:
             kind = "input-required" if raw_state == protocol.STATE_INPUT_REQUIRED else "progress"
             message_id = str(status_msg.get("messageId") or status_msg.get("message_id")
                              or f"status:{tools._digest(status_text)}")
-            self.ownership.add_message(task_id, message_id, kind, status_text)
+            entries.append((message_id, kind, status_text, False))
         for index, artifact in enumerate(payload.get("artifacts") or []):
             text = tools._text_of_message(artifact)
             if not text:
                 continue
             kind = "input-required" if raw_state == protocol.STATE_INPUT_REQUIRED else "result"
-            self.ownership.add_message(
-                task_id, tools._artifact_message_id(artifact, index, text), kind, text,
-                update_existing=True)
-        if raw_state in protocol.TERMINAL_STATES and not self.ownership.has_kind(task_id, "result"):
-            self.ownership.add_message(
-                task_id, f"state:{raw_state}", "result",
-                f"task reached {_short_state(raw_state)} with no text reply")
-        return self.ownership.queued(task_id)
+            entries.append((tools._artifact_message_id(artifact, index, text), kind, text, True))
+        if (raw_state in protocol.TERMINAL_STATES
+                and not any(kind == "result" for _mid, kind, _text, _update in entries)
+                and not self.ownership.has_kind(task_id, "result")):
+            entries.append((f"state:{raw_state}", "result",
+                            f"task reached {_short_state(raw_state)} with no text reply", False))
+        return self.ownership.record_messages(task_id, entries, session_id=session_id)
 
     def _maintain_unowned(self, now: float) -> None:
         """Cancel unowned tasks after the configured delay, abandon them after the TTL."""

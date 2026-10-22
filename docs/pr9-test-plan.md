@@ -109,17 +109,27 @@ PYTHONPATH=<hermes checkout> python -m pytest -q \
 
 ## C. Container end-to-end
 
-`e2e/container/run-container.sh` runs a real `hermes chat` on a pty against a scripted
+Two harnesses, two different claims:
+
+`e2e/container/run-container.sh` drives a classic `hermes chat` on a pty against a scripted
 OpenAI-compatible model and a scripted A2A peer (`WORKING` then `COMPLETED` with an artifact), with
-the plugin mounted from the working tree. Assertions:
+the plugin mounted from the working tree. It proves the **refusal** path:
 
-- `a2a_await(background=true)` returned a `watch_id` that reached the model.
-- The peer was polled at least once and never sent `CancelTask`.
-- The plugin's completion reached the live session exactly once through
-  `PluginContext.inject_message` and the model received it as a new turn.
-- The plugin's own outbox row for the artifact is `published`, `attempts=0`.
+- `a2a_await(background=true)` returned a refusal that reached the model.
+- No watch row was persisted and the peer was never polled (`peer_polls=0`, `watch_rows=0`).
 
-Expected: `[e2e] PASS ...` and `[run] PASS`, with `evidence/summary.json` printed.
+Expected: `refused=true` in `evidence/summary.json` and `[run] PASS`.
+
+`e2e/container/run-tui.sh` drives a real `hermes gateway run` owner and a WebSocket client that
+declares `source=tui`, against the same scripted model and peer. This is the **delivery** proof:
+
+- The next turn's model request carries the injected label, the peer artifact and the untrusted
+  boundary.
+- The live status line arrives as `notification.show`.
+- `a2a_watches` settles `complete` and `a2a_watch_publications.published_at` is set.
+- The peer was polled twice and received no `CancelTask`.
+
+Expected: `[tui-e2e] PASS`, `delivered=true`, and `[run-tui] PASS`.
 
 ## D. Known container limitations
 

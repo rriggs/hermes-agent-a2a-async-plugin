@@ -501,6 +501,50 @@ class WatchStore:
             self.settle(watch_id, now=now)
         return len(watch_ids)
 
+    @staticmethod
+    def cleanup_for_released_tasks(con: sqlite3.Connection, session_id: str,
+                                   task_ids: Iterable[str],
+                                   now: Optional[float] = None) -> int:
+        """Unwatch released tasks on the caller's transaction; returns affected watch count.
+
+        Called by ``OwnershipStore.release_many``/``transfer_many`` while they hold the write
+        lock. Doing the cleanup in that transaction is what fences it against reacquisition: the
+        same session cannot acquire the task and create a fresh watch between the ownership change
+        and this cleanup, so the new watch and its pending delivery survive.
+        """
+        ids = [str(t) for t in task_ids if t]
+        if not ids or not session_id:
+            return 0
+        now = time.time() if now is None else now
+        marks = ",".join("?" for _ in ids)
+        rows = con.execute(
+            f"""SELECT DISTINCT watch_id FROM a2a_watch_items
+                 WHERE task_id IN ({marks})
+                   AND watch_id IN (SELECT watch_id FROM a2a_watches
+                                     WHERE session_id=? AND state=?)""",
+            (*ids, session_id, WATCH_ACTIVE)).fetchall()
+        watch_ids = [str(row["watch_id"]) for row in rows]
+        if not watch_ids:
+            return 0
+        con.execute(
+            f"""UPDATE a2a_watch_items SET state=?, completed_at=?, updated_at=?
+                 WHERE task_id IN ({marks})
+                   AND watch_id IN (SELECT watch_id FROM a2a_watches
+                                     WHERE session_id=? AND state=?)""",
+            (ITEM_UNWATCHED, now, now, *ids, session_id, WATCH_ACTIVE))
+        for watch_id in watch_ids:
+            items = con.execute(
+                "SELECT state, completed_at FROM a2a_watch_items WHERE watch_id=?",
+                (watch_id,)).fetchall()
+            if items and all(item["completed_at"] is not None for item in items):
+                state = (WATCH_PAUSED if any(item["state"] == ITEM_PAUSED for item in items)
+                         else WATCH_COMPLETE)
+                con.execute(
+                    """UPDATE a2a_watches SET state=?, lease_owner='', lease_until=0,
+                           updated_at=? WHERE watch_id=? AND state=?""",
+                    (state, now, watch_id, WATCH_ACTIVE))
+        return len(watch_ids)
+
     def cancel(self, watch_id: str, session_id: str = "") -> Optional[str]:
         """Stop polling a watch. Returns the prior state, or None when unknown/not owned."""
         now = time.time()

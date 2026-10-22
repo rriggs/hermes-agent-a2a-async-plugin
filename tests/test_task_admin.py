@@ -262,31 +262,59 @@ def test_release_all_leaves_a_task_acquired_after_the_release_untouched(monkeypa
         "its watch must not be cancelled by the earlier release")
 
 
-def test_transfer_reports_a_partial_result_when_watch_cleanup_fails(monkeypatch):
-    """A11-2: ownership moved, so exit 0 would hide a watch still polling the old session."""
+def test_release_all_does_not_touch_a_same_task_reacquired_after_the_release(monkeypatch):
+    """A11-1 same-task case: cleanup is inside the release transaction, before reacquisition."""
+    _task("t1", session=SESSION_A)
+    _watch(SESSION_A, [("peer", "t1")])
+    real_release_many = ownership.OwnershipStore.release_many
+
+    def release_then_reacquire(self, task_ids, session_id, now=None):
+        out = real_release_many(self, task_ids, session_id, now)
+        _store().acquire("t1", SESSION_A)
+        _watch(SESSION_A, [("peer", "t1")], watch_id="w2")
+        _pending("w2", "t1", "ev2")
+        return out
+
+    monkeypatch.setattr(ownership.OwnershipStore, "release_many", release_then_reacquire)
+
+    result = task_admin.release_tasks(session=SESSION_A, all_tasks=True)
+
+    assert result.exit_code == 0, result.text
+    assert _owner("t1") == SESSION_A, "the reacquisition must survive the release"
+    assert watches.WatchStore().get("w2")["state"] == watches.WATCH_ACTIVE
+    assert _pending_ids() == ["ev2"], "the reacquired task's new delivery must survive"
+
+
+def test_release_rolls_back_when_watch_cleanup_fails(monkeypatch):
+    """A11-2: cleanup shares the ownership transaction, so a failure changes nothing."""
     _task("t1", session=SESSION_A)
 
-    def fail(self, session, task_ids=None):
-        raise RuntimeError("watch store unavailable")
+    def fail(con, session_id, task_ids, now=None):
+        raise RuntimeError("watch cleanup unavailable")
 
-    monkeypatch.setattr(watches.WatchStore, "cancel_session", fail)
+    monkeypatch.setattr(watches.WatchStore, "cleanup_for_released_tasks", staticmethod(fail))
 
-    result = task_admin.transfer_tasks(from_session=SESSION_A, to_session=SESSION_B)
+    result = task_admin.release_tasks(session=SESSION_A, all_tasks=True)
 
-    assert result.exit_code == task_admin.EXIT_PARTIAL
-    assert "watch cleanup failed" in result.text
-    assert _owner("t1") == SESSION_B
+    assert result.exit_code == task_admin.EXIT_ERROR
+    assert "rolled back" in result.text
+    assert _owner("t1") == SESSION_A, "the release must roll back with the cleanup"
 
 
-def test_pending_counts_include_aggregate_task_lists():
-    """A11-4: an aggregate publication names its tasks in metadata['tasks'], not task_id."""
-    _task("t1")
-    _task("t2")
+def test_aggregate_publications_count_per_task_and_once_in_the_batch_total():
+    """A11-4: one aggregate event is a per-task participant but one dropped delivery."""
+    _task("t1", session=SESSION_A)
+    _task("t2", session=SESSION_A)
     _watch(SESSION_A, [("peer", "t1"), ("peer", "t2")], watch_id="wa")
     watches.WatchStore().enqueue_publication(
         watch_id="wa", event_id="agg", content="aggregate",
         metadata={"source": "a2a", "tasks": ["peer/t1", "peer/t2"]})
 
     listing = task_admin.list_tasks(task_ids=["t1", "t2"])
-
     assert [row["pending"] for row in listing.rows] == [1, 1]
+
+    result = task_admin.release_tasks(session=SESSION_A, all_tasks=True)
+
+    assert result.exit_code == 0, result.text
+    assert "dropped 1 pending deliver" in result.text, (
+        f"the aggregate event must count once in the batch total: {result.text}")

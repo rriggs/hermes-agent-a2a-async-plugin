@@ -19,15 +19,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
 
-from . import ownership, protocol, watches
+from . import ownership, protocol
 
 EXIT_OK = 0
 EXIT_NOTHING = 1
 EXIT_USAGE = 2
 EXIT_CONFLICT = 3
-# Ownership moved, but a follow-up cleanup (watch cancellation) failed. The change is real, so
-# this is not a conflict, but the command did not finish its job.
-EXIT_PARTIAL = 4
+# The ownership transaction itself failed and rolled back; nothing changed. Kept distinct from a
+# conflict so the operator knows to retry rather than investigate ownership.
+EXIT_ERROR = 5
 
 logger = logging.getLogger(__name__)
 
@@ -105,17 +105,26 @@ def _publication_task_ids(metadata_json: str) -> set[str]:
     return ids
 
 
+def _pending_events(con: sqlite3.Connection) -> dict[str, set[str]]:
+    """Undelivered outbox rows -> the task ids each one names (one event can name several)."""
+    events: dict[str, set[str]] = {}
+    try:
+        rows = con.execute(
+            "SELECT event_id, metadata_json FROM a2a_watch_publications"
+            " WHERE published_at IS NULL"
+        ).fetchall()
+    except sqlite3.Error:
+        return events
+    for row in rows:
+        events[str(row["event_id"])] = _publication_task_ids(row["metadata_json"])
+    return events
+
+
 def _pending_counts(con: sqlite3.Connection) -> dict[str, int]:
     """Undelivered outbox rows per task, parsed in Python (metadata JSON is not queryable)."""
     counts: dict[str, int] = {}
-    try:
-        rows = con.execute(
-            "SELECT metadata_json FROM a2a_watch_publications WHERE published_at IS NULL"
-        ).fetchall()
-    except sqlite3.Error:
-        return counts
-    for row in rows:
-        for task_id in _publication_task_ids(row["metadata_json"]):
+    for task_ids in _pending_events(con).values():
+        for task_id in task_ids:
             counts[task_id] = counts.get(task_id, 0) + 1
     return counts
 
@@ -196,43 +205,14 @@ def _owner_map(store: ownership.OwnershipStore, task_ids: Iterable[str]) -> dict
         return {}
 
 
-def _affected_pending(db_path: Optional[str], task_ids: Iterable[str]) -> dict[str, int]:
-    ids = {str(t) for t in task_ids if t}
-    if not ids:
-        return {}
+def _all_pending_events(db_path: Optional[str]) -> dict[str, set[str]]:
     con = _read_only_conn(db_path)
     if con is None:
         return {}
     try:
-        return {task_id: count for task_id, count in _pending_counts(con).items()
-                if task_id in ids}
+        return _pending_events(con)
     finally:
         con.close()
-
-
-def _all_pending(db_path: Optional[str]) -> dict[str, int]:
-    con = _read_only_conn(db_path)
-    if con is None:
-        return {}
-    try:
-        return _pending_counts(con)
-    finally:
-        con.close()
-
-
-def _watch_cancel(db_path: Optional[str], session: str,
-                  task_ids: Iterable[str]) -> tuple[int, str]:
-    """Stop the affected watch items; return ``(stopped, error)``.
-
-    The error is returned rather than swallowed: ownership has already moved, so the caller must
-    report a partial success instead of exiting 0 while the old owner keeps polling.
-    """
-    try:
-        stopped = watches.WatchStore(db_path).cancel_session(session, task_ids=list(task_ids))
-        return stopped, ""
-    except Exception as exc:
-        logger.exception("A2A task admin: could not stop watches for %s", session)
-        return 0, str(exc)
 
 
 def list_tasks(*, db_path: Optional[str] = None, session: str = "", unowned: bool = False,
@@ -265,10 +245,16 @@ def release_tasks(*, db_path: Optional[str] = None, session: str = "",
     if not all_tasks and not requested:
         return Result("release", EXIT_USAGE, "Error: pass --all or at least one --task.")
     # Count the deliveries release is about to drop: it removes them in the same transaction.
-    pending = _all_pending(db_path)
-    # --all is selected under the release lock, not from an earlier snapshot: a task acquired
-    # after the command started keeps its ownership and must keep its watch and delivery.
-    released, refused = store.release_many(None if all_tasks else requested, session)
+    events = _all_pending_events(db_path)
+    # --all is selected under the release lock, not from an earlier snapshot; cleanup runs in
+    # that same transaction, so a task reacquired afterwards keeps its new watch and delivery.
+    try:
+        released, refused, stopped = store.release_many(
+            None if all_tasks else requested, session)
+    except Exception as exc:
+        logger.exception("A2A task admin: release failed for %s", session)
+        return Result("release", EXIT_ERROR,
+                      f"Nothing released: the ownership transaction failed and rolled back: {exc}")
     if refused:
         owners = _owner_map(store, refused)
         detail = ", ".join(f"{task_id} (owner: {owners.get(task_id) or 'unowned'})"
@@ -277,21 +263,18 @@ def release_tasks(*, db_path: Optional[str] = None, session: str = "",
                       f"Nothing released: not owned by {session}: {detail}.")
     if not released:
         return Result("release", EXIT_NOTHING, f"No tasks are owned by {session}.")
-    dropped = sum(pending.get(task_id, 0) for task_id in released)
-    stopped, cleanup_error = _watch_cancel(db_path, session, released)
+    released_set = set(released)
+    # One aggregate event can name several tasks; the batch total counts it once.
+    dropped = sum(1 for named in events.values() if named & released_set)
     lines = [f"Released {len(released)} task(s) owned by {session}; stopped "
              f"{stopped} watch(es); dropped {dropped} pending deliver(ies)."]
     rows = _rows_for_ids(db_path, released)
     by_id = {row["task_id"]: row for row in rows}
     for task_id in released:
         row = by_id.get(task_id, {})
+        participation = sum(1 for named in events.values() if task_id in named)
         lines.append(f"  {task_id}  {row.get('peer', '-')}  {row.get('state', '-')}  "
-                     f"{pending.get(task_id, 0)} pending delivery(ies) dropped")
-    if cleanup_error:
-        lines.append(f"Warning: ownership changed, but watch cleanup failed: {cleanup_error}. "
-                     f"Run `hermes a2a-tasks list --session {session}` and cancel any watch "
-                     f"still polling there.")
-        return Result("release", EXIT_PARTIAL, "\n".join(lines), rows)
+                     f"{participation} pending delivery(ies) dropped")
     return Result("release", EXIT_OK, "\n".join(lines), rows)
 
 
@@ -307,27 +290,26 @@ def transfer_tasks(*, db_path: Optional[str] = None, from_session: str = "", to_
     ids = requested or store.owned_ids(from_session)
     if not ids:
         return Result("transfer", EXIT_NOTHING, f"No tasks are owned by {from_session}.")
-    pending = _affected_pending(db_path, ids)
-    transferred, refused = store.transfer_many(ids, from_session, to_session)
+    events = _all_pending_events(db_path)
+    try:
+        transferred, refused, stopped = store.transfer_many(ids, from_session, to_session)
+    except Exception as exc:
+        logger.exception("A2A task admin: transfer failed for %s", from_session)
+        return Result("transfer", EXIT_ERROR,
+                      f"Nothing transferred: the ownership transaction failed and rolled back: {exc}")
     if refused:
         owners = _owner_map(store, refused)
         detail = ", ".join(f"{task_id} (owner: {owners.get(task_id) or 'unowned'})"
                            for task_id in refused)
         return Result("transfer", EXIT_CONFLICT,
                       f"Nothing transferred: not owned by {from_session}: {detail}.")
-    dropped = sum(pending.get(task_id, 0) for task_id in transferred)
-    stopped, cleanup_error = _watch_cancel(db_path, from_session, transferred)
+    dropped = sum(1 for named in events.values() if named & set(transferred))
     lines = [f"Transferred {len(transferred)} task(s) from {from_session} to {to_session}; "
              f"stopped {stopped} watch(es); dropped {dropped} pending deliver(ies). "
              f"The new owner's backlog is untouched."]
     rows = _rows_for_ids(db_path, transferred)
     for row in rows:
         lines.append(f"  {row['task_id']}  {row['peer']}  {row['state']}  -> {to_session}")
-    if cleanup_error:
-        lines.append(f"Warning: ownership moved, but watch cleanup failed: {cleanup_error}. "
-                     f"Run `hermes a2a-tasks list --session {from_session}` and cancel any watch "
-                     f"still polling there.")
-        return Result("transfer", EXIT_PARTIAL, "\n".join(lines), rows)
     return Result("transfer", EXIT_OK, "\n".join(lines), rows)
 
 

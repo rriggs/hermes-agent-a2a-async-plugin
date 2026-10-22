@@ -180,16 +180,17 @@ class OwnershipStore:
             return cur.rowcount
 
     def release_many(self, task_ids: Optional[Iterable[str]], session_id: str,
-                     now: Optional[float] = None) -> tuple[list[str], list[str]]:
-        """Release a set of tasks atomically; returns ``(released, refused)``.
+                     now: Optional[float] = None) -> tuple[list[str], list[str], int]:
+        """Release a set of tasks atomically; returns ``(released, refused, watches_stopped)``.
 
         ``task_ids=None`` releases every task the session owns, selected under the same write
         lock. Every explicit task must currently be owned by ``session_id``; if any is not,
         nothing changes and every id is refused: a partial release would leave the operator
-        unsure which tasks moved.
+        unsure which tasks moved. Watch cleanup runs in this same transaction, so a task the
+        session reacquires after the commit keeps its new watch and pending delivery.
         """
         if not session_id:
-            return [], []
+            return [], [], 0
         now = time.time() if now is None else now
         with self._session() as con:
             if not con.in_transaction:
@@ -203,7 +204,7 @@ class OwnershipStore:
             else:
                 ids = list(dict.fromkeys(str(t) for t in task_ids if t))
             if not ids:
-                return [], []
+                return [], [], 0
             marks = ",".join("?" for _ in ids)
             rows = con.execute(
                 f"SELECT task_id, owner_session_id FROM a2a_tasks WHERE task_id IN ({marks})",
@@ -211,7 +212,7 @@ class OwnershipStore:
             owners = {str(r["task_id"]): str(r["owner_session_id"] or "") for r in rows}
             refused = [task_id for task_id in ids if owners.get(task_id) != session_id]
             if refused:
-                return [], refused
+                return [], refused, 0
             con.execute(
                 f"""UPDATE a2a_tasks
                       SET owner_session_id='', released_by_session_id=?, released_at=?,
@@ -220,11 +221,15 @@ class OwnershipStore:
                 (session_id, now, now, *ids))
             for task_id in ids:
                 self._drop_publications(con, task_id)
-            return ids, []
+            from . import watches as watches_mod
+            stopped = watches_mod.WatchStore.cleanup_for_released_tasks(
+                con, session_id, ids, now)
+            return ids, [], stopped
 
     def transfer_many(self, task_ids: Iterable[str], from_session: str, to_session: str,
-                      now: Optional[float] = None) -> tuple[list[str], list[str]]:
-        """Move ownership of a set of tasks atomically; returns ``(transferred, refused)``.
+                      now: Optional[float] = None) -> tuple[list[str], list[str], int]:
+        """Move ownership of a set of tasks atomically; returns ``(transferred, refused,
+        watches_stopped)``.
 
         All tasks must be owned by ``from_session`` and the two sessions must differ. The
         ownership change and the removal of the previous owner's pending publications for those
@@ -232,7 +237,7 @@ class OwnershipStore:
         """
         ids = list(dict.fromkeys(str(t) for t in task_ids if t))
         if not ids or not from_session or not to_session or from_session == to_session:
-            return [], ids
+            return [], ids, 0
         now = time.time() if now is None else now
         marks = ",".join("?" for _ in ids)
         with self._session() as con:
@@ -245,7 +250,7 @@ class OwnershipStore:
             refused = [task_id for task_id in ids
                        if owners.get(task_id) != from_session]
             if refused:
-                return [], refused
+                return [], refused, 0
             con.execute(
                 f"""UPDATE a2a_tasks
                       SET owner_session_id=?, owned_at=?, released_at=0, unowned_since=0,
@@ -254,7 +259,10 @@ class OwnershipStore:
                 (to_session, now, *ids))
             for task_id in ids:
                 self._drop_publications(con, task_id)
-            return ids, []
+            from . import watches as watches_mod
+            stopped = watches_mod.WatchStore.cleanup_for_released_tasks(
+                con, from_session, ids, now)
+            return ids, [], stopped
 
     def reclaim(self, session_id: str, now: Optional[float] = None) -> tuple[list[str], list[str]]:
         """Re-acquire what ``session_id`` released before it ended.

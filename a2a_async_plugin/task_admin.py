@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shlex
 import sqlite3
@@ -24,6 +25,11 @@ EXIT_OK = 0
 EXIT_NOTHING = 1
 EXIT_USAGE = 2
 EXIT_CONFLICT = 3
+# Ownership moved, but a follow-up cleanup (watch cancellation) failed. The change is real, so
+# this is not a conflict, but the command did not finish its job.
+EXIT_PARTIAL = 4
+
+logger = logging.getLogger(__name__)
 
 USAGE = (
     "usage: a2a-tasks list   [--session <id>] [--unowned] [--task <id> ...]\n"
@@ -78,6 +84,27 @@ def _age(timestamp: float) -> str:
     return f"{seconds // 86400}d"
 
 
+def _publication_task_ids(metadata_json: str) -> set[str]:
+    """Task ids named by one publication: ``task_id`` or a ``tasks`` list (peer/task form)."""
+    try:
+        metadata = json.loads(metadata_json or "{}")
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(metadata, dict):
+        return set()
+    ids: set[str] = set()
+    task_id = str(metadata.get("task_id") or "")
+    if task_id:
+        ids.add(task_id)
+    for listed in metadata.get("tasks") or []:
+        name = str(listed)
+        if "/" in name:
+            name = name.rsplit("/", 1)[-1]
+        if name:
+            ids.add(name)
+    return ids
+
+
 def _pending_counts(con: sqlite3.Connection) -> dict[str, int]:
     """Undelivered outbox rows per task, parsed in Python (metadata JSON is not queryable)."""
     counts: dict[str, int] = {}
@@ -88,12 +115,7 @@ def _pending_counts(con: sqlite3.Connection) -> dict[str, int]:
     except sqlite3.Error:
         return counts
     for row in rows:
-        try:
-            metadata = json.loads(row["metadata_json"] or "{}")
-        except (TypeError, ValueError):
-            continue
-        task_id = str(metadata.get("task_id") or "")
-        if task_id:
+        for task_id in _publication_task_ids(row["metadata_json"]):
             counts[task_id] = counts.get(task_id, 0) + 1
     return counts
 
@@ -188,13 +210,29 @@ def _affected_pending(db_path: Optional[str], task_ids: Iterable[str]) -> dict[s
         con.close()
 
 
-def _watch_cancel(db_path: Optional[str], session: str,
-                  task_ids: Optional[Iterable[str]]) -> int:
+def _all_pending(db_path: Optional[str]) -> dict[str, int]:
+    con = _read_only_conn(db_path)
+    if con is None:
+        return {}
     try:
-        return watches.WatchStore(db_path).cancel_session(
-            session, task_ids=None if task_ids is None else list(task_ids))
-    except Exception:
-        return 0
+        return _pending_counts(con)
+    finally:
+        con.close()
+
+
+def _watch_cancel(db_path: Optional[str], session: str,
+                  task_ids: Iterable[str]) -> tuple[int, str]:
+    """Stop the affected watch items; return ``(stopped, error)``.
+
+    The error is returned rather than swallowed: ownership has already moved, so the caller must
+    report a partial success instead of exiting 0 while the old owner keeps polling.
+    """
+    try:
+        stopped = watches.WatchStore(db_path).cancel_session(session, task_ids=list(task_ids))
+        return stopped, ""
+    except Exception as exc:
+        logger.exception("A2A task admin: could not stop watches for %s", session)
+        return 0, str(exc)
 
 
 def list_tasks(*, db_path: Optional[str] = None, session: str = "", unowned: bool = False,
@@ -226,20 +264,21 @@ def release_tasks(*, db_path: Optional[str] = None, session: str = "",
     requested = [str(t) for t in task_ids if t]
     if not all_tasks and not requested:
         return Result("release", EXIT_USAGE, "Error: pass --all or at least one --task.")
-    ids = requested or store.owned_ids(session)
-    if not ids:
-        return Result("release", EXIT_NOTHING, f"No tasks are owned by {session}.")
     # Count the deliveries release is about to drop: it removes them in the same transaction.
-    pending = _affected_pending(db_path, ids)
-    released, refused = store.release_many(ids, session)
+    pending = _all_pending(db_path)
+    # --all is selected under the release lock, not from an earlier snapshot: a task acquired
+    # after the command started keeps its ownership and must keep its watch and delivery.
+    released, refused = store.release_many(None if all_tasks else requested, session)
     if refused:
         owners = _owner_map(store, refused)
         detail = ", ".join(f"{task_id} (owner: {owners.get(task_id) or 'unowned'})"
                            for task_id in refused)
         return Result("release", EXIT_CONFLICT,
                       f"Nothing released: not owned by {session}: {detail}.")
+    if not released:
+        return Result("release", EXIT_NOTHING, f"No tasks are owned by {session}.")
     dropped = sum(pending.get(task_id, 0) for task_id in released)
-    stopped = _watch_cancel(db_path, session, None if all_tasks else released)
+    stopped, cleanup_error = _watch_cancel(db_path, session, released)
     lines = [f"Released {len(released)} task(s) owned by {session}; stopped "
              f"{stopped} watch(es); dropped {dropped} pending deliver(ies)."]
     rows = _rows_for_ids(db_path, released)
@@ -248,6 +287,11 @@ def release_tasks(*, db_path: Optional[str] = None, session: str = "",
         row = by_id.get(task_id, {})
         lines.append(f"  {task_id}  {row.get('peer', '-')}  {row.get('state', '-')}  "
                      f"{pending.get(task_id, 0)} pending delivery(ies) dropped")
+    if cleanup_error:
+        lines.append(f"Warning: ownership changed, but watch cleanup failed: {cleanup_error}. "
+                     f"Run `hermes a2a-tasks list --session {session}` and cancel any watch "
+                     f"still polling there.")
+        return Result("release", EXIT_PARTIAL, "\n".join(lines), rows)
     return Result("release", EXIT_OK, "\n".join(lines), rows)
 
 
@@ -272,13 +316,18 @@ def transfer_tasks(*, db_path: Optional[str] = None, from_session: str = "", to_
         return Result("transfer", EXIT_CONFLICT,
                       f"Nothing transferred: not owned by {from_session}: {detail}.")
     dropped = sum(pending.get(task_id, 0) for task_id in transferred)
-    stopped = _watch_cancel(db_path, from_session, transferred)
+    stopped, cleanup_error = _watch_cancel(db_path, from_session, transferred)
     lines = [f"Transferred {len(transferred)} task(s) from {from_session} to {to_session}; "
              f"stopped {stopped} watch(es); dropped {dropped} pending deliver(ies). "
              f"The new owner's backlog is untouched."]
     rows = _rows_for_ids(db_path, transferred)
     for row in rows:
         lines.append(f"  {row['task_id']}  {row['peer']}  {row['state']}  -> {to_session}")
+    if cleanup_error:
+        lines.append(f"Warning: ownership moved, but watch cleanup failed: {cleanup_error}. "
+                     f"Run `hermes a2a-tasks list --session {from_session}` and cancel any watch "
+                     f"still polling there.")
+        return Result("transfer", EXIT_PARTIAL, "\n".join(lines), rows)
     return Result("transfer", EXIT_OK, "\n".join(lines), rows)
 
 

@@ -35,14 +35,19 @@ SESSION_B = "sess-B"
 @pytest.fixture(autouse=True)
 def _isolate(monkeypatch, tmp_path):
     monkeypatch.setenv("A2A_TASKS_DB", str(tmp_path / "a2a_tasks.db"))
-    from gateway.session_context import set_session_vars
+    try:
+        from gateway.session_context import clear_session_vars, set_session_vars
+    except Exception:
+        # Standalone execution (no Hermes checkout importable): the command core does not need
+        # the gateway's session vars, so the tests still run.
+        yield
+        return
     tokens = set_session_vars(platform="telegram", source="telegram", chat_id="42",
                               chat_type="dm", session_key="agent:main:telegram:dm:42",
                               session_id=SESSION_A)
     try:
         yield
     finally:
-        from gateway.session_context import clear_session_vars
         clear_session_vars(tokens)
 
 
@@ -123,8 +128,8 @@ def test_release_all_clears_ownership_and_keeps_the_backlog():
         "a queued peer message must stay for the next owner")
     assert _pending_ids() == [], "the previous owner's pending delivery must be dropped"
     watch = watches.WatchStore().get("w1")
-    assert watch["state"] == watches.WATCH_CANCELED, (
-        "releasing everything stops the session's watch outright")
+    assert watch["state"] == watches.WATCH_COMPLETE, (
+        "releasing everything settles the session's watch without touching other tasks")
 
 
 def test_release_is_atomic_when_one_task_is_not_owned():
@@ -232,3 +237,56 @@ def test_cli_and_slash_list_produce_the_same_text(capsys):
 
     assert code == 0
     assert cli_text.strip() == slash_text.strip(), "the two surfaces must not drift"
+
+
+def test_release_all_leaves_a_task_acquired_after_the_release_untouched(monkeypatch):
+    """A11-1: cleanup is scoped to the tasks this release moved, not the whole session."""
+    _task("t1", session=SESSION_A)
+    _watch(SESSION_A, [("peer", "t1")])
+    real_release_many = ownership.OwnershipStore.release_many
+
+    def release_then_acquire(self, task_ids, session_id, now=None):
+        out = real_release_many(self, task_ids, session_id, now)
+        _task("t3", session=SESSION_A)
+        _watch(SESSION_A, [("peer", "t3")], watch_id="w3")
+        return out
+
+    monkeypatch.setattr(ownership.OwnershipStore, "release_many", release_then_acquire)
+
+    result = task_admin.release_tasks(session=SESSION_A, all_tasks=True)
+
+    assert result.exit_code == 0, result.text
+    assert _owner("t1") == ""
+    assert _owner("t3") == SESSION_A, "a task acquired after the release must stay owned"
+    assert watches.WatchStore().get("w3")["state"] == watches.WATCH_ACTIVE, (
+        "its watch must not be cancelled by the earlier release")
+
+
+def test_transfer_reports_a_partial_result_when_watch_cleanup_fails(monkeypatch):
+    """A11-2: ownership moved, so exit 0 would hide a watch still polling the old session."""
+    _task("t1", session=SESSION_A)
+
+    def fail(self, session, task_ids=None):
+        raise RuntimeError("watch store unavailable")
+
+    monkeypatch.setattr(watches.WatchStore, "cancel_session", fail)
+
+    result = task_admin.transfer_tasks(from_session=SESSION_A, to_session=SESSION_B)
+
+    assert result.exit_code == task_admin.EXIT_PARTIAL
+    assert "watch cleanup failed" in result.text
+    assert _owner("t1") == SESSION_B
+
+
+def test_pending_counts_include_aggregate_task_lists():
+    """A11-4: an aggregate publication names its tasks in metadata['tasks'], not task_id."""
+    _task("t1")
+    _task("t2")
+    _watch(SESSION_A, [("peer", "t1"), ("peer", "t2")], watch_id="wa")
+    watches.WatchStore().enqueue_publication(
+        watch_id="wa", event_id="agg", content="aggregate",
+        metadata={"source": "a2a", "tasks": ["peer/t1", "peer/t2"]})
+
+    listing = task_admin.list_tasks(task_ids=["t1", "t2"])
+
+    assert [row["pending"] for row in listing.rows] == [1, 1]

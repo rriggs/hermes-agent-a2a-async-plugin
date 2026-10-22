@@ -179,21 +179,32 @@ class OwnershipStore:
                 self._drop_publications(con, task_id)
             return cur.rowcount
 
-    def release_many(self, task_ids: Iterable[str], session_id: str,
+    def release_many(self, task_ids: Optional[Iterable[str]], session_id: str,
                      now: Optional[float] = None) -> tuple[list[str], list[str]]:
         """Release a set of tasks atomically; returns ``(released, refused)``.
 
-        Every task must currently be owned by ``session_id``. If any is not, nothing changes and
-        every id is refused: a partial release would leave the operator unsure which tasks moved.
+        ``task_ids=None`` releases every task the session owns, selected under the same write
+        lock. Every explicit task must currently be owned by ``session_id``; if any is not,
+        nothing changes and every id is refused: a partial release would leave the operator
+        unsure which tasks moved.
         """
-        ids = list(dict.fromkeys(str(t) for t in task_ids if t))
-        if not ids or not session_id:
-            return [], ids
+        if not session_id:
+            return [], []
         now = time.time() if now is None else now
-        marks = ",".join("?" for _ in ids)
         with self._session() as con:
             if not con.in_transaction:
                 con.execute("BEGIN IMMEDIATE")
+            if task_ids is None:
+                # Snapshot inside the lock: a task acquired after this point keeps its ownership
+                # and must not have its watch or pending delivery removed by this release.
+                ids = [str(row["task_id"]) for row in con.execute(
+                    """SELECT task_id FROM a2a_tasks WHERE owner_session_id=?
+                        ORDER BY created_at, task_id""", (session_id,))]
+            else:
+                ids = list(dict.fromkeys(str(t) for t in task_ids if t))
+            if not ids:
+                return [], []
+            marks = ",".join("?" for _ in ids)
             rows = con.execute(
                 f"SELECT task_id, owner_session_id FROM a2a_tasks WHERE task_id IN ({marks})",
                 (*ids,)).fetchall()

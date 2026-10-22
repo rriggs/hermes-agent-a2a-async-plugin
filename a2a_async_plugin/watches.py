@@ -1521,23 +1521,33 @@ class WatchManager:
         task_id, peer, watch_id = item["task_id"], item["peer"], watch["watch_id"]
         session_id = str(watch.get("session_id") or "")
         text = _reply_text(payload)
+        terminal = raw_state in protocol.TERMINAL_STATES
+        if terminal:
+            # The row must exist before the fenced state update; creating a missing row cannot
+            # clobber an adopter's record because there is none.
+            self._ensure_task_record(task_id, context_id, peer, raw_state)
 
-        if raw_state in protocol.TERMINAL_STATES:
-            self._reconcile_local_task(task_id, raw_state, text, context_id, peer)
+        queued = self._record_messages(
+            task_id, peer, payload, raw_state, session_id,
+            state=raw_state if terminal else "", reply=text if terminal else "")
+        if queued is None:
+            # Ownership moved while this poll was in flight. Recording and the task-state
+            # transition share the fence, so nothing was written, including the reply. This
+            # watch's session no longer owns the task: stop polling it.
+            self.store.mark_item(watch_id, peer, task_id, ITEM_UNWATCHED, owner=self.owner)
+            logger.debug("A2A watch: %s/%s changed owner; observation not recorded",
+                         task_id, peer)
+            return
+        if terminal:
+            # The durable state/reply committed with the observation; only the transcript mirror
+            # and the status line remain, and only for an authorized poll.
+            self._mirror_terminal(task_id, text, context_id, peer)
             self._mark_status_dirty(session_id)
         elif raw_state == protocol.STATE_INPUT_REQUIRED:
             self._mark_status_dirty(session_id)
         else:
             self.store.record_working(watch_id, peer, task_id, raw_state, context_id,
                                       next_poll_at=now + self.interval, owner=self.owner)
-
-        queued = self._record_messages(task_id, peer, payload, raw_state, session_id)
-        if queued is None:
-            # The task was released and adopted while this poll was in flight. Recording is
-            # fenced inside the ownership transaction, so the new owner's backlog is untouched.
-            logger.debug("A2A watch: %s/%s changed owner; observation not recorded",
-                         task_id, peer)
-            return
         delivered: list[str] = []
         enqueue_failed = False
         # Artifacts are deliverables, not progress notes: a streaming peer that grows one
@@ -1582,7 +1592,8 @@ class WatchManager:
                                  short_state=_short_state(raw_state), owner=self.owner)
 
     def _record_messages(self, task_id: str, peer: str, payload: dict,
-                         raw_state: str, session_id: str = "") -> Optional[list[dict]]:
+                         raw_state: str, session_id: str = "",
+                         *, state: str = "", reply: str = "") -> Optional[list[dict]]:
         """Store every new peer message on the task; returns the undelivered rows.
 
         ``None`` means another session owns the task now: the observation is refused and nothing
@@ -1620,7 +1631,8 @@ class WatchManager:
                 and not self.ownership.has_kind(task_id, "result")):
             entries.append((f"state:{raw_state}", "result",
                             f"task reached {_short_state(raw_state)} with no text reply", False))
-        return self.ownership.record_messages(task_id, entries, session_id=session_id)
+        return self.ownership.record_messages(task_id, entries, session_id=session_id,
+                                              state=state, reply=reply)
 
     def _maintain_unowned(self, now: float) -> None:
         """Cancel unowned tasks after the configured delay, abandon them after the TTL."""
@@ -1654,15 +1666,20 @@ class WatchManager:
             if self.ownership.abandon(task_id, now, rec.get("released_at")):
                 logger.info("A2A: abandoned unowned task %s after the TTL", task_id)
 
-    def _reconcile_local_task(self, task_id: str, raw_state: str, text: str,
-                              context_id: str, peer: str) -> None:
-        """Update the shared task record from an authoritative terminal payload."""
+    def _ensure_task_record(self, task_id: str, context_id: str, peer: str,
+                            raw_state: str) -> None:
+        """Create the shared row when a watch predates it; never touch an existing record."""
         store = protocol.TaskStore(self.store.db_path)
-        record = store.get(task_id)
-        if record is None:
+        if store.get(task_id) is None:
             store.create(task_id, context_id or task_id, peer, direction="outbound",
                          ownership="remote", remote_state=raw_state)
-        store.complete(task_id, raw_state, text)
+
+    def _mirror_terminal(self, task_id: str, text: str, context_id: str, peer: str) -> None:
+        """Mirror an authorized terminal observation into the transcript.
+
+        The task state and reply were written by the fenced recording transaction; this only
+        persists the peer text for replay and is best-effort.
+        """
         if context_id and text:
             self._persist_peer_text(context_id, text, task_id, peer)
 

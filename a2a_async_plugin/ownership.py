@@ -365,7 +365,8 @@ class OwnershipStore:
     def record_messages(self, task_id: str,
                         messages: Iterable[tuple[str, str, str, bool]],
                         *, session_id: str = "",
-                        require_owner: bool = False) -> Optional[list[dict]]:
+                        require_owner: bool = False,
+                        state: str = "", reply: str = "") -> Optional[list[dict]]:
         """Apply one observation's message upserts under the ownership write lock.
 
         ``messages`` is ``(message_id, kind, text, update_existing)`` per peer message. Recording
@@ -373,6 +374,10 @@ class OwnershipStore:
         too late: a release and adoption that commit in between would let the old owner overwrite
         the adopter's queued answer before being refused. ``BEGIN IMMEDIATE`` here takes the same
         lock ``release``/``acquire`` take, and the owner is read inside it.
+
+        ``state``/``reply`` fold the task-record transition into the same transaction: a stale
+        poll must not terminalize a task another session has adopted, and a crash between the
+        observation and ``TaskStore.complete`` must not lose the peer's final text.
 
         Returns the still-undelivered rows, or ``None`` when this caller may not record: another
         session owns the task, or ``require_owner`` is set and the task is unowned. A session-less
@@ -391,6 +396,8 @@ class OwnershipStore:
             if owner != str(session_id or ""):
                 if owner or require_owner:
                     return None
+            if state:
+                self._apply_state_transition(con, task_id, state, reply, now)
             for message_id, kind, text, update_existing in entries:
                 if update_existing:
                     con.execute(
@@ -434,6 +441,38 @@ class OwnershipStore:
                 "SELECT 1 FROM a2a_task_messages WHERE task_id=? AND kind=? LIMIT 1",
                 (task_id, kind)).fetchone()
         return row is not None
+
+    @staticmethod
+    def _apply_state_transition(con: sqlite3.Connection, task_id: str, state: str,
+                                reply: str, now: float) -> None:
+        """Fold a task state/reply transition into the caller's transaction.
+
+        Mirrors ``TaskStore.complete``/``set_state``: a terminal row cannot be overwritten, so a
+        later poll cannot rewrite (or un-terminalize) an answer already recorded. One narrow
+        escape hatch: a terminal row whose reply is EMPTY may be replaced by a terminal report
+        that carries text. Callers must hold the ownership write lock first.
+        """
+        terminal_marks = ",".join("?" for _ in TERMINAL_REMOTE_STATES)
+        if state in TERMINAL_REMOTE_STATES:
+            con.execute(
+                f"""UPDATE a2a_tasks
+                      SET state=?,
+                          remote_state=CASE WHEN direction='outbound' THEN ?
+                                            ELSE remote_state END,
+                          reply=?, completed_at=?
+                    WHERE task_id=?
+                      AND (state NOT IN ({terminal_marks})
+                           OR (reply='' AND ?<>''))""",
+                (state, state, reply or "", now, task_id,
+                 *TERMINAL_REMOTE_STATES, reply or ""))
+        else:
+            con.execute(
+                f"""UPDATE a2a_tasks
+                      SET state=?,
+                          remote_state=CASE WHEN direction='outbound' THEN ?
+                                            ELSE remote_state END
+                    WHERE task_id=? AND state NOT IN ({terminal_marks})""",
+                (state, state, task_id, *TERMINAL_REMOTE_STATES))
 
     def consume_if_owned(self, task_id: str, session_id: str,
                          message_ids: list[str], *, state: Optional[str] = None,
@@ -485,37 +524,7 @@ class OwnershipStore:
                     # queued for the caller's re-read.
                     raise RevisionConflict(task_id, stale)
             if state:
-                # Mirror TaskStore.complete/set_state: both refuse a transition out of a terminal
-                # state, so a later poll that re-reports a different state cannot overwrite (or
-                # un-terminalize) an answer already recorded (local review round 2, N1).
-                #
-                # One escape hatch: a terminal row whose reply is EMPTY may be replaced by a
-                # terminal report that actually carries text. That is how a row terminalized
-                # without an answer (a get_task failure) still records the answer that arrives
-                # later. It is deliberately narrow — a text-less report can never flip a finished
-                # task, so a stale WORKING/INPUT_REQUIRED cannot un-terminalize it into the
-                # auto-cancel sweep, and a stale FAILED cannot rewrite a completed task (round 4).
-                terminal_marks = ",".join("?" for _ in TERMINAL_REMOTE_STATES)
-                if state in TERMINAL_REMOTE_STATES:
-                    con.execute(
-                        f"""UPDATE a2a_tasks
-                              SET state=?,
-                                  remote_state=CASE WHEN direction='outbound' THEN ?
-                                                    ELSE remote_state END,
-                                  reply=?, completed_at=?
-                            WHERE task_id=?
-                              AND (state NOT IN ({terminal_marks})
-                                   OR (reply='' AND ?<>''))""",
-                        (state, state, reply or "", now, task_id,
-                         *TERMINAL_REMOTE_STATES, reply or ""))
-                else:
-                    con.execute(
-                        f"""UPDATE a2a_tasks
-                              SET state=?,
-                                  remote_state=CASE WHEN direction='outbound' THEN ?
-                                                    ELSE remote_state END
-                            WHERE task_id=? AND state NOT IN ({terminal_marks})""",
-                        (state, state, task_id, *TERMINAL_REMOTE_STATES))
+                self._apply_state_transition(con, task_id, state, reply, now)
             for message_id in message_ids:
                 # The ownership condition is repeated on the UPDATE itself so the mark stays
                 # fenced even if a caller ever runs this inside an already-open transaction.

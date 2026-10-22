@@ -2049,3 +2049,32 @@ def test_a2a_list_reports_watches_and_their_task_states(monkeypatch):
     listed = tools.a2a_list({"kind": "watches"}, session_id=SESSION_ID)
     assert "state=complete" in listed, listed
     assert "peer/t1 completed" in listed, listed
+
+
+def test_a_stale_poll_cannot_terminalize_an_adopted_task():
+    """Amy PR #9 round 2 P1: the task state/reply transition is part of the fenced observation."""
+    manager = _manager(ScriptedPoll(task_payload(state=protocol.STATE_WORKING)))
+    watch = _add(manager)
+    item = dict(_store().get(watch["watch_id"])["items"][0])
+    store = manager.ownership
+    other = "sess-new"
+    assert store.release("t1", SESSION_ID)
+    assert store.acquire("t1", other)
+    store.add_message("t1", "new-answer", "result", "NEW ANSWER")
+    # A real poll owns the watch lease; the direct _apply_payload call must hold it too.
+    with _store()._session() as con:
+        con.execute("UPDATE a2a_watches SET lease_owner=? WHERE watch_id=?",
+                    (manager.owner, watch["watch_id"]))
+
+    manager._apply_payload(_store().get(watch["watch_id"]), item,
+                           task_payload(state=protocol.STATE_FAILED, text="STALE ANSWER"),
+                           now=100.0)
+
+    record = protocol.TaskStore().get("t1")
+    assert record["state"] != protocol.STATE_FAILED, (
+        "a stale poll must not terminalize a task another session adopted")
+    assert record["reply"] != "STALE ANSWER"
+    assert [m["text"] for m in store.queued("t1")] == ["NEW ANSWER"], (
+        "the adopter's queued answer must survive the stale poll")
+    assert _store().get(watch["watch_id"])["items"][0]["state"] == watches.ITEM_UNWATCHED, (
+        "the watch must stop polling a task it no longer owns")

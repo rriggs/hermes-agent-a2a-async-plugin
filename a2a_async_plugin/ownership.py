@@ -179,6 +179,72 @@ class OwnershipStore:
                 self._drop_publications(con, task_id)
             return cur.rowcount
 
+    def release_many(self, task_ids: Iterable[str], session_id: str,
+                     now: Optional[float] = None) -> tuple[list[str], list[str]]:
+        """Release a set of tasks atomically; returns ``(released, refused)``.
+
+        Every task must currently be owned by ``session_id``. If any is not, nothing changes and
+        every id is refused: a partial release would leave the operator unsure which tasks moved.
+        """
+        ids = list(dict.fromkeys(str(t) for t in task_ids if t))
+        if not ids or not session_id:
+            return [], ids
+        now = time.time() if now is None else now
+        marks = ",".join("?" for _ in ids)
+        with self._session() as con:
+            if not con.in_transaction:
+                con.execute("BEGIN IMMEDIATE")
+            rows = con.execute(
+                f"SELECT task_id, owner_session_id FROM a2a_tasks WHERE task_id IN ({marks})",
+                (*ids,)).fetchall()
+            owners = {str(r["task_id"]): str(r["owner_session_id"] or "") for r in rows}
+            refused = [task_id for task_id in ids if owners.get(task_id) != session_id]
+            if refused:
+                return [], refused
+            con.execute(
+                f"""UPDATE a2a_tasks
+                      SET owner_session_id='', released_by_session_id=?, released_at=?,
+                          unowned_since=?
+                    WHERE task_id IN ({marks})""",
+                (session_id, now, now, *ids))
+            for task_id in ids:
+                self._drop_publications(con, task_id)
+            return ids, []
+
+    def transfer_many(self, task_ids: Iterable[str], from_session: str, to_session: str,
+                      now: Optional[float] = None) -> tuple[list[str], list[str]]:
+        """Move ownership of a set of tasks atomically; returns ``(transferred, refused)``.
+
+        All tasks must be owned by ``from_session`` and the two sessions must differ. The
+        ownership change and the removal of the previous owner's pending publications for those
+        tasks commit together; undelivered peer messages stay queued for the new owner.
+        """
+        ids = list(dict.fromkeys(str(t) for t in task_ids if t))
+        if not ids or not from_session or not to_session or from_session == to_session:
+            return [], ids
+        now = time.time() if now is None else now
+        marks = ",".join("?" for _ in ids)
+        with self._session() as con:
+            if not con.in_transaction:
+                con.execute("BEGIN IMMEDIATE")
+            rows = con.execute(
+                f"SELECT task_id, owner_session_id FROM a2a_tasks WHERE task_id IN ({marks})",
+                (*ids,)).fetchall()
+            owners = {str(r["task_id"]): str(r["owner_session_id"] or "") for r in rows}
+            refused = [task_id for task_id in ids
+                       if owners.get(task_id) != from_session]
+            if refused:
+                return [], refused
+            con.execute(
+                f"""UPDATE a2a_tasks
+                      SET owner_session_id=?, owned_at=?, released_at=0, unowned_since=0,
+                          released_by_session_id=''
+                    WHERE task_id IN ({marks})""",
+                (to_session, now, *ids))
+            for task_id in ids:
+                self._drop_publications(con, task_id)
+            return ids, []
+
     def reclaim(self, session_id: str, now: Optional[float] = None) -> tuple[list[str], list[str]]:
         """Re-acquire what ``session_id`` released before it ended.
 
@@ -238,6 +304,16 @@ class OwnershipStore:
                 f"SELECT task_id, owner_session_id FROM a2a_tasks WHERE task_id IN ({marks})",
                 ids).fetchall()
         return {row["task_id"]: str(row["owner_session_id"] or "") for row in rows}
+
+    def owned_ids(self, session_id: str) -> list[str]:
+        """Task ids currently owned by ``session_id``, oldest first."""
+        if not session_id:
+            return []
+        with self._session() as con:
+            rows = con.execute(
+                """SELECT task_id FROM a2a_tasks WHERE owner_session_id=?
+                    ORDER BY created_at, task_id""", (session_id,)).fetchall()
+        return [str(row["task_id"]) for row in rows]
 
     # -- message backlog --------------------------------------------------
     def add_message(self, task_id: str, message_id: str, kind: str, text: str,

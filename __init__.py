@@ -41,8 +41,26 @@ def interactive_setup() -> None:
 def register(ctx) -> None:
     from .tools import register_tools
     from .adapter import A2AAdapter
+    from .task_admin import dispatch_namespace, register_cli, slash_command
 
     register_tools(ctx)
+    # Operator commands, not agent tools: ownership release/transfer is an explicit user action.
+    # Guarded so older hosts and minimal test contexts still load the tool surface.
+    register_cli_command = getattr(ctx, "register_cli_command", None)
+    if register_cli_command is not None:
+        register_cli_command(
+            name="a2a-tasks", help="Inspect, release, or transfer A2A task ownership",
+            setup_fn=register_cli, handler_fn=dispatch_namespace,
+            description=("Inspect, release, or transfer A2A task ownership in this profile's "
+                         "task store. Works without a running gateway."),
+        )
+    register_command = getattr(ctx, "register_command", None)
+    if register_command is not None:
+        register_command(
+            "a2a", handler=slash_command,
+            description="Inspect, release, or transfer A2A task ownership.",
+            args_hint="tasks [list|release|transfer] ...",
+        )
     ctx.register_platform(
         name="a2a", label="A2A", adapter_factory=lambda cfg: A2AAdapter(cfg),
         check_fn=check_requirements, validate_config=validate_config,

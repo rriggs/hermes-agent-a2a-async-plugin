@@ -9,7 +9,6 @@ gateway or a bound session.
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import shlex
@@ -84,27 +83,6 @@ def _age(timestamp: float) -> str:
     return f"{seconds // 86400}d"
 
 
-def _publication_task_ids(metadata_json: str) -> set[str]:
-    """Task ids named by one publication: ``task_id`` or a ``tasks`` list (peer/task form)."""
-    try:
-        metadata = json.loads(metadata_json or "{}")
-    except (TypeError, ValueError):
-        return set()
-    if not isinstance(metadata, dict):
-        return set()
-    ids: set[str] = set()
-    task_id = str(metadata.get("task_id") or "")
-    if task_id:
-        ids.add(task_id)
-    for listed in metadata.get("tasks") or []:
-        name = str(listed)
-        if "/" in name:
-            name = name.rsplit("/", 1)[-1]
-        if name:
-            ids.add(name)
-    return ids
-
-
 def _pending_events(con: sqlite3.Connection) -> dict[str, set[str]]:
     """Undelivered outbox rows -> the task ids each one names (one event can name several)."""
     events: dict[str, set[str]] = {}
@@ -116,7 +94,7 @@ def _pending_events(con: sqlite3.Connection) -> dict[str, set[str]]:
     except sqlite3.Error:
         return events
     for row in rows:
-        events[str(row["event_id"])] = _publication_task_ids(row["metadata_json"])
+        events[str(row["event_id"])] = ownership.publication_task_ids(row["metadata_json"])
     return events
 
 
@@ -205,16 +183,6 @@ def _owner_map(store: ownership.OwnershipStore, task_ids: Iterable[str]) -> dict
         return {}
 
 
-def _all_pending_events(db_path: Optional[str]) -> dict[str, set[str]]:
-    con = _read_only_conn(db_path)
-    if con is None:
-        return {}
-    try:
-        return _pending_events(con)
-    finally:
-        con.close()
-
-
 def list_tasks(*, db_path: Optional[str] = None, session: str = "", unowned: bool = False,
                task_ids: Iterable[str] = ()) -> Result:
     """List tasks, optionally filtered by owner, unowned state, or exact ids."""
@@ -245,11 +213,10 @@ def release_tasks(*, db_path: Optional[str] = None, session: str = "",
     if not all_tasks and not requested:
         return Result("release", EXIT_USAGE, "Error: pass --all or at least one --task.")
     # Count the deliveries release is about to drop: it removes them in the same transaction.
-    events = _all_pending_events(db_path)
     # --all is selected under the release lock, not from an earlier snapshot; cleanup runs in
     # that same transaction, so a task reacquired afterwards keeps its new watch and delivery.
     try:
-        released, refused, stopped = store.release_many(
+        released, refused, stopped, dropped_events = store.release_many(
             None if all_tasks else requested, session)
     except Exception as exc:
         logger.exception("A2A task admin: release failed for %s", session)
@@ -263,18 +230,20 @@ def release_tasks(*, db_path: Optional[str] = None, session: str = "",
                       f"Nothing released: not owned by {session}: {detail}.")
     if not released:
         return Result("release", EXIT_NOTHING, f"No tasks are owned by {session}.")
-    released_set = set(released)
-    # One aggregate event can name several tasks; the batch total counts it once.
-    dropped = sum(1 for named in events.values() if named & released_set)
+    # The deleted-outbox map is captured inside the transaction; nothing can arrive after it.
+    dropped = len(dropped_events)
     lines = [f"Released {len(released)} task(s) owned by {session}; stopped "
              f"{stopped} watch(es); dropped {dropped} pending deliver(ies)."]
     rows = _rows_for_ids(db_path, released)
     by_id = {row["task_id"]: row for row in rows}
     for task_id in released:
         row = by_id.get(task_id, {})
-        participation = sum(1 for named in events.values() if task_id in named)
+        participation = sum(1 for named in dropped_events.values() if task_id in named)
         lines.append(f"  {task_id}  {row.get('peer', '-')}  {row.get('state', '-')}  "
                      f"{participation} pending delivery(ies) dropped")
+        logger.info("A2A task admin: released task %s from %s", task_id, session)
+    logger.info("A2A task admin: released %d task(s) from %s (watches=%d, dropped=%d)",
+                len(released), session, stopped, dropped)
     return Result("release", EXIT_OK, "\n".join(lines), rows)
 
 
@@ -290,9 +259,9 @@ def transfer_tasks(*, db_path: Optional[str] = None, from_session: str = "", to_
     ids = requested or store.owned_ids(from_session)
     if not ids:
         return Result("transfer", EXIT_NOTHING, f"No tasks are owned by {from_session}.")
-    events = _all_pending_events(db_path)
     try:
-        transferred, refused, stopped = store.transfer_many(ids, from_session, to_session)
+        transferred, refused, stopped, dropped_events = store.transfer_many(
+            ids, from_session, to_session)
     except Exception as exc:
         logger.exception("A2A task admin: transfer failed for %s", from_session)
         return Result("transfer", EXIT_ERROR,
@@ -303,13 +272,17 @@ def transfer_tasks(*, db_path: Optional[str] = None, from_session: str = "", to_
                            for task_id in refused)
         return Result("transfer", EXIT_CONFLICT,
                       f"Nothing transferred: not owned by {from_session}: {detail}.")
-    dropped = sum(1 for named in events.values() if named & set(transferred))
+    dropped = len(dropped_events)
     lines = [f"Transferred {len(transferred)} task(s) from {from_session} to {to_session}; "
              f"stopped {stopped} watch(es); dropped {dropped} pending deliver(ies). "
              f"The new owner's backlog is untouched."]
     rows = _rows_for_ids(db_path, transferred)
     for row in rows:
         lines.append(f"  {row['task_id']}  {row['peer']}  {row['state']}  -> {to_session}")
+        logger.info("A2A task admin: transferred task %s from %s to %s",
+                    row["task_id"], from_session, to_session)
+    logger.info("A2A task admin: transferred %d task(s) from %s to %s (watches=%d, dropped=%d)",
+                len(transferred), from_session, to_session, stopped, dropped)
     return Result("transfer", EXIT_OK, "\n".join(lines), rows)
 
 
@@ -436,7 +409,10 @@ def _run(values: dict) -> int:
 
 def slash_command(raw_args: str, session_id: str = "", **_: object) -> str:
     """`/a2a tasks ...` entry point. The bound session is the default target."""
-    tokens = shlex.split(raw_args or "")
+    try:
+        tokens = shlex.split(raw_args or "")
+    except ValueError as exc:
+        return f"{USAGE}\nerror: {exc}"
     if tokens[:1] != ["tasks"]:
         return USAGE
     values, error = _parse(tokens[1:], "/a2a tasks")

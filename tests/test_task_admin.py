@@ -7,6 +7,7 @@ Both adapters (``hermes a2a-tasks`` and ``/a2a tasks``) call the same functions 
 from __future__ import annotations
 
 import importlib.util
+import logging
 import sqlite3
 import sys
 from pathlib import Path
@@ -299,6 +300,25 @@ def test_release_rolls_back_when_watch_cleanup_fails(monkeypatch):
     assert result.exit_code == task_admin.EXIT_ERROR
     assert "rolled back" in result.text
     assert _owner("t1") == SESSION_A, "the release must roll back with the cleanup"
+
+
+def test_slash_with_unmatched_quote_returns_usage_instead_of_raising():
+    text = task_admin.slash_command('tasks list "unclosed', session_id=SESSION_A)
+
+    assert "usage:" in text
+    assert "No closing quotation" in text
+
+
+def test_release_writes_an_audit_log_per_task(caplog):
+    _task("t1", session=SESSION_A)
+
+    with caplog.at_level(logging.INFO, logger=task_admin.__name__):
+        result = task_admin.release_tasks(session=SESSION_A, all_tasks=True)
+
+    assert result.exit_code == 0
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("released task t1" in message for message in messages)
+    assert any("released 1 task(s)" in message for message in messages)
 
 
 def test_aggregate_publications_count_per_task_and_once_in_the_batch_total():

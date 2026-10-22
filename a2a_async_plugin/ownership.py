@@ -33,6 +33,27 @@ from . import protocol
 TERMINAL_REMOTE_STATES = frozenset(protocol.TERMINAL_STATES)
 
 
+def publication_task_ids(metadata_json: Any) -> set[str]:
+    """Task ids a publication names: ``task_id`` or a ``tasks`` list in the peer/task form."""
+    try:
+        meta = json.loads(metadata_json) if metadata_json else {}
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(meta, dict):
+        return set()
+    ids: set[str] = set()
+    task_id = str(meta.get("task_id") or "")
+    if task_id:
+        ids.add(task_id)
+    for listed in meta.get("tasks") or []:
+        name = str(listed)
+        if "/" in name:
+            name = name.rsplit("/", 1)[-1]
+        if name:
+            ids.add(name)
+    return ids
+
+
 def publication_names_task(metadata_json: Any, task_id: str) -> bool:
     """True when a publication row names ``task_id``.
 
@@ -40,16 +61,7 @@ def publication_names_task(metadata_json: Any, task_id: str) -> bool:
     production "peer/task" form. Metadata is parsed in Python rather than with ``json_extract`` so
     one malformed row cannot make a release or a cancel fail (and strand the task's ownership).
     """
-    try:
-        meta = json.loads(metadata_json) if metadata_json else {}
-    except (TypeError, ValueError):
-        return False
-    if not isinstance(meta, dict):
-        return False
-    if str(meta.get("task_id") or "") == task_id:
-        return True
-    return any(str(listed) == task_id or str(listed).endswith("/" + task_id)
-               for listed in (meta.get("tasks") or []))
+    return str(task_id) in publication_task_ids(metadata_json)
 
 
 class OwnershipConflict(RuntimeError):
@@ -180,8 +192,13 @@ class OwnershipStore:
             return cur.rowcount
 
     def release_many(self, task_ids: Optional[Iterable[str]], session_id: str,
-                     now: Optional[float] = None) -> tuple[list[str], list[str], int]:
-        """Release a set of tasks atomically; returns ``(released, refused, watches_stopped)``.
+                     now: Optional[float] = None
+                     ) -> tuple[list[str], list[str], int, dict[str, set[str]]]:
+        """Release a set of tasks atomically.
+
+        Returns ``(released, refused, watches_stopped, dropped_events)`` where ``dropped_events``
+        maps each deleted outbox event id to the task ids it named. Counting the deletions inside
+        the transaction is the only race-free source for the batch total.
 
         ``task_ids=None`` releases every task the session owns, selected under the same write
         lock. Every explicit task must currently be owned by ``session_id``; if any is not,
@@ -190,7 +207,7 @@ class OwnershipStore:
         session reacquires after the commit keeps its new watch and pending delivery.
         """
         if not session_id:
-            return [], [], 0
+            return [], [], 0, {}
         now = time.time() if now is None else now
         with self._session() as con:
             if not con.in_transaction:
@@ -204,7 +221,7 @@ class OwnershipStore:
             else:
                 ids = list(dict.fromkeys(str(t) for t in task_ids if t))
             if not ids:
-                return [], [], 0
+                return [], [], 0, {}
             marks = ",".join("?" for _ in ids)
             rows = con.execute(
                 f"SELECT task_id, owner_session_id FROM a2a_tasks WHERE task_id IN ({marks})",
@@ -212,24 +229,28 @@ class OwnershipStore:
             owners = {str(r["task_id"]): str(r["owner_session_id"] or "") for r in rows}
             refused = [task_id for task_id in ids if owners.get(task_id) != session_id]
             if refused:
-                return [], refused, 0
+                return [], refused, 0, {}
             con.execute(
                 f"""UPDATE a2a_tasks
                       SET owner_session_id='', released_by_session_id=?, released_at=?,
                           unowned_since=?
                     WHERE task_id IN ({marks})""",
                 (session_id, now, now, *ids))
+            dropped: dict[str, set[str]] = {}
             for task_id in ids:
-                self._drop_publications(con, task_id)
+                dropped.update(self._drop_publications(con, task_id))
             from . import watches as watches_mod
             stopped = watches_mod.WatchStore.cleanup_for_released_tasks(
                 con, session_id, ids, now)
-            return ids, [], stopped
+            return ids, [], stopped, dropped
 
     def transfer_many(self, task_ids: Iterable[str], from_session: str, to_session: str,
-                      now: Optional[float] = None) -> tuple[list[str], list[str], int]:
-        """Move ownership of a set of tasks atomically; returns ``(transferred, refused,
-        watches_stopped)``.
+                      now: Optional[float] = None
+                      ) -> tuple[list[str], list[str], int, dict[str, set[str]]]:
+        """Move ownership of a set of tasks atomically.
+
+        Returns ``(transferred, refused, watches_stopped, dropped_events)``. The ownership change,
+        the previous owner's pending-delivery removal and its watch cleanup share one transaction.
 
         All tasks must be owned by ``from_session`` and the two sessions must differ. The
         ownership change and the removal of the previous owner's pending publications for those
@@ -237,7 +258,7 @@ class OwnershipStore:
         """
         ids = list(dict.fromkeys(str(t) for t in task_ids if t))
         if not ids or not from_session or not to_session or from_session == to_session:
-            return [], ids, 0
+            return [], ids, 0, {}
         now = time.time() if now is None else now
         marks = ",".join("?" for _ in ids)
         with self._session() as con:
@@ -250,19 +271,20 @@ class OwnershipStore:
             refused = [task_id for task_id in ids
                        if owners.get(task_id) != from_session]
             if refused:
-                return [], refused, 0
+                return [], refused, 0, {}
             con.execute(
                 f"""UPDATE a2a_tasks
                       SET owner_session_id=?, owned_at=?, released_at=0, unowned_since=0,
                           released_by_session_id=''
                     WHERE task_id IN ({marks})""",
                 (to_session, now, *ids))
+            dropped: dict[str, set[str]] = {}
             for task_id in ids:
-                self._drop_publications(con, task_id)
+                dropped.update(self._drop_publications(con, task_id))
             from . import watches as watches_mod
             stopped = watches_mod.WatchStore.cleanup_for_released_tasks(
                 con, from_session, ids, now)
-            return ids, [], stopped
+            return ids, [], stopped, dropped
 
     def reclaim(self, session_id: str, now: Optional[float] = None) -> tuple[list[str], list[str]]:
         """Re-acquire what ``session_id`` released before it ended.
@@ -298,14 +320,19 @@ class OwnershipStore:
         return reclaimed, lost
 
     @staticmethod
-    def _drop_publications(con: sqlite3.Connection, task_id: str) -> None:
+    def _drop_publications(con: sqlite3.Connection, task_id: str) -> dict[str, set[str]]:
+        """Delete pending deliveries naming ``task_id``; returns event id -> named tasks."""
         rows = con.execute(
             "SELECT event_id, metadata_json FROM a2a_watch_publications"
             " WHERE published_at IS NULL").fetchall()
+        dropped: dict[str, set[str]] = {}
         for row in rows:
-            if publication_names_task(row["metadata_json"], task_id):
+            named = publication_task_ids(row["metadata_json"])
+            if task_id in named:
                 con.execute("DELETE FROM a2a_watch_publications WHERE event_id=?",
                             (row["event_id"],))
+                dropped[str(row["event_id"])] = named
+        return dropped
 
     def owner(self, task_id: str) -> str:
         with self._session() as con:

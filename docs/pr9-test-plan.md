@@ -56,7 +56,7 @@ Expected: `Validation passed.` with two warnings, both accepted:
 pass; 13 tools, 3 hooks.
 
 `hermes plugins list --json` after `plugins enable` expected: `name=a2a-async`, `source=user`,
-`status=enabled`, `version=0.3.3`.
+`status=enabled`, `version=0.3.5`.
 
 Defect found by this gate and fixed here: `plugin.yaml` declared `provides_tools` but no
 `provides_hooks`, while `register()` registers `on_session_start`, `on_session_reset` and

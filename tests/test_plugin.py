@@ -39,7 +39,8 @@ def test_registers_all_tools_into_shared_a2a_toolset():
     names = {entry["name"] for entry in context.tools}
     assert names == {
         "a2a_discover", "a2a_call", "a2a_list", "a2a_history", "a2a_orchestrate",
-        "a2a_submit", "a2a_get_task", "a2a_await", "a2a_cancel", "a2a_steer",
+        "a2a_submit", "a2a_get_task", "a2a_await", "a2a_watch_cancel", "a2a_cancel", "a2a_steer",
+        "a2a_acquire_task_ownership", "a2a_release_task_ownership",
     }
     assert {entry["toolset"] for entry in context.tools} == {"a2a"}
     assert all(callable(entry["handler"]) for entry in context.tools)
@@ -48,20 +49,24 @@ def test_registers_all_tools_into_shared_a2a_toolset():
 
 
 def test_plugin_manifest_declares_registered_tools():
-    import yaml
+    try:  # PyYAML where it is installed; Hermes ships ruamel behind hermes_yaml
+        import yaml
+    except ModuleNotFoundError:
+        import hermes_yaml as yaml
 
     manifest = yaml.safe_load((ROOT / "plugin.yaml").read_text())
     declared = set(manifest["provides_tools"])
     assert declared == {
         "a2a_discover", "a2a_call", "a2a_list", "a2a_history", "a2a_orchestrate",
-        "a2a_submit", "a2a_get_task", "a2a_await", "a2a_cancel", "a2a_steer",
+        "a2a_submit", "a2a_get_task", "a2a_await", "a2a_watch_cancel", "a2a_cancel", "a2a_steer",
+        "a2a_acquire_task_ownership", "a2a_release_task_ownership",
     }
 
 
 def test_secondary_profile_agent_name_comes_from_secret_scope(monkeypatch):
     load_plugin()
     import importlib
-    adapter = importlib.import_module("a2a_async_plugin.a2a_async_plugin.adapter")
+    adapter = importlib.import_module("a2a_async_plugin.adapter")
 
     monkeypatch.setattr(adapter, "_profile_scoped", lambda: True)
     monkeypatch.setenv("A2A_AGENT_NAME", "hermes-emerald")
@@ -85,7 +90,7 @@ def test_secondary_profile_agent_name_comes_from_secret_scope(monkeypatch):
 def test_agent_name_hostname_fallback(monkeypatch):
     load_plugin()
     import importlib
-    adapter = importlib.import_module("a2a_async_plugin.a2a_async_plugin.adapter")
+    adapter = importlib.import_module("a2a_async_plugin.adapter")
     monkeypatch.setattr(adapter, "_profile_scoped", lambda: False)
     monkeypatch.delenv("A2A_AGENT_NAME", raising=False)
     monkeypatch.setattr("socket.gethostname", lambda: "emerald")

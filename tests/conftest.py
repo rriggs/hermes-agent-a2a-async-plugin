@@ -106,6 +106,26 @@ _RESTORED_ENV_KEYS = ("HERMES_HOME", "A2A_BEARER_TOKEN", "A2A_PEER_TOKENS")
 
 
 @pytest.fixture(autouse=True)
+def _keep_the_operator_profile_out_of_tests(tmp_path, monkeypatch):
+    """No test may read or write the operator's real profile task database.
+
+    The suite runs inside the agent's own environment, where ``HERMES_HOME`` points at a live
+    profile. A single test that constructs the watch manager without an isolated home upgraded that
+    profile's ``a2a_tasks.db`` to the new schema, and the deployed plugin then refused to open it.
+    Bind a throwaway home and task DB for every test; a test that wants its own values sets them
+    with monkeypatch and wins. The opt-in live-peer gate keeps the profile it was pointed at.
+    """
+    if _os.environ.get("A2A_LIVE_PEER_PROFILE", "").strip():
+        yield
+        return
+    home = tmp_path / "hermes-home"
+    home.mkdir(exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("A2A_TASKS_DB", str(home / "a2a_tasks.db"))
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _restore_hermes_home_per_test():
     """Snap the session-shaping env keys back to their pre-test
     values after each test in this ``tests/`` tree runs.

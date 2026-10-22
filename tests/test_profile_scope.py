@@ -30,10 +30,25 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from a2a_async_plugin import protocol  # noqa: E402
+# Load the plugin package under a private name: tests/integration registers the repository-root
+# __init__.py as ``a2a_async_plugin`` in sys.modules, which would otherwise shadow the real
+# package for every test that runs after it.
+import importlib  # noqa: E402
+import importlib.util  # noqa: E402
+
+PKG = "a2a_profile_scope_under_test"
+_spec = importlib.util.spec_from_file_location(
+    PKG, ROOT / "a2a_async_plugin" / "__init__.py",
+    submodule_search_locations=[str(ROOT / "a2a_async_plugin")])
+assert _spec and _spec.loader
+_module = importlib.util.module_from_spec(_spec)
+sys.modules[PKG] = _module
+_spec.loader.exec_module(_module)
+
+protocol = importlib.import_module(f"{PKG}.protocol")  # noqa: E402
 
 
 @pytest.fixture
@@ -110,7 +125,7 @@ def test_adapter_installs_override_from_profile_resolver(monkeypatch):
     get_hermes_home() resolves to the profile home — the same base the
     task DB resolver (protocol._resolve_db_path) uses in that scope."""
     pytest.importorskip("hermes_cli", reason="Hermes source not importable on this host")
-    from a2a_async_plugin import adapter as adapter_mod  # noqa: E402  (imports gateway.*)
+    adapter_mod = importlib.import_module(f"{PKG}.adapter")  # noqa: E402  (imports gateway.*)
 
     monkeypatch.delenv("A2A_CONVERSATIONS_DIR", raising=False)
     # Default-profile gateway: resolver tracks get_hermes_home()'s context

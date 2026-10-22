@@ -76,8 +76,9 @@ PLATFORM_NAME = "a2a"
 EXPECTED_TOOLS = {
     "a2a_discover", "a2a_call", "a2a_list", "a2a_history", "a2a_orchestrate",
     "a2a_submit", "a2a_get_task", "a2a_await", "a2a_cancel", "a2a_steer",
+    "a2a_watch_cancel", "a2a_acquire_task_ownership", "a2a_release_task_ownership",
 }
-EXPECTED_TOOL_COUNT = 10
+EXPECTED_TOOL_COUNT = 13
 
 
 # ---------------------------------------------------------------------------
@@ -130,11 +131,20 @@ def _load_plugin_hermetic(monkeypatch, tmp_path: Path) -> _Ctx:
         submodule_search_locations=[str(REPO_ROOT)],
     )
     assert spec and spec.loader
+    # Load the root shim under the real package name, then restore whatever was there: leaving it
+    # registered hides the real package for every later test in this process.
+    previous = sys.modules.get(spec.name)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    ctx = _Ctx()
-    module.register(ctx)
+    try:
+        spec.loader.exec_module(module)
+        ctx = _Ctx()
+        module.register(ctx)
+    finally:
+        if previous is not None:
+            sys.modules[spec.name] = previous
+        else:
+            sys.modules.pop(spec.name, None)
     return ctx
 
 
@@ -189,10 +199,10 @@ def _build_adapter_in_process(ctx, port: int):
     return factory(config)
 
 
-def test_registration_records_exactly_ten_a2a_tools_and_one_platform(
+def test_registration_records_exactly_thirteen_a2a_tools_and_one_platform(
     monkeypatch, tmp_path: Path,
 ):
-    """(a, part 1) The plugin's ``register(ctx)`` registers exactly 10 tools
+    """(a, part 1) The plugin's ``register(ctx)`` registers exactly 13 tools
     under toolset='a2a' with zero duplicate names, and the inbound platform
     'a2a' is registered exactly once. The hermetic env (NOTES #12) keeps
     any in-process protocol helpers from polluting the operator's home.

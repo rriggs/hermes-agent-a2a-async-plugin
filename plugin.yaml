@@ -1,9 +1,9 @@
 name: a2a-async
-version: 0.2.2
+version: 0.3.5
 description: "Complete asynchronous A2A client and inbound gateway contributed to the shared a2a toolset."
 author: Rob Riggs
 kind: platform
-requires_hermes: ">=0.21.3"
+requires_hermes: ">=0.22.2"
 platforms:
   - linux
   - macos
@@ -12,6 +12,9 @@ provides_tools:
   - a2a_submit
   - a2a_get_task
   - a2a_await
+  - a2a_watch_cancel
+  - a2a_acquire_task_ownership
+  - a2a_release_task_ownership
   - a2a_cancel
   - a2a_discover
   - a2a_call
@@ -19,3 +22,7 @@ provides_tools:
   - a2a_history
   - a2a_orchestrate
   - a2a_steer
+provides_hooks:
+  - on_session_start
+  - on_session_reset
+  - on_session_finalize

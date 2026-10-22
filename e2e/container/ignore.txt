@@ -1,0 +1,11 @@
+.git
+.venv
+venv
+node_modules
+ui-tui/node_modules
+apps/desktop/node_modules
+web/node_modules
+__pycache__
+*.pyc
+.pytest_cache
+test_durations.json

@@ -38,7 +38,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "1.0"
-A2A_TASK_SCHEMA_VERSION = 3
+A2A_TASK_SCHEMA_VERSION = 6
 
 # A2A v1.0 task lifecycle states.
 STATE_SUBMITTED = "TASK_STATE_SUBMITTED"
@@ -627,7 +627,13 @@ class TaskStore:
         con.execute("PRAGMA journal_mode=WAL")
         return con
 
-    def _ensure_db(self, con: "sqlite3.Connection") -> None:
+    @staticmethod
+    def _ensure_db(con: "sqlite3.Connection") -> None:
+        if int(con.execute("PRAGMA user_version").fetchone()[0]) == A2A_TASK_SCHEMA_VERSION:
+            # Schema is current: constructing a store (and every read path through one) must not
+            # take the database-wide write lock. A listing that opened the profile DB used to
+            # stall behind a publish for the full 10s busy timeout and come up empty (round 4).
+            return
         con.execute("BEGIN IMMEDIATE")
         try:
             version = int(con.execute("PRAGMA user_version").fetchone()[0])
@@ -650,16 +656,100 @@ class TaskStore:
                 completed_at REAL,
                 direction TEXT NOT NULL DEFAULT 'inbound',
                 ownership TEXT NOT NULL DEFAULT 'local',
-                remote_state TEXT NOT NULL DEFAULT ''
+                remote_state TEXT NOT NULL DEFAULT '',
+                owner_session_id TEXT NOT NULL DEFAULT '',
+                released_by_session_id TEXT NOT NULL DEFAULT '',
+                owned_at REAL NOT NULL DEFAULT 0,
+                released_at REAL NOT NULL DEFAULT 0,
+                unowned_since REAL NOT NULL DEFAULT 0,
+                cancel_requested_at REAL NOT NULL DEFAULT 0
             )""")
             columns = {row[1] for row in con.execute("PRAGMA table_info(a2a_tasks)")}
             for name, definition in (
                 ("direction", "TEXT NOT NULL DEFAULT 'inbound'"),
                 ("ownership", "TEXT NOT NULL DEFAULT 'local'"),
                 ("remote_state", "TEXT NOT NULL DEFAULT ''"),
+                # Session ownership (schema v6): a task is unowned or owned by exactly one
+                # session. Await acquires; session end releases; adoption is final.
+                ("owner_session_id", "TEXT NOT NULL DEFAULT ''"),
+                ("released_by_session_id", "TEXT NOT NULL DEFAULT ''"),
+                ("owned_at", "REAL NOT NULL DEFAULT 0"),
+                ("released_at", "REAL NOT NULL DEFAULT 0"),
+                ("unowned_since", "REAL NOT NULL DEFAULT 0"),
+                ("cancel_requested_at", "REAL NOT NULL DEFAULT 0"),
             ):
                 if name not in columns:
                     con.execute(f"ALTER TABLE a2a_tasks ADD COLUMN {name} {definition}")
+            # Background watches (a2a_async_plugin/watches.py, schema v4+) and their publication
+            # outbox (v5). Additive tables only: an older database gains them in place, and an
+            # older plugin reading a newer database still sees every column it knows.
+            con.execute(
+                """CREATE TABLE IF NOT EXISTS a2a_watches (
+                watch_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL DEFAULT '',
+                target_json TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                last_error TEXT NOT NULL DEFAULT '',
+                lease_owner TEXT NOT NULL DEFAULT '',
+                lease_until REAL NOT NULL DEFAULT 0
+            )"""
+            )
+            con.execute(
+                """CREATE TABLE IF NOT EXISTS a2a_watch_items (
+                watch_id TEXT NOT NULL,
+                peer TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT '',
+                short_state TEXT NOT NULL DEFAULT '',
+                published_state TEXT NOT NULL DEFAULT '',
+                context_id TEXT NOT NULL DEFAULT '',
+                errors INTEGER NOT NULL DEFAULT 0,
+                next_poll_at REAL NOT NULL DEFAULT 0,
+                completed_at REAL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (watch_id, peer, task_id)
+            )"""
+            )
+            # The outbox makes delivery durable: an event is written here before the publish
+            # attempt and cleared only after the host accepted it, so a refused publish is retried
+            # on the next pass and after a restart instead of vanishing with the closed watch.
+            con.execute(
+                """CREATE TABLE IF NOT EXISTS a2a_watch_publications (
+                event_id TEXT PRIMARY KEY,
+                watch_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at REAL NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL DEFAULT 0,
+                published_at REAL
+            )"""
+            )
+            con.execute(
+                """CREATE INDEX IF NOT EXISTS idx_a2a_watch_publications_due
+                       ON a2a_watch_publications (published_at, next_attempt_at)"""
+            )
+            # Queued peer messages (schema v6): while a task is unowned every message it produces
+            # is recorded here and delivered to whoever adopts it. delivered_at IS NULL = queued.
+            con.execute(
+                """CREATE TABLE IF NOT EXISTS a2a_task_messages (
+                task_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'progress',
+                text TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                delivered_to_session TEXT NOT NULL DEFAULT '',
+                delivered_at REAL,
+                PRIMARY KEY (task_id, message_id)
+            )"""
+            )
+            con.execute(
+                """CREATE INDEX IF NOT EXISTS idx_a2a_task_messages_pending
+                       ON a2a_task_messages (task_id, delivered_at)"""
+            )
             if version < A2A_TASK_SCHEMA_VERSION:
                 con.execute(f"PRAGMA user_version = {A2A_TASK_SCHEMA_VERSION}")
             elif version > A2A_TASK_SCHEMA_VERSION:

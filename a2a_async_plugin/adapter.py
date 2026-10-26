@@ -21,7 +21,14 @@ Design (the #11025 insight, done as a plugin with zero core edits):
   - The agent's reply comes back through ``adapter.send()``; we override that to
     fulfil a per-task Future the HTTP handler is blocked on, turning the
     async gateway into a synchronous request/response for the A2A caller.
-    ``on_processing_complete`` resolves failures/cancellations promptly.
+    One reply settles every task the turn answered: its trigger task plus any
+    peer message steered into that same turn mid-run (this fleet runs
+    ``busy_input_mode: steer``). ``on_processing_complete`` resolves failures and
+    cancellations promptly, including for those folded arrivals.
+  - One peer per context. The context id keys the agent session, the transcript,
+    and the anti-loop counter, all of which drop the peer for a DM that carries a
+    chat_id, so the first inbound peer to use a context binds it and a different
+    peer is rejected instead of being merged into the same conversation.
   - Every exchange is persisted to disk and audit-logged.
 
 Bind safety: with no token configured, the server binds 127.0.0.1 only.
@@ -504,13 +511,23 @@ class A2AAdapter(BasePlatformAdapter):
         self._profile_session_locks_guard = threading.Lock()
 
         # Pending reply futures, keyed by task_id. Each future resolves to a
-        # (state, text) tuple. _pending_order keeps per-context FIFO order so
-        # adapter.send() — which only knows the context — resolves the oldest
-        # outstanding task for that context (no cross-talk between concurrent
-        # requests sharing a context).
+        # (state, text) tuple. _pending_order keeps per-context FIFO order for the
+        # legacy "oldest outstanding task" resolution used when no turn identity is
+        # available (a late or out-of-band send).
         self._pending: Dict[str, tuple[str, Future]] = {}
         self._pending_order: Dict[str, deque[str]] = {}
         self._pending_lock = threading.Lock()
+
+        # Reply attribution (per context id). adapter.send() receives only the
+        # context, never the task id, so the turn's own task ids are captured here:
+        # _turn_tasks is what on_processing_start saw start a turn, _arrived is what
+        # landed mid-turn in a mode that folds the text into that same turn (steer,
+        # or the standalone adapter's merge path). Both are settled by one reply,
+        # because both are answered by it. Queue/interrupt modes give an arrival its
+        # own turn or abort the turn, so those are never absorbed.
+        self._turn_tasks: Dict[str, list[str]] = {}
+        self._arrived: Dict[str, list[str]] = {}
+        self._turn_lock = threading.Lock()
 
         # Orphaned task watchdog
         self._watchdog_stop = threading.Event()
@@ -831,6 +848,112 @@ class A2AAdapter(BasePlatformAdapter):
                     return True
         return False
 
+    #: Cap on mid-turn arrivals folded into one reply. A turn that outlives this many
+    #: arrivals should stop absorbing them rather than grow a list without bound.
+    _MAX_ARRIVALS_PER_TURN = 256
+
+    def _note_turn_start(self, context_id: str, task_id: str) -> None:
+        """Record the task a turn was started for (called from on_processing_start)."""
+        if not context_id or not task_id:
+            return
+        with self._turn_lock:
+            self._turn_tasks[context_id] = [task_id]
+
+    def _note_arrival(self, context_id: str, task_id: str, *, folded_into_turn: bool) -> None:
+        """Record a task that arrived while a turn was running.
+
+        ``folded_into_turn`` is True only when the arrival's text lands inside the
+        turn that is already running, so that turn's reply answers it too and must
+        settle it. Queue and interrupt modes are False: the arrival gets its own
+        turn, or the turn is aborted before answering anything.
+        """
+        if not folded_into_turn or not context_id or not task_id:
+            return
+        with self._turn_lock:
+            arrivals = self._arrived.setdefault(context_id, [])
+            if len(arrivals) >= self._MAX_ARRIVALS_PER_TURN:
+                logger.warning(
+                    "A2A: context %s has %d arrivals folded into one turn; "
+                    "further arrivals will wait for their own turn",
+                    context_id, len(arrivals),
+                )
+                return
+            arrivals.append(task_id)
+
+    def _settle_turn(self, context_id: str, state: str, text: str) -> "int | None":
+        """Settle every task the current turn is answering.
+
+        The turn's trigger task plus every arrival whose text was folded into that
+        turn share one reply, because they share one model turn. Settling only the
+        oldest pending task here is what left steered peers unanswered.
+
+        Returns the number of tasks resolved, or None when the adapter holds no turn
+        record for this context (a late or out-of-band send), which tells the caller
+        to fall back to oldest-pending resolution.
+        """
+        with self._turn_lock:
+            had_record = context_id in self._turn_tasks or context_id in self._arrived
+            batch = list(self._turn_tasks.pop(context_id, []))
+            for task_id in self._arrived.pop(context_id, []):
+                if task_id not in batch:
+                    batch.append(task_id)
+        if not had_record:
+            return None
+        settled = 0
+        for task_id in batch:
+            if self._resolve_task(task_id, state, text):
+                settled += 1
+        return settled
+
+    def _arrival_folds_into_turn(self, event: MessageEvent) -> bool:
+        """True when a mid-run arrival's text joins the running turn.
+
+        Reads the gateway's effective busy-input mode. ``steer`` (this fleet's
+        setting) injects the text mid-run; the standalone adapter with no runner
+        merges it into the pending event, which is also one turn. ``queue`` defers
+        it to its own turn and ``interrupt`` aborts the running one, so neither may
+        be settled by the reply that comes back.
+
+        Steer also falls back to queueing when the live agent cannot take a steer,
+        so the agent handle is checked too — otherwise the arriving task would be
+        settled with a reply that never saw it and then answered twice.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            return True  # standalone adapter: the base merge path, one turn
+        try:
+            session_key = self._event_session_key(event)
+        except Exception:
+            logger.debug("A2A: session-key derivation failed; not folding arrival", exc_info=True)
+            return False
+        resolve_mode = getattr(runner, "_effective_busy_input_mode", None)
+        if callable(resolve_mode):
+            try:
+                if str(resolve_mode(event.source) or "").strip().lower() in ("queue", "interrupt"):
+                    return False
+            except Exception:
+                logger.debug("A2A: busy-mode lookup failed", exc_info=True)
+        peek = getattr(runner, "_peek_session_state", None)
+        if not callable(peek):
+            return False
+        try:
+            state = peek(session_key)
+            turn = getattr(state, "turn", None)
+            agent = getattr(turn, "agent", None)
+        except Exception:
+            logger.debug("A2A: session-state lookup failed; not folding arrival", exc_info=True)
+            return False
+        return callable(getattr(agent, "steer", None))
+
+    def _session_is_busy(self, event: MessageEvent) -> bool:
+        """True when this event's session holds a running turn right now."""
+        try:
+            return self._event_session_key(event) in self._active_sessions
+        except Exception:
+            logger.debug("A2A: session-key derivation failed; treating as idle", exc_info=True)
+            return False
+
+
     def _scope_for_agent(self, agent: Optional[dict]) -> tuple[str, str]:
         agent = agent or self._agents[""]
         return str(agent.get("slug") or ""), str(agent.get("tenant") or "")
@@ -856,6 +979,27 @@ class A2AAdapter(BasePlatformAdapter):
         text = protocol.extract_text(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
         task_id = protocol.new_task_id()
+
+        # One context, one peer. The session key drops the participant for a DM that
+        # carries a chat_id (gateway.session.build_session_key), so two peers sharing
+        # a contextId would share the agent session, the transcript file, and the
+        # anti-loop counter. Bind the context to its first inbound peer and refuse a
+        # different one instead of silently merging two correspondents.
+        bound_peer = self.tasks.context_peer(context_id)
+        if bound_peer and bound_peer != peer:
+            logger.warning(
+                "A2A: rejecting peer %r on context %s — context is bound to peer %r",
+                peer, context_id, bound_peer,
+            )
+            security.audit("inbound-rejected-peer-mismatch", peer, task_id, text)
+            rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
+            self.tasks.complete(task_id, protocol.STATE_REJECTED, "")
+            return protocol.build_task(
+                task_id, context_id, protocol.STATE_REJECTED,
+                f"Context {context_id} belongs to a different peer. A context carries "
+                f"one peer's conversation; start a new context for a new correspondent.",
+                created_at=rec["created_iso"],
+            ), None
 
         # Anti-loop ping-pong protection
         turn = self._turns.track(context_id)
@@ -930,6 +1074,16 @@ class A2AAdapter(BasePlatformAdapter):
             ),
             message_id=task_id,
         )
+
+        # A turn may already be running. Under steer mode (this fleet's setting) this
+        # arrival's text is injected into it, so that turn's single reply answers both
+        # this task and the task the turn was started for. Record it before dispatch:
+        # send() must settle every task the reply answers, not just the oldest.
+        if self._session_is_busy(event):
+            self._note_arrival(
+                context_id, task_id,
+                folded_into_turn=self._arrival_folds_into_turn(event),
+            )
 
         try:
             asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
@@ -1563,11 +1717,13 @@ class A2AAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ):
-        """Fulfil the pending reply Future for this context.
+        """Fulfil the pending reply Future(s) for this context.
 
-        ``chat_id`` is the A2A context id we set as the source chat_id; the
-        oldest outstanding task for that context receives the reply (the
-        gateway session processes messages in order).
+        ``chat_id`` is the A2A context id we set as the source chat_id. A turn under
+        steer mode answers its trigger task *and* every peer message steered into it
+        mid-run, so all of those tasks are settled with this one reply. Only when the
+        adapter holds no turn record (a late or out-of-band send) does it fall back to
+        the oldest outstanding task.
 
         The gateway marks final user-visible replies with ``metadata['notify']``
         (see ``_mark_notify_metadata`` in gateway.platforms.base — this is the
@@ -1579,27 +1735,43 @@ class A2AAdapter(BasePlatformAdapter):
         if not (metadata or {}).get("notify"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
             return SendResult(success=True, message_id=message_id)
-        if not self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
+        settled = self._settle_turn(chat_id, protocol.STATE_COMPLETED, content or "")
+        if settled is None and not self._resolve_oldest_for_context(
+                chat_id, protocol.STATE_COMPLETED, content or ""):
             # No waiter (e.g. a late chunk or out-of-band send) — drop it.
             logger.debug("A2A: send() for context %s had no pending waiter", chat_id)
+        elif settled:
+            logger.debug("A2A: reply for context %s settled %d task(s)", chat_id, settled)
         return SendResult(success=True, message_id=message_id)
 
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Record which task this turn was started for.
+
+        The turn's reply settles it by identity rather than by arrival order, which
+        is what stops a reply from landing on a task that is still queued behind it.
+        """
+        context_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
+        self._note_turn_start(context_id, str(getattr(event, "message_id", "") or ""))
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Resolve the task future when processing ends without a reply send.
+        """Resolve the task future(s) when processing ends without a reply send.
 
         The success path resolves via send(); this hook catches failures,
         cancellations, and empty runs so the HTTP thread returns promptly
-        instead of waiting out the reply timeout.
+        instead of waiting out the reply timeout. Any arrival folded into this
+        turn shares its fate — it was answered by the same turn.
         """
+        context_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
         task_id = str(getattr(event, "message_id", "") or "")
-        if not task_id:
-            return
         if outcome == ProcessingOutcome.FAILURE:
-            self._resolve_task(task_id, protocol.STATE_FAILED, "[agent processing failed]")
+            state, text = protocol.STATE_FAILED, "[agent processing failed]"
         elif outcome == ProcessingOutcome.CANCELLED:
-            self._resolve_task(task_id, protocol.STATE_CANCELED, "")
+            state, text = protocol.STATE_CANCELED, ""
         else:
-            self._resolve_task(task_id, protocol.STATE_COMPLETED, "")
+            state, text = protocol.STATE_COMPLETED, ""
+        settled = self._settle_turn(context_id, state, text) if context_id else None
+        if not settled and task_id:
+            self._resolve_task(task_id, state, text)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         return None

@@ -1030,6 +1030,49 @@ class TaskStore:
                 return None
             return dict(rec)
 
+    def context_peer(self, context_id: str) -> str:
+        """Inbound peer that already owns ``context_id``, or ``""`` when unused.
+
+        An A2A context identifies ONE peer's conversation with us, and Hermes keys
+        the agent session, the on-disk transcript, and the anti-loop counter by it.
+        ``gateway.session.build_session_key`` drops the participant for a DM that
+        carries a chat_id, so two peers sharing a ``contextId`` would share all
+        three stores. Contexts are caller-generated opaque ids, so a collision is
+        either a caller bug or deliberate; either way it must not merge two peers.
+
+        The caller binds the context by being the first inbound peer to use it.
+        Reads memory first (fast path, and the only store when no DB is configured)
+        then the durable rows, so a trimmed in-memory store cannot forget a binding
+        that older terminal rows still establish.
+        """
+        with self._lock:
+            for rec in self._tasks.values():
+                if (rec.get("context_id") == context_id
+                        and rec.get("direction", "inbound") == "inbound"
+                        and rec.get("peer")):
+                    return str(rec["peer"])
+            db_path = getattr(self, "_db_path", "")
+        if not db_path:
+            return ""
+        try:
+            con = self._open_db()
+            try:
+                row = con.execute(
+                    "SELECT peer FROM a2a_tasks WHERE context_id = ? "
+                    "AND direction = 'inbound' AND peer != '' "
+                    "ORDER BY created_at ASC LIMIT 1",
+                    (context_id,),
+                ).fetchone()
+            finally:
+                con.close()
+            return str(row[0]) if row else ""
+        except Exception:
+            # Fail OPEN: refusing a legitimate first contact would take the whole
+            # A2A surface down over a transient read error. A real collision still
+            # hits the in-memory arm above.
+            logger.debug("A2A: context_peer lookup failed for %s", context_id, exc_info=True)
+            return ""
+
     def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
         """Transition a task to a terminal state. Idempotent."""
         watchers: list[Future] = []

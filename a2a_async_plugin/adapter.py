@@ -596,6 +596,11 @@ class A2AAdapter(BasePlatformAdapter):
             else "REMOTE (bearer auth)"
         )
         logger.info(
+            "A2A: a2a-async %s (task schema v%d) loaded from %s [pid %d]",
+            protocol.PLUGIN_VERSION, protocol.A2A_TASK_SCHEMA_VERSION,
+            os.path.dirname(os.path.abspath(protocol.__file__)), os.getpid(),
+        )
+        logger.info(
             "A2A: serving Agent Card + JSON-RPC on http://%s:%s (%s) as %r; %d routed agent(s)",
             self.host, self.port, exposure, self.agent_name, len(self._agents),
         )

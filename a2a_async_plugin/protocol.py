@@ -40,6 +40,30 @@ logger = logging.getLogger(__name__)
 PROTOCOL_VERSION = "1.0"
 A2A_TASK_SCHEMA_VERSION = 6
 
+
+def _load_plugin_version() -> str:
+    """Read this plugin's version from the adjacent ``plugin.yaml`` at import.
+
+    Resolved once so the running build can be reported three ways without SSH or
+    a file mtime guess: the startup log line, the Agent Card ``version`` field
+    (which is the agent implementation's version per the v1.0 proto -- the wire
+    protocol version lives in ``supportedInterfaces[].protocolVersion``), and the
+    ``/metrics`` snapshot. Keep this dependency-free: a manifest that cannot be
+    read yields ``"unknown"`` rather than failing plugin load.
+    """
+    try:
+        from pathlib import Path
+        manifest = Path(__file__).resolve().parent.parent / "plugin.yaml"
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("version:"):
+                return line.split(":", 1)[1].strip().strip("'\"") or "unknown"
+    except Exception:
+        pass
+    return "unknown"
+
+
+PLUGIN_VERSION = _load_plugin_version()
+
 # A2A v1.0 task lifecycle states.
 STATE_SUBMITTED = "TASK_STATE_SUBMITTED"
 STATE_WORKING = "TASK_STATE_WORKING"
@@ -126,7 +150,7 @@ def build_agent_card(
         "name": name,
         "description": description,
         "url": url,  # convenience for pre-1.0 clients; canonical is supportedInterfaces
-        "version": "1.0.0",
+        "version": PLUGIN_VERSION,
         "provider": {
             "organization": os.getenv("A2A_PROVIDER_ORG", "Hermes Agent"),
             "url": os.getenv("A2A_PROVIDER_URL", "") or url,
@@ -561,6 +585,12 @@ class Metrics:
         uptime = time.time() - self._start_time
         return {
             "uptime_seconds": round(uptime, 1),
+            # Which build answered this request. Without these, a caller cannot
+            # distinguish a freshly deployed copy from one still running old code
+            # out of process memory after the files on disk were replaced.
+            "plugin_version": PLUGIN_VERSION,
+            "schema_version": A2A_TASK_SCHEMA_VERSION,
+            "pid": os.getpid(),
             "inbound_total": self.inbound_total,
             "outbound_total": self.outbound_total,
             "streams_started": self.streams_started,

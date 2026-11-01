@@ -1219,39 +1219,56 @@ class A2AAdapter(BasePlatformAdapter):
 
     def _finalize_task(self, pending: dict, state: str, reply: str) -> tuple[str, str]:
         """Record the outcome of a dispatched task. Returns (state, reply) after
-        redaction and input-required detection."""
+        redaction and input-required detection.
+
+        The pending entry is the orphan watchdog's protection. It is removed only
+        after the terminal row is committed: popping it first left a window where
+        the watchdog could fail a long blocking task (older than its 300s threshold)
+        while the reply was being persisted, and ``complete()`` is terminal-idempotent,
+        so the stored row stayed FAILED while the caller was told COMPLETED. That is
+        the same uncorrectable false-failure class as issue #1.
+        """
         task_id = pending["task_id"]
         context_id = pending["context_id"]
         peer = pending["peer"]
-        self._pop_pending(task_id)
+        try:
+            reply = security.redact_outbound(reply or "")
 
-        reply = security.redact_outbound(reply or "")
+            # The agent flags clarification requests with a leading marker; map
+            # them to the A2A input-required state so the peer knows to answer.
+            if state == protocol.STATE_COMPLETED:
+                stripped = reply.lstrip()
+                if stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
+                    state = protocol.STATE_INPUT_REQUIRED
+                    reply = stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
 
-        # The agent flags clarification requests with a leading marker; map
-        # them to the A2A input-required state so the peer knows to answer.
-        if state == protocol.STATE_COMPLETED:
-            stripped = reply.lstrip()
-            if stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
-                state = protocol.STATE_INPUT_REQUIRED
-                reply = stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
+            protocol.persist_message(context_id, "agent", reply, task_id, conv_dir=self._conversations_dir)
+            security.audit("outbound", peer, task_id, reply)
 
-        protocol.persist_message(context_id, "agent", reply, task_id, conv_dir=self._conversations_dir)
-        security.audit("outbound", peer, task_id, reply)
+            stored = self.tasks.complete(task_id, state, reply)
+            if stored is None:
+                # Another writer (watchdog, cancellation, shutdown) settled the row
+                # first. Report what the store says: never hand the caller a state
+                # the durable record contradicts.
+                current = self.tasks.get(task_id)
+                if current and current.get("state") in protocol.TERMINAL_STATES:
+                    state, reply = current["state"], current.get("reply", "")
 
-        if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
-            protocol.metrics.outbound_total += 1
-            protocol.metrics.tasks_completed += 1
-            protocol.metrics.record_latency(time.time() - pending["started"])
-        elif state == protocol.STATE_CANCELED:
-            # Caller-side withdrawal is not an agent failure — count it
-            # separately so tasks_failed stays an honest agent-health signal.
-            protocol.metrics.tasks_canceled += 1
-        else:
-            protocol.metrics.tasks_failed += 1
+            if state in (protocol.STATE_COMPLETED, protocol.STATE_INPUT_REQUIRED):
+                protocol.metrics.outbound_total += 1
+                protocol.metrics.tasks_completed += 1
+                protocol.metrics.record_latency(time.time() - pending["started"])
+            elif state == protocol.STATE_CANCELED:
+                # Caller-side withdrawal is not an agent failure — count it
+                # separately so tasks_failed stays an honest agent-health signal.
+                protocol.metrics.tasks_canceled += 1
+            else:
+                protocol.metrics.tasks_failed += 1
 
-        self.tasks.complete(task_id, state, reply)
-        self._send_push_notification(task_id, context_id, reply, state)
-        return state, reply
+            self._send_push_notification(task_id, context_id, reply, state)
+            return state, reply
+        finally:
+            self._pop_pending(task_id)
 
     @staticmethod
     def _client_alive_check(handler):

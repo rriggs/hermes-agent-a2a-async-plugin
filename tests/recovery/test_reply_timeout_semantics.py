@@ -302,6 +302,101 @@ def test_sse_wait_detects_client_disconnect_without_cap(monkeypatch, tmp_path):
         adp._watchdog_stop.set()
 
 
+def test_finalization_keeps_watchdog_protection_until_the_row_is_committed(
+    monkeypatch, tmp_path
+):
+    """A live blocking task must stay protected through the terminal commit.
+
+    Regression for the issue #1 class: ``_finalize_task`` used to pop the pending
+    entry (the watchdog's protection) before persisting the reply. A watchdog pass
+    in that gap failed a task older than 300s, and ``complete()`` is
+    terminal-idempotent, so the stored row stayed FAILED while the caller was told
+    COMPLETED.
+    """
+    _isolated_hermes_home(monkeypatch, tmp_path)
+    monkeypatch.delenv("A2A_REPLY_TIMEOUT", raising=False)
+
+    adp = _instantiate_adapter(port=_free_port())
+    try:
+        rec = adp.tasks.create("rw-watchdog", "ctx-rw-watchdog", peer="peer-rw",
+                               direction="inbound", ownership="local")
+        adp.tasks.set_state(rec["task_id"], STATE_WORKING)
+        with adp.tasks._lock:
+            adp.tasks._tasks[rec["task_id"]]["created_at"] = time.time() - 1000.0
+        fut = adp._add_pending(rec["task_id"], rec["context_id"])
+        pending = {
+            "task_id": rec["task_id"],
+            "context_id": rec["context_id"],
+            "peer": "peer-rw",
+            "future": fut,
+            "created_iso": rec["created_iso"],
+            "started": time.time() - 1000.0,
+        }
+        adp._resolve_task(rec["task_id"], STATE_COMPLETED, "healthy real answer")
+        state, reply = adp._await_reply(pending)
+        assert state == STATE_COMPLETED
+
+        original_persist = protocol.persist_message
+        observed: dict = {}
+
+        def interleave_watchdog(*args, **kwargs):
+            # The exact watchdog body: snapshot protection, then sweep.
+            with adp._pending_lock:
+                protected = set(adp._pending.keys())
+            observed["protected"] = protected
+            observed["failed"] = adp.tasks.fail_orphans(
+                adapter_module._ORPHAN_TIMEOUT, protected=protected)
+            return original_persist(*args, **kwargs)
+
+        monkeypatch.setattr(protocol, "persist_message", interleave_watchdog)
+        returned_state, returned_reply = adp._finalize_task(pending, state, reply)
+
+        row = adp.tasks.get(rec["task_id"])
+        assert row is not None
+        assert rec["task_id"] in observed["protected"], (
+            "the pending entry must protect the task until the row is committed")
+        assert observed["failed"] == []
+        assert row["state"] == STATE_COMPLETED
+        assert row["reply"] == "healthy real answer"
+        assert (returned_state, returned_reply) == (STATE_COMPLETED, "healthy real answer")
+    finally:
+        adp._watchdog_stop.set()
+
+
+def test_finalize_reports_the_stored_outcome_when_another_writer_won(monkeypatch, tmp_path):
+    """The caller must not be told COMPLETED when the durable row says otherwise."""
+    _isolated_hermes_home(monkeypatch, tmp_path)
+    monkeypatch.delenv("A2A_REPLY_TIMEOUT", raising=False)
+
+    adp = _instantiate_adapter(port=_free_port())
+    try:
+        rec = adp.tasks.create("rw-race", "ctx-rw-race", peer="peer-rw",
+                               direction="inbound", ownership="local")
+        adp.tasks.set_state(rec["task_id"], STATE_WORKING)
+        fut = adp._add_pending(rec["task_id"], rec["context_id"])
+        pending = {
+            "task_id": rec["task_id"],
+            "context_id": rec["context_id"],
+            "peer": "peer-rw",
+            "future": fut,
+            "created_iso": rec["created_iso"],
+            "started": time.time(),
+        }
+        # The watchdog settles the row while the reply is already being finalized.
+        adp.tasks.complete(rec["task_id"], STATE_FAILED,
+                           "[task orphaned — no reply produced]")
+
+        state, reply = adp._finalize_task(pending, STATE_COMPLETED, "agent answer")
+
+        row = adp.tasks.get(rec["task_id"])
+        assert row is not None
+        assert row["state"] == STATE_FAILED
+        assert (state, reply) == (STATE_FAILED, "[task orphaned — no reply produced]"), (
+            "the returned outcome must match the durable record")
+    finally:
+        adp._watchdog_stop.set()
+
+
 def _free_port() -> int:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:

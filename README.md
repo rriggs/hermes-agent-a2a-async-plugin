@@ -36,6 +36,29 @@ a2a_await(agent="researcher", task_id="...", background=true)   # or get the res
 
 Use `a2a_steer` with the `context_id` returned by an earlier A2A exchange when a running conversation needs a correction or follow-up. It returns a distinct task ID immediately.
 
+## Blocking and asynchronous sends
+
+Inbound `message/send` has two shapes, and the difference matters for long work:
+
+- **Blocking** (no `configuration.returnImmediately`, or `blocking: true`): the plugin waits until
+  the task reaches a terminal or interrupted state, then returns that state and reply. There is no
+  artificial reply cap by default, per A2A v1.0 §3.2.2. A healthy agent that takes an hour gets an
+  hour; the wait is bounded only by the client connection (a disconnected caller is detected and the
+  wait stops) and by gateway shutdown.
+- **Asynchronous** (`configuration.returnImmediately: true`): the plugin returns `WORKING` with the
+  task id immediately and finalizes the task off the request thread, bounded by
+  `A2A_ASYNC_TIMEOUT` (default 28800s). Use this for multi-turn conversations and any caller that
+  cannot hold a connection open.
+
+`A2A_REPLY_TIMEOUT` opts into a cap for blocking sends. On expiry the task is recorded `CANCELED`
+with a caller-side marker, never `FAILED`: the agent may still be working, and `FAILED` would assert
+an outcome that never happened. The cap does not abort the agent's turn; a reply that arrives after
+expiry is dropped rather than written into the terminal record. Leave it unset unless a client-side
+deadline is required.
+
+Profile-forwarded tasks keep a bounded dispatch timeout (default 300s): expiry kills the child
+process, so the `FAILED` outcome there is truthful.
+
 ## Task ownership
 
 A task is either **unowned** or **owned by exactly one session**. Ownership belongs to the session,

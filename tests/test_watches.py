@@ -2327,3 +2327,85 @@ def test_a_backed_off_peer_does_not_starve_a_healthy_peer(monkeypatch):
     row = protocol.TaskStore(_store().db_path).get("healthy")
     assert row["state"] == protocol.STATE_COMPLETED, (
         "ten rows for a dead peer must not occupy every batch")
+
+
+@pytest.mark.parametrize("adopt_during, cancel_refused", [
+    ("CancelTask", False),
+    ("GetTask", True),
+])
+def test_auto_cancel_does_not_fold_a_response_after_adoption(
+        monkeypatch, adopt_during, cancel_refused):
+    """The CancelTask and -32002/GetTask paths both fence post-RPC state writes."""
+    _old_unowned_task("t1")
+    _age_row("t1", 100_000.0)
+    manager = _manager(ScriptedPoll(task_payload()))
+    manager.reconcile_after_s = 10 ** 9
+    assert manager.ownership.acquire("t1", "old-owner")
+    assert manager.ownership.release("t1", "old-owner", now=time.time() - 100_000.0)
+
+    def rpc(_peer, method, _params, timeout=None):
+        if method == "CancelTask":
+            if cancel_refused:
+                return {"error": {"code": protocol.ERR_TASK_NOT_CANCELABLE,
+                                  "message": "already terminal"}}
+            assert adopt_during == "CancelTask"
+            assert manager.ownership.acquire("t1", SESSION_ID)
+            return {"result": task_payload("t1", protocol.STATE_CANCELED, "stale cancel")}
+        assert method == "GetTask"
+        assert adopt_during == "GetTask"
+        assert manager.ownership.acquire("t1", SESSION_ID)
+        return {"result": task_payload("t1", protocol.STATE_COMPLETED, "stale answer")}
+
+    monkeypatch.setattr(tools, "_resolve_peer", lambda _name: {"url": "http://peer.test"})
+    monkeypatch.setattr(tools, "_rpc_request", rpc)
+    manager._maintain_unowned(time.time())
+
+    assert manager.ownership.owner("t1") == SESSION_ID
+    row = protocol.TaskStore(_store().db_path).get("t1")
+    assert row["state"] == protocol.STATE_WORKING, row
+    assert row["reply"] == "", row
+    assert manager.ownership.queued("t1") == []
+
+
+def test_reconciled_answer_is_queued_for_an_offline_adopter(monkeypatch):
+    """A reconciled reply must remain deliverable without another peer round trip."""
+    _old_unowned_task("t1")
+    manager = _manager(ScriptedPoll(task_payload()))
+    monkeypatch.setattr(tools, "_resolve_peer", lambda _name: {"url": "http://peer.test"})
+    monkeypatch.setattr(tools, "_rpc_request", lambda *_a, **_k: {
+        "result": task_payload("t1", protocol.STATE_COMPLETED, "unique recovered answer")})
+
+    manager._reconcile_outbound(time.time())
+
+    queued = manager.ownership.queued("t1")
+    assert any(message["text"] == "unique recovered answer" and
+               message["kind"] == "result" for message in queued), queued
+
+    def offline(*_args, **_kwargs):
+        raise RuntimeError("peer offline after reconciliation")
+
+    monkeypatch.setattr(tools, "_rpc_request", offline)
+    monkeypatch.setattr(tools, "_ensure_maintenance", lambda *_a, **_k: None)
+
+    result = tools.a2a_await({"agent": "peer", "task_id": "t1"}, session_id=SESSION_ID)
+
+    assert "unique recovered answer" in result, result
+
+
+def test_reconciliation_backoff_skips_remaining_rows_for_the_same_peer(monkeypatch):
+    """A first failure suppresses more requests to that peer in the current batch."""
+    for index in range(3):
+        _old_unowned_task(f"t{index}", peer="dead")
+    manager = _manager(ScriptedPoll(task_payload()))
+    calls = []
+
+    def offline(*_args, **_kwargs):
+        calls.append(1)
+        raise RuntimeError("peer offline")
+
+    monkeypatch.setattr(tools, "_resolve_peer", lambda _name: {"url": "http://dead.test"})
+    monkeypatch.setattr(tools, "_rpc_request", offline)
+
+    manager._reconcile_outbound(time.time())
+
+    assert len(calls) == 1, f"backed-off peer retried {len(calls)} times in one batch"

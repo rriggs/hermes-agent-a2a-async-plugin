@@ -676,26 +676,35 @@ class OwnershipStore:
                 params).fetchall()
         return [dict(row) for row in rows]
 
-    def reconcile_observation(self, task_id: str, state: str, *,
+    def reconcile_observation(self, task_id: str, state: Optional[str], *,
                               reply: Optional[str] = None, released_at: Optional[float] = None,
                               remote_state: Optional[str] = None,
-                              now: Optional[float] = None) -> bool:
-        """Apply a peer observation under the ownership fence (issue #12 review P1).
+                              now: Optional[float] = None,
+                              messages: Iterable[tuple[str, str, str, bool]] = ()) -> bool:
+        """Apply a peer observation and its backlog under the ownership fence.
 
         The ownership and release-generation check and the state/reply write share one
         ``BEGIN IMMEDIATE`` transaction. A sweep that selected a row, then lost it to an adopter
-        while GetTask was in flight, must not terminalize the adopter's row: the check and the
-        write must be atomic, not a post-write timestamp update.
+        while GetTask or CancelTask was in flight, must not terminalize the adopter's row. Any
+        messages captured from that response are queued in the same transaction, so the durable
+        reply remains deliverable after adoption even if the peer is offline. ``state=None`` is
+        used when an auto-cancel request yielded no task payload; it fences and records its notice
+        without changing the task state.
         """
         now = time.time() if now is None else now
-        terminal = state in TERMINAL_REMOTE_STATES
+        terminal = state in TERMINAL_REMOTE_STATES if state else False
+        entries = [entry for entry in messages if entry and entry[0]]
+        terminal_marks = ",".join("?" for _ in TERMINAL_REMOTE_STATES)
         with self._session() as con:
             if not con.in_transaction:
                 con.execute("BEGIN IMMEDIATE")
             row = con.execute(
-                "SELECT owner_session_id, released_at, state FROM a2a_tasks WHERE task_id=?",
+                "SELECT owner_session_id, released_at, state, direction "
+                "FROM a2a_tasks WHERE task_id=?",
                 (task_id,)).fetchone()
             if row is None:
+                return False
+            if str(row["direction"] or "") != "outbound":
                 return False
             if str(row["owner_session_id"] or ""):
                 return False
@@ -703,14 +712,64 @@ class OwnershipStore:
                 return False
             if str(row["state"] or "") in TERMINAL_REMOTE_STATES:
                 return False
-            cur = con.execute(
-                """UPDATE a2a_tasks
-                      SET state=?, reply=COALESCE(?, reply), remote_state=?,
-                          completed_at=COALESCE(?, completed_at), reconciled_at=?
-                    WHERE task_id=? AND owner_session_id=''""",
-                (state, reply if terminal else None, remote_state or state,
-                 now if terminal else None, now, task_id))
-            return cur.rowcount == 1
+            if state:
+                cur = con.execute(
+                    f"""UPDATE a2a_tasks
+                          SET state=?, reply=COALESCE(?, reply), remote_state=?,
+                              completed_at=COALESCE(?, completed_at), reconciled_at=?
+                        WHERE task_id=? AND owner_session_id='' AND direction='outbound'
+                          AND state NOT IN ({terminal_marks})
+                          AND (? IS NULL OR released_at=?)""",
+                    (state, reply if terminal else None, remote_state or state,
+                     now if terminal else None, now, task_id,
+                     *TERMINAL_REMOTE_STATES, released_at, released_at))
+            else:
+                cur = con.execute(
+                    f"""UPDATE a2a_tasks SET reconciled_at=?
+                        WHERE task_id=? AND owner_session_id='' AND direction='outbound'
+                          AND state NOT IN ({terminal_marks})
+                          AND (? IS NULL OR released_at=?)""",
+                    (now, task_id, *TERMINAL_REMOTE_STATES, released_at, released_at))
+            if cur.rowcount != 1:
+                return False
+
+            # A missing-text placeholder should not appear beside a result that was already
+            # recorded by an earlier observation while the SELECT above was in flight.
+            placeholder_id = f"state:{state}" if terminal else ""
+            if placeholder_id and any(
+                    message_id == placeholder_id and kind == "result"
+                    and text.endswith(" with no text reply")
+                    for message_id, kind, text, _update in entries):
+                prior_result = con.execute(
+                    "SELECT 1 FROM a2a_task_messages WHERE task_id=? AND kind='result' LIMIT 1",
+                    (task_id,)).fetchone()
+                if prior_result is not None:
+                    entries = [entry for entry in entries
+                               if not (entry[0] == placeholder_id
+                                       and entry[1] == "result"
+                                       and entry[2].endswith(" with no text reply"))]
+
+            for message_id, kind, text, update_existing in entries:
+                if update_existing:
+                    con.execute(
+                        """INSERT INTO a2a_task_messages
+                               (task_id, message_id, kind, text, created_at)
+                           VALUES (?, ?, ?, ?, ?)
+                           ON CONFLICT(task_id, message_id) DO UPDATE SET
+                               kind=excluded.kind,
+                               text=excluded.text,
+                               delivered_at=NULL,
+                               delivered_to_session=''
+                           WHERE a2a_task_messages.text <> excluded.text
+                              OR a2a_task_messages.kind <> excluded.kind""",
+                        (task_id, message_id, kind or "progress", text or "", now))
+                else:
+                    con.execute(
+                        """INSERT OR IGNORE INTO a2a_task_messages
+                               (task_id, message_id, kind, text, created_at)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (task_id, message_id, kind or "progress", text or "", now))
+            return True
 
     def mark_reconciled(self, task_id: str, now: Optional[float] = None,
                         released_at: Optional[float] = None,

@@ -1661,31 +1661,7 @@ class WatchManager:
         stale poll. An unowned task still records (its backlog waits for the adopter).
         """
         from . import tools
-        entries: list[tuple[str, str, str, bool]] = []
-        # History first (chronology), peer-originated only: ROLE_USER entries are OUR requests,
-        # not peer progress, and status/artifacts are the newest messages.
-        for index, message in enumerate(payload.get("history") or []):
-            if not tools._peer_role(message.get("role")):
-                continue
-            text = tools._text_of_message(message)
-            if not text:
-                continue
-            message_id = str(message.get("messageId") or message.get("message_id")
-                             or f"history:{index}:{tools._digest(text)}")
-            entries.append((message_id, "progress", text, False))
-        status_msg = (payload.get("status") or {}).get("message") or {}
-        status_text = tools._text_of_message(status_msg)
-        if status_text:
-            kind = "input-required" if raw_state == protocol.STATE_INPUT_REQUIRED else "progress"
-            message_id = str(status_msg.get("messageId") or status_msg.get("message_id")
-                             or f"status:{tools._digest(status_text)}")
-            entries.append((message_id, kind, status_text, False))
-        for index, artifact in enumerate(payload.get("artifacts") or []):
-            text = tools._text_of_message(artifact)
-            if not text:
-                continue
-            kind = "input-required" if raw_state == protocol.STATE_INPUT_REQUIRED else "result"
-            entries.append((tools._artifact_message_id(artifact, index, text), kind, text, True))
+        entries = tools._observation_messages(payload, raw_state, input_artifact_kind=True)
         if (raw_state in protocol.TERMINAL_STATES
                 and not any(kind == "result" for _mid, kind, _text, _update in entries)
                 and not self.ownership.has_kind(task_id, "result")):
@@ -1726,6 +1702,8 @@ class WatchManager:
             task_id = str(rec["task_id"])
             peer_name = str(rec["peer"] or "")
             released_at = rec.get("released_at")
+            if self._peer_backoff.get(peer_name, 0.0) > now:
+                continue
             try:
                 peer = tools._resolve_peer(peer_name)
                 if not peer or not peer.get("url"):
@@ -1747,12 +1725,17 @@ class WatchManager:
                     if error.get("code") == protocol.ERR_TASK_NOT_FOUND:
                         # The peer no longer knows this task. That is not an agent failure, so it
                         # is not recorded as FAILED; the work is simply gone.
-                        self.ownership.reconcile_observation(
-                            task_id, protocol.STATE_CANCELED,
-                            reply="[peer no longer has this task — abandoned after reconciliation]",
-                            released_at=released_at, remote_state="NOT_FOUND", now=now)
-                        logger.info("A2A: task %s is gone from peer %s; marked canceled",
-                                    task_id, peer_name)
+                        gone_reply = "[peer no longer has this task — abandoned after reconciliation]"
+                        applied = self.ownership.reconcile_observation(
+                            task_id, protocol.STATE_CANCELED, reply=gone_reply,
+                            released_at=released_at, remote_state="NOT_FOUND", now=now,
+                            messages=[(f"state:{protocol.STATE_CANCELED}", "result",
+                                       gone_reply, False)])
+                        if applied:
+                            logger.info("A2A: task %s is gone from peer %s; marked canceled",
+                                        task_id, peer_name)
+                        else:
+                            logger.debug("A2A: reconcile for %s refused; ownership moved", task_id)
                     else:
                         self.ownership.mark_reconciled(task_id, now, released_at)
                         self._note_peer_failure(peer_name, now)
@@ -1762,14 +1745,21 @@ class WatchManager:
                 payload = resp.get("result")
                 raw_state = (str((payload.get("status") or {}).get("state") or "")
                              if isinstance(payload, dict) else "")
-                if not raw_state:
+                if not isinstance(payload, dict) or not raw_state:
                     self.ownership.mark_reconciled(task_id, now, released_at)
                     self._note_peer_failure(peer_name, now)
                     continue
+                messages = tools._observation_messages(payload, raw_state,
+                                                       input_artifact_kind=True)
+                if (raw_state in protocol.TERMINAL_STATES
+                        and not any(kind == "result" for _mid, kind, _text, _update in messages)):
+                    messages.append((f"state:{raw_state}", "result",
+                                     f"task reached {tools._short_state(raw_state)} "
+                                     "with no text reply", False))
                 applied = self.ownership.reconcile_observation(
                     task_id, raw_state,
                     reply=tools._reply_text_from_result(payload),
-                    released_at=released_at, now=now)
+                    released_at=released_at, now=now, messages=messages)
                 if applied:
                     self._peer_failures.pop(peer_name, None)
                     self._peer_backoff.pop(peer_name, None)
@@ -1793,10 +1783,8 @@ class WatchManager:
         except Exception:
             logger.debug("A2A: unowned task sweep failed", exc_info=True)
             return
-        task_store = protocol.TaskStore(self.store.db_path) if cancel else None
         for rec in cancel:
             task_id = str(rec["task_id"])
-            assert task_store is not None  # cancel is non-empty => the store exists
             # Fence first: the selection is a snapshot, and an adoption may have happened since.
             # Claiming the action atomically is what proves the task is still unowned.
             if not self.ownership.mark_cancel_requested(task_id, now, rec.get("released_at")):
@@ -1804,10 +1792,12 @@ class WatchManager:
             peer_name = str(rec["peer"] or "")
             peer = tools._resolve_peer(peer_name)
             detail = "The watcher asked the peer to cancel it. Its remote state may still be working."
+            payload = None
             if peer and peer.get("url"):
                 try:
                     outcome = tools._cancel_task(peer, peer_name, task_id,
-                                                 store=task_store, timeout=15)
+                                                 timeout=15, fold=False)
+                    payload = outcome.get("payload")
                     if outcome.get("already_terminal"):
                         detail = (f"The peer reported the task already "
                                   f"{outcome.get('state') or 'terminal'}; the local record was "
@@ -1819,10 +1809,28 @@ class WatchManager:
                                      task_id, outcome.get("error"))
                 except Exception as exc:
                     logger.debug("A2A: CancelTask for unowned %s failed: %s", task_id, exc)
-            self.ownership.add_message(
-                task_id, f"auto-cancel:{int(now)}", "error",
+            state = ""
+            reply = None
+            messages: list[tuple[str, str, str, bool]] = []
+            if isinstance(payload, dict):
+                state = str((payload.get("status") or {}).get("state") or "")
+                reply = tools._reply_text_from_result(payload)
+                messages = tools._observation_messages(payload, state,
+                                                       input_artifact_kind=True)
+                if (state in protocol.TERMINAL_STATES
+                        and not any(kind == "result"
+                                    for _mid, kind, _text, _update in messages)):
+                    messages.append((f"state:{state}", "result",
+                                     f"task reached {tools._short_state(state)} "
+                                     "with no text reply", False))
+            messages.append((
+                f"auto-cancel:{int(now)}", "error",
                 "This task was unowned for longer than the auto-cancellation timeout, so the "
-                f"watcher asked the peer to cancel it. {detail}")
+                f"watcher asked the peer to cancel it. {detail}", False))
+            if not self.ownership.reconcile_observation(
+                    task_id, state or None, reply=reply, released_at=rec.get("released_at"),
+                    remote_state=state or None, now=now, messages=messages):
+                logger.debug("A2A: auto-cancel result for %s refused; ownership moved", task_id)
         for rec in abandon:
             task_id = str(rec["task_id"])
             if self.ownership.abandon(task_id, now, rec.get("released_at"),

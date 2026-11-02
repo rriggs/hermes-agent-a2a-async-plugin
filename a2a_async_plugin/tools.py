@@ -318,35 +318,57 @@ def _fold_task_payload(store: "protocol.TaskStore", task_id: str,
 
 def _cancel_task(peer: dict, agent_label: str, task_id: str, *,
                  store: Optional["protocol.TaskStore"] = None,
-                 timeout: int = 30) -> dict:
+                 timeout: int = 30, fold: bool = True) -> dict:
     """Send CancelTask and reconcile the local row. Returns a result dict.
 
     ``-32002 TaskNotCancelable`` means the peer considers the task terminal. That refusal is an
     authoritative observation, not a dead end: fetch the task and fold its state and reply.
     Reporting only "already completed" left the row stuck at SUBMITTED/WORKING with no result
-    (issue #16).
+    (issue #16). A maintenance caller can set ``fold=False`` to apply the response under its own
+    ownership-generation fence instead of writing through ``TaskStore`` here.
     """
-    store = _task_store() if store is None else store
+    if fold and store is None:
+        store = _task_store()
+
+    def result_for(payload: Any, *, ok: bool, already_terminal: bool = False) -> dict:
+        if isinstance(payload, dict):
+            if fold:
+                assert store is not None
+                state, reply = _fold_task_payload(store, task_id, payload)
+            else:
+                raw_state = str((payload.get("status") or {}).get("state") or "")
+                state, reply = _short_state(raw_state), _reply_text_from_result(payload)
+        else:
+            state, reply = "", ""
+        result = {"ok": ok, "state": state, "reply": reply}
+        if already_terminal:
+            result["already_terminal"] = True
+        if not fold:
+            result["payload"] = payload if isinstance(payload, dict) else None
+        return result
+
     resp = _rpc_request(peer, "CancelTask", {"id": task_id}, timeout=timeout)
     if "error" not in resp:
         payload = resp.get("result", {})
-        if not isinstance(payload, dict):
-            return {"ok": True, "state": "", "reply": ""}
-        state, reply = _fold_task_payload(store, task_id, payload)
-        return {"ok": True, "state": state, "reply": reply}
+        return result_for(payload, ok=True)
 
     err = resp.get("error") or {}
     if err.get("code") == protocol.ERR_TASK_NOT_CANCELABLE:
         try:
             get = _rpc_request(peer, "GetTask", {"id": task_id}, timeout=timeout)
         except Exception as exc:
-            return {"ok": False,
-                    "error": f"{_peer_rpc_error(resp, agent_label)} (GetTask failed: {exc})"}
+            result = {"ok": False,
+                      "error": f"{_peer_rpc_error(resp, agent_label)} (GetTask failed: {exc})"}
+            if not fold:
+                result["payload"] = None
+            return result
         payload = get.get("result") if isinstance(get, dict) else None
         if isinstance(payload, dict) and "error" not in get:
-            state, reply = _fold_task_payload(store, task_id, payload)
-            return {"ok": False, "already_terminal": True, "state": state, "reply": reply}
-    return {"ok": False, "error": _peer_rpc_error(resp, agent_label)}
+            return result_for(payload, ok=False, already_terminal=True)
+    result = {"ok": False, "error": _peer_rpc_error(resp, agent_label)}
+    if not fold:
+        result["payload"] = None
+    return result
 
 
 def a2a_steer(args: dict, **_: Any) -> str:
@@ -880,29 +902,8 @@ def _record_observation(task_id: str, payload: dict, peer: str,
     state = str((payload.get("status") or {}).get("state") or "")
     context_id = str(payload.get("contextId") or "")
     _ensure_task_record(task_id, peer, context_id, state)
-    entries: list[tuple[str, str, str, bool]] = []
     try:
-        # History first (chronology), peer-originated only: ROLE_USER is OUR request.
-        for index, message in enumerate(payload.get("history") or []):
-            if not _peer_role(message.get("role")):
-                continue
-            text = _text_of_message(message)
-            if not text:
-                continue
-            message_id = str(message.get("messageId") or message.get("message_id")
-                             or f"history:{index}:{_digest(text)}")
-            entries.append((message_id, "progress", text, False))
-        status_msg = (payload.get("status") or {}).get("message") or {}
-        message_id = str(status_msg.get("messageId") or status_msg.get("message_id") or "")
-        status_text = _text_of_message(status_msg)
-        if status_text:
-            kind = "input-required" if state == protocol.STATE_INPUT_REQUIRED else "progress"
-            entries.append((message_id or f"status:{_digest(status_text)}", kind, status_text, False))
-        for index, artifact in enumerate(payload.get("artifacts") or []):
-            text = _text_of_message(artifact)
-            if not text:
-                continue
-            entries.append((_artifact_message_id(artifact, index, text), "result", text, True))
+        entries = _observation_messages(payload, state)
         if (state in protocol.TERMINAL_STATES
                 and not any(kind == "result" for _mid, kind, _text, _update in entries)
                 and not store.has_kind(task_id, "result")):
@@ -915,6 +916,37 @@ def _record_observation(task_id: str, payload: dict, peer: str,
     except Exception:
         logger.debug("A2A: message recording failed", exc_info=True)
         return store.queued(task_id)
+
+
+def _observation_messages(payload: dict, state: str, *,
+                         input_artifact_kind: bool = False) -> list[tuple[str, str, str, bool]]:
+    """Extract stable backlog entries from one peer task observation, without writing them."""
+    entries: list[tuple[str, str, str, bool]] = []
+    # History first (chronology), peer-originated only: ROLE_USER is OUR request.
+    for index, message in enumerate(payload.get("history") or []):
+        if not _peer_role(message.get("role")):
+            continue
+        text = _text_of_message(message)
+        if not text:
+            continue
+        message_id = str(message.get("messageId") or message.get("message_id")
+                         or f"history:{index}:{_digest(text)}")
+        entries.append((message_id, "progress", text, False))
+    status_msg = (payload.get("status") or {}).get("message") or {}
+    status_text = _text_of_message(status_msg)
+    if status_text:
+        message_id = str(status_msg.get("messageId") or status_msg.get("message_id")
+                         or f"status:{_digest(status_text)}")
+        kind = "input-required" if state == protocol.STATE_INPUT_REQUIRED else "progress"
+        entries.append((message_id, kind, status_text, False))
+    for index, artifact in enumerate(payload.get("artifacts") or []):
+        text = _text_of_message(artifact)
+        if not text:
+            continue
+        kind = ("input-required" if input_artifact_kind
+                and state == protocol.STATE_INPUT_REQUIRED else "result")
+        entries.append((_artifact_message_id(artifact, index, text), kind, text, True))
+    return entries
 
 
 def _peer_role(role: Any) -> bool:

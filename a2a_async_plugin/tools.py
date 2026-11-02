@@ -387,6 +387,7 @@ def a2a_steer(args: dict, **_: Any) -> str:
                          remote_state=state or protocol.STATE_SUBMITTED)
     protocol.persist_message(reply_ctx, "user", safe_message, task_id)  # local turn, no peer
     protocol.metrics.outbound_total += 1
+    _start_maintenance()
     return (f"[{agent} · steering task {task_id} · context {reply_ctx} · "
             f"{_short_state(state) or 'submitted'}]\nSteering queued. Poll with "
             f"a2a_get_task(agent='{agent}', task_id='{task_id}') to observe delivery.")
@@ -450,6 +451,7 @@ def a2a_submit(args: dict, **_: Any) -> str:
     )
     protocol.persist_message(reply_ctx, "user", safe_message, task_id)  # local turn, no peer
     protocol.metrics.outbound_total += 1
+    _start_maintenance()
     return (
         f"[{agent} · task {task_id} · context {reply_ctx} · "
         f"{_short_state(state) or 'submitted'}]\n"
@@ -546,6 +548,23 @@ def _watch_manager(ctx: Any = None):
         # Same profile: refresh the context (a re-registration may carry a newer ctx).
         manager.ctx = ctx
     return manager
+
+
+def _start_maintenance() -> None:
+    """Start the profile's maintenance poller after creating abandoned-prone outbound work.
+
+    A profile that had no watches and no unowned work starts no poller at plugin load. Without
+    this, the first ``a2a_submit`` on an idle profile creates a row no reconciliation or timer
+    ever sees until a reload or another operation starts polling (issue #16 review P1).
+    ``rehydrate`` is the existing read-only probe that starts only when there is work.
+    """
+    ctx = _CTX
+    if ctx is None:
+        return
+    try:
+        _watch_manager(ctx).rehydrate()
+    except Exception:
+        logger.debug("A2A: could not start maintenance after outbound work", exc_info=True)
 
 
 def _delivery_capable(ctx: Any) -> bool:

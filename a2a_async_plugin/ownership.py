@@ -642,16 +642,25 @@ class OwnershipStore:
         return cancel, abandon
 
     def reconcile_due(self, now: Optional[float] = None, *, after_s: float, interval_s: float,
-                      limit: int) -> list[dict]:
+                      limit: int, exclude_peers: Optional[Iterable[str]] = None) -> list[dict]:
         """Unowned outbound rows nobody is polling, one attempt per ``interval_s`` (issue #12).
 
         Only unowned rows are selected: an owned task belongs to a session that may still be
         waiting, and its watch already polls the peer. Terminal rows are settled and need no
-        reconciliation.
+        reconciliation. ``exclude_peers`` drops peers that are currently backed off *before* the
+        LIMIT, so ten rows for an unreachable peer cannot starve a healthy peer's row. Candidates
+        are ordered by last attempt first, which also rotates a peer's rows when it is retried.
         """
         now = time.time() if now is None else now
         terminal = tuple(TERMINAL_REMOTE_STATES)
         placeholders = ",".join("?" * len(terminal))
+        excluded = tuple(sorted({str(p) for p in (exclude_peers or ()) if p}))
+        peer_clause = ""
+        params: list[Any] = [*terminal, now - after_s, now - interval_s]
+        if excluded:
+            peer_clause = " AND peer NOT IN (" + ",".join("?" * len(excluded)) + ")"
+            params.extend(excluded)
+        params.append(max(1, int(limit)))
         with self._session() as con:
             rows = con.execute(
                 f"""SELECT task_id, peer, state, remote_state, created_at, released_at,
@@ -661,10 +670,47 @@ class OwnershipStore:
                        AND state NOT IN ({placeholders})
                        AND created_at<=?
                        AND (reconciled_at=0 OR reconciled_at<=?)
-                     ORDER BY created_at
+                       {peer_clause}
+                     ORDER BY COALESCE(NULLIF(reconciled_at, 0), created_at), created_at
                      LIMIT ?""",
-                (*terminal, now - after_s, now - interval_s, max(1, int(limit)))).fetchall()
+                params).fetchall()
         return [dict(row) for row in rows]
+
+    def reconcile_observation(self, task_id: str, state: str, *,
+                              reply: Optional[str] = None, released_at: Optional[float] = None,
+                              remote_state: Optional[str] = None,
+                              now: Optional[float] = None) -> bool:
+        """Apply a peer observation under the ownership fence (issue #12 review P1).
+
+        The ownership and release-generation check and the state/reply write share one
+        ``BEGIN IMMEDIATE`` transaction. A sweep that selected a row, then lost it to an adopter
+        while GetTask was in flight, must not terminalize the adopter's row: the check and the
+        write must be atomic, not a post-write timestamp update.
+        """
+        now = time.time() if now is None else now
+        terminal = state in TERMINAL_REMOTE_STATES
+        with self._session() as con:
+            if not con.in_transaction:
+                con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT owner_session_id, released_at, state FROM a2a_tasks WHERE task_id=?",
+                (task_id,)).fetchone()
+            if row is None:
+                return False
+            if str(row["owner_session_id"] or ""):
+                return False
+            if released_at is not None and float(row["released_at"] or 0.0) != float(released_at):
+                return False
+            if str(row["state"] or "") in TERMINAL_REMOTE_STATES:
+                return False
+            cur = con.execute(
+                """UPDATE a2a_tasks
+                      SET state=?, reply=COALESCE(?, reply), remote_state=?,
+                          completed_at=COALESCE(?, completed_at), reconciled_at=?
+                    WHERE task_id=? AND owner_session_id=''""",
+                (state, reply if terminal else None, remote_state or state,
+                 now if terminal else None, now, task_id))
+            return cur.rowcount == 1
 
     def mark_reconciled(self, task_id: str, now: Optional[float] = None,
                         released_at: Optional[float] = None,
@@ -699,17 +745,28 @@ class OwnershipStore:
             return cur.rowcount == 1
 
     def abandon(self, task_id: str, now: Optional[float] = None,
-                released_at: Optional[float] = None) -> bool:
-        """Retire an unowned task and its backlog. False when it was adopted or re-released."""
+                released_at: Optional[float] = None,
+                expected_state: Optional[str] = None) -> bool:
+        """Retire an unowned task and its backlog. False when it was adopted or re-released.
+
+        ``expected_state`` makes the TTL decision conditional on the snapshot it was made from:
+        a refused cancel can reconcile the row to COMPLETED between selection and this call, and
+        overwriting that recovered answer with the TTL marker would destroy it (issue #12 review
+        P1).
+        """
         now = time.time() if now is None else now
-        with self._session() as con:
-            cur = con.execute(
-                """UPDATE a2a_tasks
+        sql = ("""UPDATE a2a_tasks
                       SET state=?, remote_state=?, reply=?, completed_at=?
                     WHERE task_id=? AND owner_session_id='' AND direction='outbound'
-                      AND (? IS NULL OR released_at=?)""",
-                (protocol.STATE_CANCELED, protocol.STATE_CANCELED,
-                 "abandoned after the unowned-task TTL", now, task_id, released_at, released_at))
+                      AND (? IS NULL OR released_at=?)""")
+        params: list[Any] = [protocol.STATE_CANCELED, protocol.STATE_CANCELED,
+                             "abandoned after the unowned-task TTL", now, task_id,
+                             released_at, released_at]
+        if expected_state is not None:
+            sql += " AND state=?"
+            params.append(expected_state)
+        with self._session() as con:
+            cur = con.execute(sql, params)
             if cur.rowcount != 1:
                 return False
             con.execute("DELETE FROM a2a_task_messages WHERE task_id=?", (task_id,))

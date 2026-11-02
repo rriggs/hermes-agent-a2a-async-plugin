@@ -2090,9 +2090,9 @@ def _age_row(task_id: str, seconds: float) -> None:
     con.close()
 
 
-def _old_unowned_task(task_id="t1", state=protocol.STATE_WORKING):
+def _old_unowned_task(task_id="t1", state=protocol.STATE_WORKING, peer="peer"):
     rec = protocol.TaskStore(_store().db_path).create(
-        task_id, "ctx-1", "peer", direction="outbound", remote_state=state)
+        task_id, "ctx-1", peer, direction="outbound", remote_state=state)
     protocol.TaskStore(_store().db_path).set_state(task_id, state)
     _age_row(task_id, 7200.0)
     return rec
@@ -2161,7 +2161,7 @@ def test_reconciliation_leaves_the_row_alone_when_the_peer_is_unreachable(monkey
     with _store()._session() as con:
         stamped = con.execute(
             "SELECT reconciled_at FROM a2a_tasks WHERE task_id='t1'").fetchone()
-    assert stamped["reconciled_at"] == 0, "no successful observation to record"
+    assert stamped["reconciled_at"] > 0, "the attempt must be recorded so the batch rotates"
     assert len(calls) == 1
 
     manager._reconcile_outbound(now)
@@ -2253,3 +2253,77 @@ def test_the_sweep_cancels_a_never_awaited_task(monkeypatch):
         requested = con.execute(
             "SELECT cancel_requested_at FROM a2a_tasks WHERE task_id='t1'").fetchone()
     assert requested["cancel_requested_at"] > 0
+
+
+def test_reconcile_cannot_terminalize_a_task_adopted_during_the_rpc(monkeypatch):
+    """Review P1: the observation and its ownership check must be one transaction."""
+    _old_unowned_task("t1")
+    manager = _manager(ScriptedPoll(task_payload()))
+
+    def rpc(_peer, method, params, timeout=None):
+        assert manager.ownership.acquire("t1", SESSION_ID), "adopt while GetTask is in flight"
+        return {"error": {"code": protocol.ERR_TASK_NOT_FOUND, "message": "gone"}}
+
+    monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": "http://peer.test"})
+    monkeypatch.setattr(tools, "_rpc_request", rpc)
+
+    manager._reconcile_outbound(time.time())
+
+    assert manager.ownership.owner("t1") == SESSION_ID
+    row = protocol.TaskStore(_store().db_path).get("t1")
+    assert row["state"] == protocol.STATE_WORKING, (
+        "a sweep that lost the row mid-RPC must not terminalize the adopter's task")
+
+
+def test_ttl_does_not_overwrite_a_result_recovered_by_a_refused_cancel(monkeypatch):
+    """Review P1: the cancel snapshot's answer must survive the abandon pass in the same cycle."""
+    _old_unowned_task("t1")
+    _age_row("t1", 700_000.0)  # past the seven-day TTL
+    manager = _manager(ScriptedPoll(task_payload()))
+    manager.reconcile_after_s = 10 ** 9  # leave reconciliation to the refused-cancel path
+
+    def rpc(_peer, method, params, timeout=None):
+        if method == "CancelTask":
+            return {"error": {"code": protocol.ERR_TASK_NOT_CANCELABLE,
+                              "message": "task already TASK_STATE_COMPLETED"}}
+        if method == "GetTask":
+            return {"result": task_payload("t1", protocol.STATE_COMPLETED,
+                                           "answer must survive")}
+        raise AssertionError(method)
+
+    monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": "http://peer.test"})
+    monkeypatch.setattr(tools, "_rpc_request", rpc)
+
+    manager._maintain_unowned(time.time())
+
+    row = protocol.TaskStore(_store().db_path).get("t1")
+    assert row["state"] == protocol.STATE_COMPLETED
+    assert row["reply"] == "answer must survive", "the TTL must not overwrite a recovered answer"
+
+
+def test_a_backed_off_peer_does_not_starve_a_healthy_peer(monkeypatch):
+    """Review P2: selection must exclude backed-off peers before applying the batch limit."""
+    for index in range(10):
+        task_id = f"dead-{index}"
+        _old_unowned_task(task_id, peer="dead")
+        _age_row(task_id, 9000.0)
+    _old_unowned_task("healthy", peer="healthy")
+    _age_row("healthy", 8000.0)
+    manager = _manager(ScriptedPoll(task_payload()))
+    manager.reconcile_batch = 10
+
+    def rpc(peer, method, params, timeout=None):
+        if peer["url"].startswith("http://dead"):
+            raise RuntimeError("peer down")
+        return {"result": task_payload(params["id"], protocol.STATE_COMPLETED, "healthy answer")}
+
+    monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": f"http://{name}.test"})
+    monkeypatch.setattr(tools, "_rpc_request", rpc)
+    now = time.time()
+
+    manager._reconcile_outbound(now)
+    manager._reconcile_outbound(now + 1.0)
+
+    row = protocol.TaskStore(_store().db_path).get("healthy")
+    assert row["state"] == protocol.STATE_COMPLETED, (
+        "ten rows for a dead peer must not occupy every batch")

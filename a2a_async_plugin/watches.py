@@ -1711,28 +1711,33 @@ class WatchManager:
         pass, and per-peer backoff keep this from turning into a polling storm.
         """
         from . import tools
+        excluded = {peer for peer, until in self._peer_backoff.items() if until > now}
         try:
             due = self.ownership.reconcile_due(
                 now, after_s=self.reconcile_after_s,
-                interval_s=self.reconcile_interval_s, limit=self.reconcile_batch)
+                interval_s=self.reconcile_interval_s, limit=self.reconcile_batch,
+                exclude_peers=excluded)
         except Exception:
             logger.debug("A2A: outbound reconciliation selection failed", exc_info=True)
             return
         if not due:
             return
-        task_store = protocol.TaskStore(self.store.db_path)
         for rec in due:
             task_id = str(rec["task_id"])
             peer_name = str(rec["peer"] or "")
+            released_at = rec.get("released_at")
             try:
-                if self._peer_backoff.get(peer_name, 0.0) > now:
-                    continue
                 peer = tools._resolve_peer(peer_name)
                 if not peer or not peer.get("url"):
+                    # Unknown peer: record the attempt so these rows do not fill every batch,
+                    # and back off so a later config fix is retried rather than hammered.
+                    self.ownership.mark_reconciled(task_id, now, released_at)
+                    self._note_peer_failure(peer_name, now)
                     continue
                 try:
                     resp = tools._rpc_request(peer, "GetTask", {"id": task_id}, timeout=15)
                 except Exception as exc:
+                    self.ownership.mark_reconciled(task_id, now, released_at)
                     self._note_peer_failure(peer_name, now)
                     logger.debug("A2A: reconcile GetTask for %s on %s failed: %s",
                                  task_id, peer_name, exc)
@@ -1742,28 +1747,36 @@ class WatchManager:
                     if error.get("code") == protocol.ERR_TASK_NOT_FOUND:
                         # The peer no longer knows this task. That is not an agent failure, so it
                         # is not recorded as FAILED; the work is simply gone.
-                        task_store.complete(
+                        self.ownership.reconcile_observation(
                             task_id, protocol.STATE_CANCELED,
-                            "[peer no longer has this task — abandoned after reconciliation]")
-                        self.ownership.mark_reconciled(
-                            task_id, now, rec.get("released_at"), remote_state="NOT_FOUND")
+                            reply="[peer no longer has this task — abandoned after reconciliation]",
+                            released_at=released_at, remote_state="NOT_FOUND", now=now)
                         logger.info("A2A: task %s is gone from peer %s; marked canceled",
                                     task_id, peer_name)
                     else:
+                        self.ownership.mark_reconciled(task_id, now, released_at)
                         self._note_peer_failure(peer_name, now)
                         logger.debug("A2A: reconcile GetTask for %s on %s returned %s",
                                      task_id, peer_name, error.get("code"))
                     continue
                 payload = resp.get("result")
-                if not isinstance(payload, dict):
+                raw_state = (str((payload.get("status") or {}).get("state") or "")
+                             if isinstance(payload, dict) else "")
+                if not raw_state:
+                    self.ownership.mark_reconciled(task_id, now, released_at)
                     self._note_peer_failure(peer_name, now)
                     continue
-                state, _reply = tools._fold_task_payload(task_store, task_id, payload)
-                self.ownership.mark_reconciled(task_id, now, rec.get("released_at"))
-                self._peer_failures.pop(peer_name, None)
-                self._peer_backoff.pop(peer_name, None)
-                logger.debug("A2A: reconciled task %s on %s: %s", task_id, peer_name,
-                             state or "unknown")
+                applied = self.ownership.reconcile_observation(
+                    task_id, raw_state,
+                    reply=tools._reply_text_from_result(payload),
+                    released_at=released_at, now=now)
+                if applied:
+                    self._peer_failures.pop(peer_name, None)
+                    self._peer_backoff.pop(peer_name, None)
+                    logger.debug("A2A: reconciled task %s on %s: %s", task_id, peer_name,
+                                 tools._short_state(raw_state) or "unknown")
+                else:
+                    logger.debug("A2A: reconcile for %s refused; ownership moved", task_id)
             except Exception:
                 logger.debug("A2A: reconcile of task %s failed", task_id, exc_info=True)
                 self._note_peer_failure(peer_name, now)
@@ -1812,7 +1825,8 @@ class WatchManager:
                 f"watcher asked the peer to cancel it. {detail}")
         for rec in abandon:
             task_id = str(rec["task_id"])
-            if self.ownership.abandon(task_id, now, rec.get("released_at")):
+            if self.ownership.abandon(task_id, now, rec.get("released_at"),
+                                      expected_state=rec.get("state")):
                 logger.info("A2A: abandoned unowned task %s after the TTL", task_id)
 
     def _ensure_task_record(self, task_id: str, context_id: str, peer: str,

@@ -942,3 +942,31 @@ def test_explicit_acquire_then_session_end_starts_maintenance(monkeypatch):
     tools._on_session_end(None, {"old_session_id": SESSION_A}, boundary="reset")
     assert _store().owner("t1") == ""
     assert starts, "released task has timer work but no scheduler was started"
+
+
+def test_reconcile_observation_refuses_a_row_adopted_after_selection():
+    """The ownership check and the observation write share one transaction (review P1)."""
+    _task("t1")
+    before = protocol.TaskStore().get("t1")["state"]
+    store = _store()
+    store.acquire("t1", SESSION_B)
+
+    assert store.reconcile_observation(
+        "t1", protocol.STATE_CANCELED, released_at=0.0) is False
+
+    row = protocol.TaskStore().get("t1")
+    assert row["state"] == before, "the adopter's state was terminalized"
+
+
+def test_abandon_with_expected_state_keeps_a_recovered_answer():
+    """The TTL decision is conditional on the snapshot it was made from (review P1)."""
+    _task("t1")
+    protocol.TaskStore().complete("t1", protocol.STATE_COMPLETED, "the answer")
+    store = _store()
+
+    assert store.abandon("t1", released_at=0.0,
+                         expected_state=protocol.STATE_WORKING) is False
+
+    row = protocol.TaskStore().get("t1")
+    assert row["state"] == protocol.STATE_COMPLETED
+    assert row["reply"] == "the answer"

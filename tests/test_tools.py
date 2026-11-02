@@ -385,3 +385,29 @@ def test_cancel_does_not_rewrite_a_locally_terminal_row(monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_submit_starts_maintenance_on_an_idle_profile(monkeypatch, tmp_path):
+    """Review P1: the first submit on an idle profile must start the maintenance poller."""
+    monkeypatch.setenv("A2A_TASKS_DB", str(tmp_path / "tasks.db"))
+    started = []
+
+    class Manager:
+        def rehydrate(self):
+            started.append(True)
+            return 1
+
+    monkeypatch.setattr(tools, "_CTX", object())
+    monkeypatch.setattr(tools, "_watch_manager", lambda *a, **k: Manager())
+    monkeypatch.setattr(tools, "_load_config",
+                        lambda: {"a2a_agents": {"peer": {"url": "http://peer.invalid"}}})
+    monkeypatch.setattr(
+        tools, "_rpc_request",
+        lambda *a, **k: {"result": {"id": "task-s1", "contextId": "ctx-s1",
+                                    "status": {"state": tools.protocol.STATE_WORKING}}})
+    monkeypatch.setattr(tools.security, "redact_outbound", lambda text: text)
+
+    out = tools.a2a_submit({"agent": "peer", "message": "long job"})
+
+    assert "accepted asynchronously" in out, out
+    assert started == [True], "submit on an idle profile left the maintenance poller stopped"

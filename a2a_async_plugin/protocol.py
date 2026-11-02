@@ -38,7 +38,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "1.0"
-A2A_TASK_SCHEMA_VERSION = 6
+A2A_TASK_SCHEMA_VERSION = 7
 
 
 def _load_plugin_version() -> str:
@@ -692,7 +692,8 @@ class TaskStore:
                 owned_at REAL NOT NULL DEFAULT 0,
                 released_at REAL NOT NULL DEFAULT 0,
                 unowned_since REAL NOT NULL DEFAULT 0,
-                cancel_requested_at REAL NOT NULL DEFAULT 0
+                cancel_requested_at REAL NOT NULL DEFAULT 0,
+                reconciled_at REAL NOT NULL DEFAULT 0
             )""")
             columns = {row[1] for row in con.execute("PRAGMA table_info(a2a_tasks)")}
             for name, definition in (
@@ -707,6 +708,10 @@ class TaskStore:
                 ("released_at", "REAL NOT NULL DEFAULT 0"),
                 ("unowned_since", "REAL NOT NULL DEFAULT 0"),
                 ("cancel_requested_at", "REAL NOT NULL DEFAULT 0"),
+                # Reconciliation sweep (schema v7, issue #12): last time this outbound row was
+                # checked against its peer. Independent of ownership so an unowned row gets
+                # exactly one GetTask per interval instead of one per poller pass.
+                ("reconciled_at", "REAL NOT NULL DEFAULT 0"),
             ):
                 if name not in columns:
                     con.execute(f"ALTER TABLE a2a_tasks ADD COLUMN {name} {definition}")

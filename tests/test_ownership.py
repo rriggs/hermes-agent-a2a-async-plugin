@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -132,6 +133,96 @@ def test_unowned_tasks_are_cancelled_after_a_day_and_abandoned_after_the_ttl():
 
     _, abandon = store.unowned_due(604801.0, cancel_after_s=86400.0, ttl_s=604800.0)
     assert [r["task_id"] for r in abandon] == ["t1"]
+
+
+def test_a_never_awaited_outbound_task_enters_the_sweep_on_its_creation_clock():
+    """Issue #16: submit-and-forget is unowned from creation, not only after a release."""
+    rec = _task("t1")
+    base = rec["created_at"]
+    store = _store()
+
+    cancel, abandon = store.unowned_due(base + 3600.0, cancel_after_s=86_400.0,
+                                       ttl_s=604_800.0)
+    assert (cancel, abandon) == ([], []), "fresh work is not due yet"
+
+    cancel, abandon = store.unowned_due(base + 86_401.0, cancel_after_s=86_400.0,
+                                       ttl_s=604_800.0)
+    assert [r["task_id"] for r in cancel] == ["t1"]
+    assert abandon == []
+    assert store.mark_cancel_requested("t1", base + 86_401.0, 0.0) is True
+
+    cancel, abandon = store.unowned_due(base + 604_801.0, cancel_after_s=86_400.0,
+                                       ttl_s=604_800.0)
+    assert cancel == []
+    assert [r["task_id"] for r in abandon] == ["t1"], "the TTL also applies to never-owned rows"
+
+
+def test_terminal_never_owned_rows_are_history_not_sweep_work():
+    """A completed row that nobody owned must not be rewritten as CANCELED by the TTL."""
+    rec = _task("t1")
+    protocol.TaskStore().complete("t1", protocol.STATE_COMPLETED, "the answer")
+    store = _store()
+
+    cancel, abandon = store.unowned_due(rec["created_at"] + 10_000_000.0,
+                                       cancel_after_s=86_400.0, ttl_s=604_800.0)
+    assert (cancel, abandon) == ([], [])
+    assert protocol.TaskStore().get("t1")["state"] == protocol.STATE_COMPLETED
+
+
+def test_inbound_rows_are_never_swept_as_abandoned_outbound_work():
+    rec = protocol.TaskStore().create("t1", "ctx", "peer", direction="inbound")
+    store = _store()
+    cancel, abandon = store.unowned_due(rec["created_at"] + 10_000_000.0,
+                                       cancel_after_s=86_400.0, ttl_s=604_800.0)
+    assert (cancel, abandon) == ([], [])
+
+
+def test_reconcile_due_selects_only_unowned_nonterminal_outbound_rows():
+    def age(task_id: str, seconds: float) -> None:
+        db = _store().db_path
+        con = sqlite3.connect(db)
+        con.execute("UPDATE a2a_tasks SET created_at=created_at-? WHERE task_id=?",
+                    (seconds, task_id))
+        con.commit()
+        con.close()
+
+    _task("t1")                                   # unowned, old: due
+    _task("t2"); _store().acquire("t2", SESSION_A)  # owned: not due
+    _task("t3"); protocol.TaskStore().complete("t3", protocol.STATE_COMPLETED, "done")
+    protocol.TaskStore().create("t4", "ctx", "peer", direction="inbound")
+    _task("t5")                                   # unowned, fresh: not due yet
+    _task("t6")                                   # unowned, old, recently reconciled
+    for task_id in ("t1", "t2", "t3", "t4", "t6"):
+        age(task_id, 7200.0)
+    db = _store().db_path
+    con = sqlite3.connect(db)
+    con.execute("UPDATE a2a_tasks SET reconciled_at=? WHERE task_id='t6'",
+                (time.time() - 60.0,))
+    con.commit()
+    con.close()
+
+    due = _store().reconcile_due(time.time(), after_s=3600.0, interval_s=300.0, limit=10)
+
+    assert [r["task_id"] for r in due] == ["t1"], (
+        "owned, terminal, inbound, fresh, and recently reconciled rows are all skipped")
+
+
+def test_mark_reconciled_refuses_a_row_adopted_after_selection():
+    _task("t1")
+    store = _store()
+    now = time.time()
+    assert store.reconcile_due(now, after_s=0.0, interval_s=0.0, limit=10)
+    store.acquire("t1", SESSION_B)
+    assert store.mark_reconciled("t1", now) is False, "an adopter's row must not be rewritten"
+
+
+def test_unowned_count_readonly_counts_never_owned_work():
+    _task("t1")                                   # never awaited, non-terminal
+    protocol.TaskStore().create("t2", "ctx", "peer", direction="inbound")
+    _task("t3"); protocol.TaskStore().complete("t3", protocol.STATE_COMPLETED, "done")
+
+    assert _store().unowned_count_readonly() >= 1, (
+        "the poller must start for submit-and-forget rows, not only released ones")
 
 
 def test_session_hooks_release_on_end_and_reclaim_with_a_note_on_start():

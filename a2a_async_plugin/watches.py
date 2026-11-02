@@ -77,6 +77,12 @@ RETENTION_S = 7 * 24 * 3600.0
 # waiting for) and abandoned after the TTL. Both are configurable per profile.
 DEFAULT_UNOWNED_CANCEL_AFTER_S = 24 * 3600.0
 DEFAULT_UNOWNED_TTL_S = 7 * 24 * 3600.0
+# An unowned outbound row nobody is polling is reconciled against its peer before the cancel
+# timer fires. One GetTask per row per interval, a bounded batch per pass, and per-peer backoff so
+# an unreachable peer cannot stall the sweep (issue #12).
+DEFAULT_RECONCILE_AFTER_S = 3600.0
+DEFAULT_RECONCILE_INTERVAL_S = 300.0
+DEFAULT_RECONCILE_BATCH = 10
 # Keep a published completion inside the core publisher's content budget (32k chars).
 MAX_REPLY_CHARS = 24_000
 
@@ -1160,6 +1166,16 @@ class WatchManager:
             "unowned_cancel_after_s", "A2A_UNOWNED_CANCEL_AFTER", DEFAULT_UNOWNED_CANCEL_AFTER_S)
         self.unowned_ttl_s = _config_float(
             "unowned_task_ttl_s", "A2A_UNOWNED_TASK_TTL", DEFAULT_UNOWNED_TTL_S)
+        self.reconcile_after_s = _config_float(
+            "reconcile_after_s", "A2A_RECONCILE_AFTER", DEFAULT_RECONCILE_AFTER_S)
+        self.reconcile_interval_s = _config_float(
+            "reconcile_interval_s", "A2A_RECONCILE_INTERVAL", DEFAULT_RECONCILE_INTERVAL_S)
+        self.reconcile_batch = _config_int(
+            "reconcile_batch", "A2A_RECONCILE_BATCH", DEFAULT_RECONCILE_BATCH, 1)
+        # Per-peer backoff for reconciliation. In-memory on purpose: a restart re-probes once,
+        # and the row-level reconciled_at keeps the steady-state rate bounded in SQLite.
+        self._peer_backoff: dict[str, float] = {}
+        self._peer_failures: dict[str, int] = {}
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._lifecycle = threading.Lock()
@@ -1678,33 +1694,122 @@ class WatchManager:
         return self.ownership.record_messages(task_id, entries, session_id=session_id,
                                               state=state, reply=reply)
 
-    def _maintain_unowned(self, now: float) -> None:
-        """Cancel unowned tasks after the configured delay, abandon them after the TTL."""
+    def _note_peer_failure(self, peer: str, now: float) -> None:
+        """Back off a peer after a failed reconciliation attempt (60s doubling, capped at 1h)."""
+        failures = self._peer_failures.get(peer, 0) + 1
+        self._peer_failures[peer] = failures
+        delay = min(3600.0, 60.0 * (2 ** min(failures - 1, 6)))
+        self._peer_backoff[peer] = now + delay
+
+    def _reconcile_outbound(self, now: float) -> None:
+        """Ask the peer about unowned outbound rows nobody is polling (issue #12).
+
+        A row is settled by the peer's answer, never by a local clock: terminal state and reply
+        are folded into the local record, ``TaskNotFound`` means the remote task no longer exists
+        and is recorded as canceled rather than failed, and an unreachable peer leaves the row
+        untouched for a later attempt. One GetTask per row per interval, a bounded batch per
+        pass, and per-peer backoff keep this from turning into a polling storm.
+        """
         from . import tools
+        try:
+            due = self.ownership.reconcile_due(
+                now, after_s=self.reconcile_after_s,
+                interval_s=self.reconcile_interval_s, limit=self.reconcile_batch)
+        except Exception:
+            logger.debug("A2A: outbound reconciliation selection failed", exc_info=True)
+            return
+        if not due:
+            return
+        task_store = protocol.TaskStore(self.store.db_path)
+        for rec in due:
+            task_id = str(rec["task_id"])
+            peer_name = str(rec["peer"] or "")
+            try:
+                if self._peer_backoff.get(peer_name, 0.0) > now:
+                    continue
+                peer = tools._resolve_peer(peer_name)
+                if not peer or not peer.get("url"):
+                    continue
+                try:
+                    resp = tools._rpc_request(peer, "GetTask", {"id": task_id}, timeout=15)
+                except Exception as exc:
+                    self._note_peer_failure(peer_name, now)
+                    logger.debug("A2A: reconcile GetTask for %s on %s failed: %s",
+                                 task_id, peer_name, exc)
+                    continue
+                error = resp.get("error") if isinstance(resp, dict) else None
+                if error:
+                    if error.get("code") == protocol.ERR_TASK_NOT_FOUND:
+                        # The peer no longer knows this task. That is not an agent failure, so it
+                        # is not recorded as FAILED; the work is simply gone.
+                        task_store.complete(
+                            task_id, protocol.STATE_CANCELED,
+                            "[peer no longer has this task — abandoned after reconciliation]")
+                        self.ownership.mark_reconciled(
+                            task_id, now, rec.get("released_at"), remote_state="NOT_FOUND")
+                        logger.info("A2A: task %s is gone from peer %s; marked canceled",
+                                    task_id, peer_name)
+                    else:
+                        self._note_peer_failure(peer_name, now)
+                        logger.debug("A2A: reconcile GetTask for %s on %s returned %s",
+                                     task_id, peer_name, error.get("code"))
+                    continue
+                payload = resp.get("result")
+                if not isinstance(payload, dict):
+                    self._note_peer_failure(peer_name, now)
+                    continue
+                state, _reply = tools._fold_task_payload(task_store, task_id, payload)
+                self.ownership.mark_reconciled(task_id, now, rec.get("released_at"))
+                self._peer_failures.pop(peer_name, None)
+                self._peer_backoff.pop(peer_name, None)
+                logger.debug("A2A: reconciled task %s on %s: %s", task_id, peer_name,
+                             state or "unknown")
+            except Exception:
+                logger.debug("A2A: reconcile of task %s failed", task_id, exc_info=True)
+                self._note_peer_failure(peer_name, now)
+
+    def _maintain_unowned(self, now: float) -> None:
+        """Reconcile unowned outbound work, then cancel and abandon it on its timers."""
+        from . import tools
+        # Reconcile before the cancel timer: a peer that finished with a result gets that result
+        # folded into the row, instead of the row being canceled at the one-day mark.
+        self._reconcile_outbound(now)
         try:
             cancel, abandon = self.ownership.unowned_due(
                 now, cancel_after_s=self.unowned_cancel_after_s, ttl_s=self.unowned_ttl_s)
         except Exception:
             logger.debug("A2A: unowned task sweep failed", exc_info=True)
             return
+        task_store = protocol.TaskStore(self.store.db_path) if cancel else None
         for rec in cancel:
             task_id = str(rec["task_id"])
+            assert task_store is not None  # cancel is non-empty => the store exists
             # Fence first: the selection is a snapshot, and an adoption may have happened since.
             # Claiming the action atomically is what proves the task is still unowned.
             if not self.ownership.mark_cancel_requested(task_id, now, rec.get("released_at")):
                 continue
             peer_name = str(rec["peer"] or "")
             peer = tools._resolve_peer(peer_name)
+            detail = "The watcher asked the peer to cancel it. Its remote state may still be working."
             if peer and peer.get("url"):
                 try:
-                    tools._rpc_request(peer, "CancelTask", {"id": task_id}, timeout=15)
-                    logger.info("A2A: cancelled unowned task %s on %s", task_id, peer_name)
+                    outcome = tools._cancel_task(peer, peer_name, task_id,
+                                                 store=task_store, timeout=15)
+                    if outcome.get("already_terminal"):
+                        detail = (f"The peer reported the task already "
+                                  f"{outcome.get('state') or 'terminal'}; the local record was "
+                                  f"reconciled with that answer.")
+                    elif outcome.get("ok"):
+                        detail = "The peer accepted the cancellation request."
+                    else:
+                        logger.debug("A2A: CancelTask for unowned %s failed: %s",
+                                     task_id, outcome.get("error"))
                 except Exception as exc:
                     logger.debug("A2A: CancelTask for unowned %s failed: %s", task_id, exc)
             self.ownership.add_message(
                 task_id, f"auto-cancel:{int(now)}", "error",
                 "This task was unowned for longer than the auto-cancellation timeout, so the "
-                "watcher asked the peer to cancel it. Its remote state may still be working.")
+                f"watcher asked the peer to cancel it. {detail}")
         for rec in abandon:
             task_id = str(rec["task_id"])
             if self.ownership.abandon(task_id, now, rec.get("released_at")):
@@ -1810,6 +1915,23 @@ def _config_float(key: str, env_name: str, default: float) -> float:
     except (TypeError, ValueError):
         value = default
     return max(60.0, value)
+
+
+def _config_int(key: str, env_name: str, default: int, minimum: int) -> int:
+    """An integer tuning value from ``a2a.<key>`` / the env var, clamped to ``minimum``."""
+    try:
+        from . import tools
+        section = (tools._load_config() or {}).get("a2a") or {}
+        raw = section.get(key)
+    except Exception:
+        raw = None
+    if raw in (None, ""):
+        raw = os.getenv(env_name, "").strip()
+    try:
+        value = int(raw) if raw not in (None, "") else int(default)
+    except (TypeError, ValueError):
+        value = int(default)
+    return max(int(minimum), value)
 
 
 def _terminal_content(peer: str, task_id: str, short: str, text: str) -> str:

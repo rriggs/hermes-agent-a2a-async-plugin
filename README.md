@@ -82,7 +82,17 @@ delivered when the adopting session awaits the task, once per message, oldest fi
 
 An unowned task is cancelled remotely after `a2a.unowned_cancel_after_s` (default 86400s, one day)
 and abandoned after `a2a.unowned_task_ttl_s` (default 604800s, seven days). Both can also be set
-with `A2A_UNOWNED_CANCEL_AFTER` and `A2A_UNOWNED_TASK_TTL`.
+with `A2A_UNOWNED_CANCEL_AFTER` and `A2A_UNOWNED_TASK_TTL`. The clock starts at the last release,
+or at creation for a task that was submitted and never awaited.
+
+Before the cancel timer fires, an unowned outbound task is reconciled against its peer. `GetTask`
+is issued once the task is older than `a2a.reconcile_after_s` (default 3600s), at most once per
+`a2a.reconcile_interval_s` (default 300s) per row, in batches of `a2a.reconcile_batch` (default
+10). The peer's terminal state and reply are folded into the local record; `TaskNotFound` marks the
+task canceled with a "peer no longer has this task" reply rather than FAILED; an unreachable peer
+leaves the row untouched and is backed off. These can also be set with `A2A_RECONCILE_AFTER`,
+`A2A_RECONCILE_INTERVAL` and `A2A_RECONCILE_BATCH`. `a2a_list` shows each task's age, so an
+abandoned row is visible without opening the database.
 
 ## Operator commands
 

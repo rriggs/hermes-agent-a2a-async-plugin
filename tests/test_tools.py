@@ -293,6 +293,79 @@ def test_cancel_without_a_task_body_leaves_the_snapshot_alone(monkeypatch):
         server.server_close()
 
 
+def test_cancel_refused_as_already_terminal_reconciles_state_and_reply(monkeypatch, tmp_path):
+    """Issue #16: -32002 means the peer holds a terminal task. Fetch it and fold the answer,
+    instead of returning an error string and leaving the local row stuck at SUBMITTED."""
+    monkeypatch.setenv("A2A_TASKS_DB", str(tmp_path / "tasks.db"))
+    _seed_outbound("task-c5", tools.protocol.STATE_WORKING)
+    calls = []
+
+    def rpc(_peer, method, params, timeout=None):
+        calls.append((method, params))
+        if method == "CancelTask":
+            return {"error": {"code": tools.protocol.ERR_TASK_NOT_CANCELABLE,
+                              "message": "task task-c5 already TASK_STATE_COMPLETED"}}
+        if method == "GetTask":
+            return {"result": {"id": "task-c5", "contextId": "ctx-task-c5",
+                               "status": {"state": tools.protocol.STATE_COMPLETED},
+                               "artifacts": [{"parts": [{"text": "the answer"}]}]}}
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(tools, "_load_config",
+                        lambda: {"a2a_agents": {"peer": {"url": "http://peer.invalid"}}})
+    monkeypatch.setattr(tools, "_rpc_request", rpc)
+
+    out = tools.a2a_cancel({"agent": "peer", "task_id": "task-c5"})
+
+    assert "already completed" in out.lower(), out
+    assert "the answer" in out, "the peer's result must not be discarded"
+    rec = tools.protocol.TaskStore().get("task-c5")
+    assert rec is not None
+    assert rec["state"] == tools.protocol.STATE_COMPLETED
+    assert rec["reply"] == "the answer"
+    assert [method for method, _params in calls] == ["CancelTask", "GetTask"]
+
+
+def test_cancel_refusal_reports_the_original_error_when_gettask_fails(monkeypatch, tmp_path):
+    """The refusal is still the answer; a failed follow-up must not invent a state."""
+    monkeypatch.setenv("A2A_TASKS_DB", str(tmp_path / "tasks.db"))
+    _seed_outbound("task-c6", tools.protocol.STATE_WORKING)
+
+    def rpc(_peer, method, params, timeout=None):
+        if method == "CancelTask":
+            return {"error": {"code": tools.protocol.ERR_TASK_NOT_CANCELABLE,
+                              "message": "task task-c6 already TASK_STATE_COMPLETED"}}
+        raise RuntimeError("peer died before GetTask")
+
+    monkeypatch.setattr(tools, "_load_config",
+                        lambda: {"a2a_agents": {"peer": {"url": "http://peer.invalid"}}})
+    monkeypatch.setattr(tools, "_rpc_request", rpc)
+
+    out = tools.a2a_cancel({"agent": "peer", "task_id": "task-c6"})
+
+    assert "-32002" in out, out
+    assert "GetTask failed" in out, out
+    row = tools.protocol.TaskStore().get("task-c6")
+    assert row is not None
+    assert row["state"] == tools.protocol.STATE_WORKING
+
+
+def test_a2a_list_shows_task_age(monkeypatch, tmp_path):
+    """Issue #12: abandoned rows must be distinguishable without opening SQLite."""
+    monkeypatch.setenv("A2A_TASKS_DB", str(tmp_path / "tasks.db"))
+    _seed_outbound("task-old", tools.protocol.STATE_WORKING)
+    import sqlite3
+    con = sqlite3.connect(str(tmp_path / "tasks.db"))
+    con.execute("UPDATE a2a_tasks SET created_at=created_at-90000 WHERE task_id='task-old'")
+    con.commit()
+    con.close()
+
+    listed = tools.a2a_list({"kind": "tasks"})
+
+    assert "task-old" in listed
+    assert "age=1d01h" in listed, listed
+
+
 def test_cancel_does_not_rewrite_a_locally_terminal_row(monkeypatch):
     """complete() is idempotent: a stale peer reply cannot overwrite a terminal local row."""
     server, _url = peer_server(monkeypatch)
@@ -306,6 +379,7 @@ def test_cancel_does_not_rewrite_a_locally_terminal_row(monkeypatch):
         tools.a2a_cancel({"agent": "peer", "task_id": "task-c4"})
 
         rec = tools.protocol.TaskStore().get("task-c4")
+        assert rec is not None
         assert rec["state"] == tools.protocol.STATE_COMPLETED
         assert rec["reply"] == "final answer"
     finally:

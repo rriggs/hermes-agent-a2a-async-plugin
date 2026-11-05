@@ -47,6 +47,21 @@ platforms:
 
 The code and tests cover scoped precedence, unscoped environment fallback, config fallback, and hostname fallback. The README documents the configuration surface.
 
+## Inbound attachments (Issue #13)
+
+Inbound A2A `FilePart` payloads are materialized beneath the active profile's `a2a_files` inbox and
+rendered to the agent as task-scoped paths. Files are mode `0600`, task directories are mode `0700`,
+raw payloads default to a 20 MiB per-file limit, and terminal inboxes default to a seven-day TTL.
+URL parts are fetched only from globally routable HTTP(S) addresses with DNS-pinned connections,
+redirect validation, no environment proxy, and the same byte limit. The Agent Card advertises
+`text/plain` plus the active inbound media allowlist. JSON-RPC requests and peer responses have a
+32 MiB body cap; inbound body ingestion is limited to two active request slots per adapter.
+
+Configuration: `A2A_FILES_DIR`, `A2A_MAX_INBOUND_FILE_MB`,
+`A2A_INBOUND_FILE_MEDIA_TYPES`, and `A2A_INBOUND_FILE_TTL_DAYS`. In the current worktree this
+change is still under review and is not part of `main`; outbound `DataPart`/`FilePart` emission is
+tracked separately in Issue #14.
+
 ## Architecture
 
 The root `__init__.py` is the directory-plugin entry point. It registers:

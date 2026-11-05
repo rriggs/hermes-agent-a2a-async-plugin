@@ -248,6 +248,30 @@ platforms:
 
 The plugin falls back to `A2A_AGENT_NAME` for older deployments, then to `hermes-<hostname>`.
 
+## Inbound attachments
+
+Inbound A2A `FilePart` bytes are validated and materialized as mode-`0600` files under
+`<profile-home>/a2a_files/<task-id>/` (task directories are mode `0700`). `A2A_FILES_DIR` overrides
+the inbox location. The Agent Card advertises `text/plain` and the configured inbound file media
+types; the default allowlist covers common image, audio, video, text, PDF, Office/OpenDocument, and
+ZIP formats. Unsupported media types remain visible to the agent as an explicit rejection note.
+
+- `A2A_MAX_INBOUND_FILE_MB`: per-file size cap, default `20` MiB. Oversized raw parts are rejected
+  with an agent-visible note. URL parts are fetched only over HTTP(S) to globally routable addresses;
+  DNS results are pinned for the connection, redirects are checked again, and downloads are bounded
+  by the same size cap. The original URL stays visible. No peer authorization headers or environment
+  proxy credentials are forwarded.
+- `A2A_INBOUND_FILE_MEDIA_TYPES`: optional comma-separated media-type allowlist. Defaults are the
+  built-in supported types above; exact media types and patterns such as `image/*` are accepted.
+- `A2A_INBOUND_FILE_TTL_DAYS`: terminal/expired task inbox retention, default `7` days. Active task
+  inboxes are retained; set `0` to disable cleanup. Cleanup runs at adapter startup and on the
+  watchdog interval.
+
+Inbound JSON-RPC request bodies and peer JSON responses are capped at `32` MiB. The inbound adapter
+actively ingests at most two request bodies concurrently. This accommodates the default 20 MiB
+raw-file cap plus base64 and JSON overhead while limiting concurrent inbound request-body buffers to
+`64` MiB per adapter.
+
 ## Architecture
 
 ```text
@@ -267,13 +291,14 @@ The plugin uses the stdlib HTTP transport and the A2A JSON-RPC protocol. It has 
 |---|---|
 | `plugin.yaml` | Hermes plugin manifest |
 | `__init__.py` | Hermes plugin entry point; delegates to the implementation package |
-| `a2a_async_plugin/adapter.py` | Inbound A2A HTTP server, Agent Card, JSON-RPC/SSE dispatch, push notifications, and metrics |
-| `a2a_async_plugin/tools.py` | Synchronous and asynchronous A2A client tool schemas, handlers, and registration |
-| `a2a_async_plugin/protocol.py` | A2A protocol helpers, Agent Card construction, and durable task store |
+| `a2a_async_plugin/adapter.py` | Inbound A2A HTTP server, Agent Card, attachment ingestion, JSON-RPC/SSE dispatch, push notifications, and metrics |
+| `a2a_async_plugin/tools.py` | Synchronous and asynchronous A2A client tools, task-result rendering, and registration |
+| `a2a_async_plugin/protocol.py` | A2A protocol helpers, inbound attachment materialization, Agent Card construction, and durable task store |
 | `a2a_async_plugin/ownership.py` | Session-scoped task ownership and queued-message backlog |
 | `a2a_async_plugin/task_admin.py` | Operator CLI and slash commands for task ownership |
 | `a2a_async_plugin/watches.py` | Background watch manager: polling, leases, completion publishing |
 | `a2a_async_plugin/security.py` | Inbound authentication, bind safety, outbound redaction, and audit helpers |
+| `tests/test_inbound_files.py` | Regression tests for inbound file parts, safe URL downloads, and request limits |
 
 ## Development
 

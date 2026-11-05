@@ -70,7 +70,8 @@ logger = logging.getLogger(__name__)
 _DEFAULT_PORT = 9900
 _ORPHAN_TIMEOUT = 300  # seconds before a pending task is considered orphaned
 _WATCHDOG_INTERVAL = 60  # seconds between orphaned task watchdog runs
-_MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaustion
+_MAX_BODY = protocol.MAX_JSON_BODY_BYTES  # Fits a 20MiB raw attachment's base64 plus JSON overhead.
+_MAX_CONCURRENT_BODY_READS = 2  # Caps concurrent request-body buffers at 64MiB per adapter.
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
 
 
@@ -373,13 +374,33 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             self._json(401, protocol.jsonrpc_error(None, protocol.ERR_UNAUTHORIZED, "unauthorized"))
             return
 
+        if not adapter._body_read_slots.acquire(timeout=5):
+            self._json(429, protocol.jsonrpc_error(None, protocol.ERR_RATE_LIMITED, "request body capacity is full"))
+            return
+        body_slot_state = getattr(adapter, "_body_read_slot_state", None)
+        if body_slot_state is not None:
+            body_slot_state.held = True
+        try:
+            self._handle_post_request(adapter, identity)
+        finally:
+            release = getattr(adapter, "_release_body_read_slot", None)
+            if callable(release):
+                release()
+            else:
+                adapter._body_read_slots.release()
+
+    def _handle_post_request(self, adapter: "A2AAdapter", identity: str) -> None:
         try:
             length = int(self.headers.get("Content-Length", 0))
+            if length < 0:
+                self._json(400, protocol.jsonrpc_error(None, protocol.ERR_PARSE, "invalid content length"))
+                return
             if length > _MAX_BODY:
                 self._json(413, protocol.jsonrpc_error(None, protocol.ERR_PARSE, "payload too large"))
                 return
             raw = self.rfile.read(length) if length else b"{}"
             req = json.loads(raw.decode("utf-8"))
+            del raw
         except Exception:
             self._json(400, protocol.jsonrpc_error(None, protocol.ERR_PARSE, "parse error"))
             return
@@ -423,6 +444,11 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             self._json(200, protocol.jsonrpc_error(
                 req_id, protocol.ERR_METHOD_NOT_FOUND, f"method not found: {method}"))
             return
+
+        if operation not in {"send", "stream"}:
+            release = getattr(adapter, "_release_body_read_slot", None)
+            if callable(release):
+                release()
 
         if operation == "send":
             self._json(200, adapter._rpc_message_send(req_id, params, identity, agent=agent, v1_response=is_v1, handler=self))
@@ -473,6 +499,10 @@ class A2AAdapter(BasePlatformAdapter):
         # fix's PR description: open PR #98937 is actively rewriting this
         # field's None-vs-empty-list semantics.)
         self._security_context = security.A2ASecurityContext.capture()
+        self._inbound_file_policy = protocol.capture_inbound_file_policy()
+        self._files_dir = self._inbound_file_policy.files_dir
+        self._body_read_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_BODY_READS)
+        self._body_read_slot_state = threading.local()
         # Issue #3: capture the conversation dir ONCE at init, inside the
         # profile's runtime scope (the same context that scoped A2A_PORT
         # and the task DB root). A get_hermes_home() call from the plugin's
@@ -577,6 +607,7 @@ class A2AAdapter(BasePlatformAdapter):
             name="a2a-http",
             daemon=True,
         )
+        self._cleanup_inbound_files()
         self._server_thread.start()
 
         # Reset watchdog state for reconnection (disconnect sets the event)
@@ -642,8 +673,21 @@ class A2AAdapter(BasePlatformAdapter):
                 for tid in self.tasks.fail_orphans(_ORPHAN_TIMEOUT, protected=protected):
                     logger.warning("A2A: orphaned task %s marked failed (timeout %ds)", tid, _ORPHAN_TIMEOUT)
                     protocol.metrics.tasks_failed += 1
+                self._cleanup_inbound_files()
             except Exception:
                 logger.debug("A2A: watchdog error", exc_info=True)
+
+    def _cleanup_inbound_files(self) -> None:
+        removed = protocol.cleanup_inbound_files(
+            self._files_dir, self.tasks, ttl_seconds=self._inbound_file_policy.ttl_seconds)
+        if removed:
+            logger.info("A2A: removed %d expired inbound file inbox(es)", removed)
+
+    def _release_body_read_slot(self) -> None:
+        if not getattr(self._body_read_slot_state, "held", False):
+            return
+        self._body_read_slot_state.held = False
+        self._body_read_slots.release()
 
     # ── Agent routing + Agent Cards ───────────────────────────────────────
 
@@ -787,6 +831,7 @@ class A2AAdapter(BasePlatformAdapter):
             push_notifications=True,
             auth_required=not self._security_context.localhost_only(),
             tenant=str(agent.get("tenant") or ""),
+            input_modes=protocol.inbound_file_input_modes(self._inbound_file_policy),
         )
 
     def _advertised_skills(self, agent: Optional[dict] = None) -> list[dict]:
@@ -981,7 +1026,6 @@ class A2AAdapter(BasePlatformAdapter):
         the future the caller must wait on. Runs on an HTTP worker thread.
         """
         agent = agent or self._agents[""]
-        text = protocol.extract_text(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
         task_id = protocol.new_task_id()
 
@@ -996,7 +1040,7 @@ class A2AAdapter(BasePlatformAdapter):
                 "A2A: rejecting peer %r on context %s — context is bound to peer %r",
                 peer, context_id, bound_peer,
             )
-            security.audit("inbound-rejected-peer-mismatch", peer, task_id, text)
+            security.audit("inbound-rejected-peer-mismatch", peer, task_id, "")
             rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
             self.tasks.complete(task_id, protocol.STATE_REJECTED, "")
             return protocol.build_task(
@@ -1022,6 +1066,12 @@ class A2AAdapter(BasePlatformAdapter):
                 created_at=rec["created_iso"],
             ), None
 
+        text = protocol.extract_text(params, task_id=task_id,
+                                     file_policy=self._inbound_file_policy)
+        inbound_message = params.get("message", params)
+        if isinstance(inbound_message, dict):
+            inbound_message.pop("parts", None)
+        self._release_body_read_slot()
         if not text:
             rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
             self.tasks.complete(task_id, protocol.STATE_REJECTED, "")

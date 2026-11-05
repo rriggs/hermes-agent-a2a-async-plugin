@@ -112,10 +112,24 @@ def _auth_header(auth: dict) -> dict:
 # HTTP
 # --------------------------------------------------------------------------
 
+def _read_json_response(response: Any) -> dict:
+    limit = protocol.MAX_JSON_BODY_BYTES
+    try:
+        declared_size = int(response.headers.get("Content-Length", ""))
+    except (TypeError, ValueError):
+        declared_size = 0
+    if declared_size > limit:
+        raise ValueError("A2A peer response body exceeds limit")
+    raw = response.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError("A2A peer response body exceeds limit")
+    return json.loads(raw.decode("utf-8"))
+
+
 def _http_get_json(url: str, headers: dict, timeout: int) -> dict:
     req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
-        return json.loads(resp.read().decode("utf-8"))
+        return _read_json_response(resp)
 
 
 def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
@@ -123,7 +137,7 @@ def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
     hdrs = {"Content-Type": "application/json", "A2A-Version": protocol.PROTOCOL_VERSION, **headers}
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
-        return json.loads(resp.read().decode("utf-8"))
+        return _read_json_response(resp)
 
 
 def _card_url(base_url: str) -> str:
@@ -253,17 +267,18 @@ def _reply_text_from_result(result: Any) -> str:
     result = protocol.unwrap_send_message_response(result)
     if not isinstance(result, dict):
         return str(result)
+    task_id = str(result.get("id") or result.get("taskId") or "")
     # Artifacts first (final output), then status message (interim/clarify).
     for artifact in result.get("artifacts", []) or []:
-        txt = protocol.extract_text(artifact)
+        txt = protocol.extract_text(artifact, task_id=task_id)
         if txt:
             return txt
     status = result.get("status", {}) or {}
     msg = status.get("message")
     if msg:
-        return protocol.extract_text(msg)
+        return protocol.extract_text(msg, task_id=task_id)
     # Bare message result (message/send may return a Message instead of a Task)
-    return protocol.extract_text(result)
+    return protocol.extract_text(result, task_id=task_id)
 
 
 # --------------------------------------------------------------------------
@@ -518,11 +533,11 @@ def a2a_get_task(args: dict, **_: Any) -> str:
     lines = [f"[{agent} · task {payload.get('id', task_id)} · {state}]"]
     msg = status.get("message")
     if msg:
-        txt = protocol.extract_text(msg)
+        txt = protocol.extract_text(msg, task_id=task_id)
         if txt:
             lines.append(txt[:2000])
     for artifact in payload.get("artifacts", []) or []:
-        txt = protocol.extract_text(artifact)
+        txt = protocol.extract_text(artifact, task_id=task_id)
         if txt:
             lines.append(f"[artifact] {txt[:4000]}")
     return "\n".join(lines)
@@ -922,25 +937,26 @@ def _observation_messages(payload: dict, state: str, *,
                          input_artifact_kind: bool = False) -> list[tuple[str, str, str, bool]]:
     """Extract stable backlog entries from one peer task observation, without writing them."""
     entries: list[tuple[str, str, str, bool]] = []
+    task_id = str(payload.get("id") or payload.get("taskId") or "")
     # History first (chronology), peer-originated only: ROLE_USER is OUR request.
     for index, message in enumerate(payload.get("history") or []):
         if not _peer_role(message.get("role")):
             continue
-        text = _text_of_message(message)
+        text = _text_of_message(message, task_id=task_id)
         if not text:
             continue
         message_id = str(message.get("messageId") or message.get("message_id")
                          or f"history:{index}:{_digest(text)}")
         entries.append((message_id, "progress", text, False))
     status_msg = (payload.get("status") or {}).get("message") or {}
-    status_text = _text_of_message(status_msg)
+    status_text = _text_of_message(status_msg, task_id=task_id)
     if status_text:
         message_id = str(status_msg.get("messageId") or status_msg.get("message_id")
                          or f"status:{_digest(status_text)}")
         kind = "input-required" if state == protocol.STATE_INPUT_REQUIRED else "progress"
         entries.append((message_id, kind, status_text, False))
     for index, artifact in enumerate(payload.get("artifacts") or []):
-        text = _text_of_message(artifact)
+        text = _text_of_message(artifact, task_id=task_id)
         if not text:
             continue
         kind = ("input-required" if input_artifact_kind
@@ -958,16 +974,12 @@ def _peer_role(role: Any) -> bool:
     return str(role or "").lower() in ("agent", "assistant", "role_agent")
 
 
-def _text_of_message(message: Any) -> str:
+def _text_of_message(message: Any, *, task_id: str = "") -> str:
     if not isinstance(message, dict):
         return ""
-    parts = message.get("parts")
-    if isinstance(parts, list):
-        texts = [str(part.get("text") or "") for part in parts
-                 if isinstance(part, dict) and part.get("kind", "text") in ("text", "")]
-        joined = "\n".join(t for t in texts if t).strip()
-        if joined:
-            return joined
+    rendered = protocol.extract_text(message, task_id=task_id)
+    if rendered:
+        return rendered
     return str(message.get("text") or "").strip()
 
 

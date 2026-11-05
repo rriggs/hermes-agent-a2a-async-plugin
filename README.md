@@ -1,8 +1,8 @@
 # hermes-agent-a2a-async-plugin
 
-Standalone asynchronous A2A client tools for Hermes Agent.
+The complete A2A platform plugin for Hermes Agent: it serves inbound A2A requests and provides synchronous and asynchronous outbound client tools with durable task state.
 
-This plugin extends the built-in A2A integration without replacing it. It contributes the async tools to Hermes' existing `a2a` toolset, so operators do not need to manage a second toolset:
+The plugin registers the inbound `a2a` platform and contributes its client tools to Hermes' shared `a2a` toolset. It is not client-only and does not register a second toolset. Its asynchronous client tools include:
 
 - `a2a_submit` -- submit a task without waiting
 - `a2a_get_task` -- retrieve a task snapshot
@@ -20,7 +20,7 @@ hermes plugins install /path/to/hermes-agent-a2a-async-plugin
 hermes plugins enable a2a-async
 ```
 
-Or install from GitHub using the Hermes plugin manager. Keep the built-in A2A plugin enabled. This plugin adds tools to the shared `a2a` toolset; it does not register a second toolset or replace inbound A2A serving.
+Or install from GitHub using the Hermes plugin manager. This plugin must be the sole inbound A2A platform owner: disable the bundled inbound A2A adapter when enabling this plugin, and do not run both. The plugin contributes client tools to the shared `a2a` toolset; it does not register a second toolset.
 
 After installation, enable `a2a` for the relevant platform/profile if it is not already enabled. The plugin contributes no tools when disabled.
 
@@ -220,7 +220,7 @@ Background publications are framed with the same untrusted boundary as inbound A
 markers are filtered before it reaches the session as a user turn. Blocking `a2a_await` and
 `a2a_get_task` do not use the injection rail.
 
-Peers are configured in `config.yaml` under `a2a_agents`. Authentication and endpoint configuration remain owned by the built-in A2A integration.
+Outbound peers are configured in the profile's `config.yaml` under `a2a_agents`. Inbound endpoint binding, the Agent Card, and peer authentication are owned by this plugin's `a2a_async_plugin/adapter.py` and `security.py`, not by the bundled integration. The listener is localhost-only by default. To expose it remotely, configure `A2A_BEARER_TOKEN` or `A2A_PEER_TOKENS` and set `A2A_HOST`; never put tokens in `config.yaml`.
 
 The inbound Agent Card identity can be set per profile under the A2A platform configuration. In a multiplexed gateway, put the name in each profile's config rather than relying on the shared process environment:
 
@@ -237,13 +237,12 @@ The plugin falls back to `A2A_AGENT_NAME` for older deployments, then to `hermes
 ## Architecture
 
 ```text
-Hermes built-in A2A plugin
-  synchronous client tools + inbound A2A platform
-                 \
-                  shared `a2a` toolset
-                 /
 hermes-agent-a2a-async-plugin
-  async client tools + durable task state
+  inbound A2A platform (sole owner)
+  synchronous + asynchronous client tools
+  durable task state
+                 |
+         shared `a2a` toolset
 ```
 
 The plugin uses the stdlib HTTP transport and the A2A JSON-RPC protocol. It has no third-party runtime dependency.
@@ -254,10 +253,13 @@ The plugin uses the stdlib HTTP transport and the A2A JSON-RPC protocol. It has 
 |---|---|
 | `plugin.yaml` | Hermes plugin manifest |
 | `__init__.py` | Hermes plugin entry point; delegates to the implementation package |
-| `a2a_async_plugin/tools.py` | Async tool schemas, handlers, and registration |
-| `a2a_async_plugin/protocol.py` | A2A protocol helpers and durable task/watch store |
+| `a2a_async_plugin/adapter.py` | Inbound A2A HTTP server, Agent Card, JSON-RPC/SSE dispatch, push notifications, and metrics |
+| `a2a_async_plugin/tools.py` | Synchronous and asynchronous A2A client tool schemas, handlers, and registration |
+| `a2a_async_plugin/protocol.py` | A2A protocol helpers, Agent Card construction, and durable task store |
+| `a2a_async_plugin/ownership.py` | Session-scoped task ownership and queued-message backlog |
+| `a2a_async_plugin/task_admin.py` | Operator CLI and slash commands for task ownership |
 | `a2a_async_plugin/watches.py` | Background watch manager: polling, leases, completion publishing |
-| `a2a_async_plugin/security.py` | Outbound redaction and audit helpers |
+| `a2a_async_plugin/security.py` | Inbound authentication, bind safety, outbound redaction, and audit helpers |
 
 ## Development
 

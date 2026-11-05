@@ -300,6 +300,77 @@ def _peer_rpc_error(resp: dict, agent_label: str) -> str:
     return f"Error: peer '{agent_label}' returned {code}: {err.get('message', err)}"
 
 
+def _fold_task_payload(store: "protocol.TaskStore", task_id: str,
+                       payload: dict) -> tuple[str, str]:
+    """Fold a peer task object into the local row; return ``(short_state, reply)``.
+
+    ``complete()`` is idempotent past a terminal state, so a stale reply can never overwrite a
+    result the caller already collected.
+    """
+    raw_state = str((payload.get("status") or {}).get("state") or "")
+    reply = _reply_text_from_result(payload)
+    if raw_state in protocol.TERMINAL_STATES:
+        store.complete(task_id, raw_state, reply)
+    elif raw_state:
+        store.set_state(task_id, raw_state)
+    return _short_state(raw_state), reply
+
+
+def _cancel_task(peer: dict, agent_label: str, task_id: str, *,
+                 store: Optional["protocol.TaskStore"] = None,
+                 timeout: int = 30, fold: bool = True) -> dict:
+    """Send CancelTask and reconcile the local row. Returns a result dict.
+
+    ``-32002 TaskNotCancelable`` means the peer considers the task terminal. That refusal is an
+    authoritative observation, not a dead end: fetch the task and fold its state and reply.
+    Reporting only "already completed" left the row stuck at SUBMITTED/WORKING with no result
+    (issue #16). A maintenance caller can set ``fold=False`` to apply the response under its own
+    ownership-generation fence instead of writing through ``TaskStore`` here.
+    """
+    if fold and store is None:
+        store = _task_store()
+
+    def result_for(payload: Any, *, ok: bool, already_terminal: bool = False) -> dict:
+        if isinstance(payload, dict):
+            if fold:
+                assert store is not None
+                state, reply = _fold_task_payload(store, task_id, payload)
+            else:
+                raw_state = str((payload.get("status") or {}).get("state") or "")
+                state, reply = _short_state(raw_state), _reply_text_from_result(payload)
+        else:
+            state, reply = "", ""
+        result = {"ok": ok, "state": state, "reply": reply}
+        if already_terminal:
+            result["already_terminal"] = True
+        if not fold:
+            result["payload"] = payload if isinstance(payload, dict) else None
+        return result
+
+    resp = _rpc_request(peer, "CancelTask", {"id": task_id}, timeout=timeout)
+    if "error" not in resp:
+        payload = resp.get("result", {})
+        return result_for(payload, ok=True)
+
+    err = resp.get("error") or {}
+    if err.get("code") == protocol.ERR_TASK_NOT_CANCELABLE:
+        try:
+            get = _rpc_request(peer, "GetTask", {"id": task_id}, timeout=timeout)
+        except Exception as exc:
+            result = {"ok": False,
+                      "error": f"{_peer_rpc_error(resp, agent_label)} (GetTask failed: {exc})"}
+            if not fold:
+                result["payload"] = None
+            return result
+        payload = get.get("result") if isinstance(get, dict) else None
+        if isinstance(payload, dict) and "error" not in get:
+            return result_for(payload, ok=False, already_terminal=True)
+    result = {"ok": False, "error": _peer_rpc_error(resp, agent_label)}
+    if not fold:
+        result["payload"] = None
+    return result
+
+
 def a2a_steer(args: dict, **_: Any) -> str:
     """Queue a non-blocking steering message on an existing A2A context."""
     agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
@@ -338,6 +409,7 @@ def a2a_steer(args: dict, **_: Any) -> str:
                          remote_state=state or protocol.STATE_SUBMITTED)
     protocol.persist_message(reply_ctx, "user", safe_message, task_id)  # local turn, no peer
     protocol.metrics.outbound_total += 1
+    _start_maintenance()
     return (f"[{agent} · steering task {task_id} · context {reply_ctx} · "
             f"{_short_state(state) or 'submitted'}]\nSteering queued. Poll with "
             f"a2a_get_task(agent='{agent}', task_id='{task_id}') to observe delivery.")
@@ -401,6 +473,7 @@ def a2a_submit(args: dict, **_: Any) -> str:
     )
     protocol.persist_message(reply_ctx, "user", safe_message, task_id)  # local turn, no peer
     protocol.metrics.outbound_total += 1
+    _start_maintenance()
     return (
         f"[{agent} · task {task_id} · context {reply_ctx} · "
         f"{_short_state(state) or 'submitted'}]\n"
@@ -440,12 +513,8 @@ def a2a_get_task(args: dict, **_: Any) -> str:
     if not isinstance(payload, dict):
         return f"Error: unexpected GetTask response from '{agent}'."
     status = payload.get("status") or {}
-    raw_state = str(status.get("state", ""))
-    state = _short_state(raw_state) or "unknown"
-    if raw_state in protocol.TERMINAL_STATES:
-        _task_store().complete(task_id, raw_state, _reply_text_from_result(payload))
-    else:
-        _task_store().set_state(task_id, raw_state or protocol.STATE_WORKING)
+    state, _reply = _fold_task_payload(_task_store(), task_id, payload)
+    state = state or "unknown"
     lines = [f"[{agent} · task {payload.get('id', task_id)} · {state}]"]
     msg = status.get("message")
     if msg:
@@ -501,6 +570,23 @@ def _watch_manager(ctx: Any = None):
         # Same profile: refresh the context (a re-registration may carry a newer ctx).
         manager.ctx = ctx
     return manager
+
+
+def _start_maintenance() -> None:
+    """Start the profile's maintenance poller after creating abandoned-prone outbound work.
+
+    A profile that had no watches and no unowned work starts no poller at plugin load. Without
+    this, the first ``a2a_submit`` on an idle profile creates a row no reconciliation or timer
+    ever sees until a reload or another operation starts polling (issue #16 review P1).
+    ``rehydrate`` is the existing read-only probe that starts only when there is work.
+    """
+    ctx = _CTX
+    if ctx is None:
+        return
+    try:
+        _watch_manager(ctx).rehydrate()
+    except Exception:
+        logger.debug("A2A: could not start maintenance after outbound work", exc_info=True)
 
 
 def _delivery_capable(ctx: Any) -> bool:
@@ -816,29 +902,8 @@ def _record_observation(task_id: str, payload: dict, peer: str,
     state = str((payload.get("status") or {}).get("state") or "")
     context_id = str(payload.get("contextId") or "")
     _ensure_task_record(task_id, peer, context_id, state)
-    entries: list[tuple[str, str, str, bool]] = []
     try:
-        # History first (chronology), peer-originated only: ROLE_USER is OUR request.
-        for index, message in enumerate(payload.get("history") or []):
-            if not _peer_role(message.get("role")):
-                continue
-            text = _text_of_message(message)
-            if not text:
-                continue
-            message_id = str(message.get("messageId") or message.get("message_id")
-                             or f"history:{index}:{_digest(text)}")
-            entries.append((message_id, "progress", text, False))
-        status_msg = (payload.get("status") or {}).get("message") or {}
-        message_id = str(status_msg.get("messageId") or status_msg.get("message_id") or "")
-        status_text = _text_of_message(status_msg)
-        if status_text:
-            kind = "input-required" if state == protocol.STATE_INPUT_REQUIRED else "progress"
-            entries.append((message_id or f"status:{_digest(status_text)}", kind, status_text, False))
-        for index, artifact in enumerate(payload.get("artifacts") or []):
-            text = _text_of_message(artifact)
-            if not text:
-                continue
-            entries.append((_artifact_message_id(artifact, index, text), "result", text, True))
+        entries = _observation_messages(payload, state)
         if (state in protocol.TERMINAL_STATES
                 and not any(kind == "result" for _mid, kind, _text, _update in entries)
                 and not store.has_kind(task_id, "result")):
@@ -851,6 +916,37 @@ def _record_observation(task_id: str, payload: dict, peer: str,
     except Exception:
         logger.debug("A2A: message recording failed", exc_info=True)
         return store.queued(task_id)
+
+
+def _observation_messages(payload: dict, state: str, *,
+                         input_artifact_kind: bool = False) -> list[tuple[str, str, str, bool]]:
+    """Extract stable backlog entries from one peer task observation, without writing them."""
+    entries: list[tuple[str, str, str, bool]] = []
+    # History first (chronology), peer-originated only: ROLE_USER is OUR request.
+    for index, message in enumerate(payload.get("history") or []):
+        if not _peer_role(message.get("role")):
+            continue
+        text = _text_of_message(message)
+        if not text:
+            continue
+        message_id = str(message.get("messageId") or message.get("message_id")
+                         or f"history:{index}:{_digest(text)}")
+        entries.append((message_id, "progress", text, False))
+    status_msg = (payload.get("status") or {}).get("message") or {}
+    status_text = _text_of_message(status_msg)
+    if status_text:
+        message_id = str(status_msg.get("messageId") or status_msg.get("message_id")
+                         or f"status:{_digest(status_text)}")
+        kind = "input-required" if state == protocol.STATE_INPUT_REQUIRED else "progress"
+        entries.append((message_id, kind, status_text, False))
+    for index, artifact in enumerate(payload.get("artifacts") or []):
+        text = _text_of_message(artifact)
+        if not text:
+            continue
+        kind = ("input-required" if input_artifact_kind
+                and state == protocol.STATE_INPUT_REQUIRED else "result")
+        entries.append((_artifact_message_id(artifact, index, text), kind, text, True))
+    return entries
 
 
 def _peer_role(role: Any) -> bool:
@@ -1366,27 +1462,21 @@ def a2a_cancel(args: dict, **_: Any) -> str:
     if not peer or not peer.get("url"):
         return f"Error: unknown agent '{agent}'."
     try:
-        resp = _rpc_request(peer, "CancelTask", {"id": task_id}, timeout=30)
+        result = _cancel_task(peer, agent, task_id)
     except Exception as e:
         return f"Error: CancelTask on '{agent}' failed — {e}."
-    if "error" in resp:
-        return _peer_rpc_error(resp, agent)
-    payload = resp.get("result", {})
-    raw_state = ""
-    if isinstance(payload, dict):
-        raw_state = str((payload.get("status") or {}).get("state") or "")
-    state = _short_state(raw_state)
-    if raw_state:
-        # CancelTask returns the task the peer now holds (A2A v1.0), so this is an authoritative
-        # observation, not a guess. Fold it into the local snapshot: without this, a successful
-        # cancel leaves a2a_list reporting the pre-cancel state (working/submitted) until some
-        # later poll happens to reconcile the row. complete() is idempotent, so a row that is
-        # already terminal locally is never rewritten by a stale peer reply.
-        if raw_state in protocol.TERMINAL_STATES:
-            _task_store().complete(task_id, raw_state, _reply_text_from_result(payload))
-        else:
-            _task_store().set_state(task_id, raw_state)
-    return f"[{agent} · task {task_id} · {state or 'cancel requested'}]"
+    if result.get("error"):
+        return result["error"]
+    state = result.get("state") or ""
+    reply = (result.get("reply") or "").strip()
+    if result.get("already_terminal"):
+        line = (f"[{agent} · task {task_id} · {state or 'terminal'} — "
+                f"cancel refused: already {state or 'terminal'}]")
+    else:
+        line = f"[{agent} · task {task_id} · {state or 'cancel requested'}]"
+    # A refused cancel is still an authoritative observation of the peer's state (and, when it
+    # finished, of its result). Hand the caller the answer it could not collect before.
+    return f"{line}\n{reply}" if reply else line
 
 
 # --------------------------------------------------------------------------
@@ -1533,6 +1623,7 @@ def a2a_list(args: dict | None = None, session_id: Optional[str] = None, **_: An
             owners = _ownership().owners([r.get("task_id", "") for r in visible])
         except Exception:
             owners = {}
+        now = time.time()
         for r in visible:
             state = str(r.get("state", "")).replace("TASK_STATE_", "").lower()
             task_id = r.get("task_id")
@@ -1543,9 +1634,13 @@ def a2a_list(args: dict | None = None, session_id: Optional[str] = None, **_: An
                 owned = "owned-by-this-session"
             else:
                 owned = "owned-by-another-session"
+            try:
+                age = _age_label(now - float(r.get("created_at") or now))
+            except (TypeError, ValueError):
+                age = "?"
             lines.append(f"  - {task_id} context={r.get('context_id')} peer={r.get('peer')} "
                          f"direction={r.get('direction', 'inbound')} ownership={r.get('ownership', 'local')} "
-                         f"owner={owned} state={state}")
+                         f"owner={owned} state={state} age={age}")
         if not records:
             lines.append("  (none)")
 

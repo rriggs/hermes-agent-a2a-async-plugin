@@ -60,21 +60,27 @@ read, and recomputes the remaining absolute deadline before every read. Regressi
 returned permit while the drip is still running; it fails at `66bf09b` with
 `no 408 after 0.800s with a 0.25s body deadline; drips=15, free_slots=1`.
 
-Verification of this round (worktree `fix/issue-13-inbound-file-parts`, uncommitted at the time of
-the run; the commit that follows carries the identical code plus this note):
+Verification of this round (worktree `fix/issue-13-inbound-file-parts`; round 2 ran uncommitted at
+`66bf09b`, round 3 at `cc6a408`):
 
-- Host suite: 385 passed, 6 skipped.
-- Clean-export container suite (Podman, disposable home, loopback peer): 386 passed, 5 skipped;
-  `plugins validate` passed, `plugins doctor` reported 13 tools / 3 hooks with only the expected
-  security-caution and private-core-import warnings.
+- Host suite: 389 passed, 3 skipped with the `tests/interoperability/.venv-sdk` venv present; a
+  clean checkout without that venv is 386 passed, 6 skipped. The three remaining skips are the
+  live-peer gates (`A2A_LIVE_PEER_PROFILE` unset by design) and the runtime-registration test,
+  whose `HERMES_TREE/.venv/bin/hermes` path does not exist in this core checkout.
+- Clean-export container suite at `cc6a408` (Podman, disposable home, loopback peer): 387 passed,
+  5 skipped; `plugins validate` passed, `plugins doctor` reported 13 tools / 3 hooks with only the
+  expected warnings.
+- Amy's nine independent controls, run unchanged against the clean export at `/review/plugin`:
+  9 passed (her drip control was the one failure she reported at `66bf09b`).
 - TUI delivery E2E: PASS (`delivered: true`, watch `complete`, publication published, two status
   notifications).
 - Classic CLI refusal E2E: PASS (`refused: true`, `peer_polls: 0`, `watch_rows: 0`).
-- New regression tests fail on the pre-fix tree (`53df155`) and pass on this one:
-  `test_stalled_attachment_bodies_do_not_starve_a_small_jsonrpc_request` reproduces the 429,
-  `test_incomplete_request_body_times_out_and_frees_the_slot`,
+- New regression tests fail on the tree they were written against and pass on this head:
+  `test_stalled_attachment_bodies_do_not_starve_a_small_jsonrpc_request` reproduces the 429 on
+  `53df155`, `test_incomplete_request_body_times_out_and_frees_the_slot`,
   `test_long_text_part_does_not_truncate_the_file_locator`, and
-  `test_extract_text_budget_keeps_every_file_locator`.
+  `test_extract_text_budget_keeps_every_file_locator` fail on `53df155`;
+  `test_drip_fed_body_still_hits_the_deadline_while_the_drip_continues` fails on `66bf09b`.
 
 ## Recent Agent Card identity fix
 

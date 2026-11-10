@@ -10,12 +10,16 @@ Workspace: /home/hermes/.hermes/profiles/sven/workspace/hermes-agent-a2a-async-p
 The standalone plugin provides the inbound asynchronous A2A gateway adapter, durable protocol/task
 state, security helpers, and outbound synchronous/asynchronous client tools.
 
-Branch under review:
+Current state:
 
-- `fix/issue-13-inbound-file-parts` — PR [#19](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/19),
-  based on `main` at `42c6237`. This branch carries inbound `FilePart` materialization (Issue #13)
-  plus the fixes for the two findings in Amy's request-changes review (below).
-- `main` is `42c6237`. The #13 change has not merged, so nothing here is released or deployed.
+- `main` is `7663468`, the merge of PR [#19](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/19)
+  (`fix/issue-13-inbound-file-parts`, Amy approved at `d171435`). That merge closed Issue #13 and
+  shipped inbound `FilePart` materialization plus the body-deadline and locator fixes below.
+- `fix/container-sdk-venv` (off `main`) makes the container suite build the `a2a-sdk` venv and run
+  the three compatibility tests instead of skipping them: `e2e/container/run-suite.sh`, the
+  `SDK_VENV_DIR` / `A2A_SDK_VENV` overrides, and `A2A_INTEROP_WORK_DIR` for a read-only export.
+- Issue #14 (outbound parts) is still local and uncommitted, stacked on the old #13 branch; it
+  rebases onto `main` cleanly except for this file's status block. Issue #20 is its follow-up.
 
 The plugin manifest declares:
 
@@ -334,8 +338,10 @@ both call shapes.
   `test_a2a_python_sdk.py::SDK_VERSION` — and asserted at runtime
   via the `sdk_version` fixture. The venv is gitignored at
   `tests/interoperability/.venv-sdk/`; the setup script refuses to
-  install outside this directory. We never install the SDK into
-  the Hermes runtime `.venv` per the HANDOFF.md constraint.
+  install outside that directory unless `SDK_VENV_DIR` names an
+  absolute target, which is how a read-only checkout (the container
+  suite) builds it; the test follows `A2A_SDK_VENV`. We never install
+  the SDK into the Hermes runtime `.venv` per the HANDOFF.md constraint.
 * **Setup script** (`setup_sdk_env.sh`): builds
   `tests/interoperability/.venv-sdk/` with `a2a-sdk[http-server]==1.1.2`
   + `uvicorn` + `httpx`. Strips the leaky
@@ -386,10 +392,17 @@ both call shapes.
     NOT hang).
 * **Skip path:** when `tests/interoperability/.venv-sdk/` is
   absent, the whole module SKIPs with a clear message pointing at
-  `setup_sdk_env.sh`. Enforced in two places: `pytest_collection_modifyitems`
+  `setup_sdk_env.sh` (or `A2A_SDK_VENV`). Enforced in two places: `pytest_collection_modifyitems`
   (per-item marker) and module-scope fixtures
   (`sdk_version`, `plugin_gateway`, `sdk_echo_server`) call
   `pytest.skip(...)` themselves as a belt-and-braces.
+* **Container gate:** `e2e/container/run-suite.sh` builds the venv at
+  `/data/sdk-venv`, exports `A2A_SDK_VENV`, and fails the run unless
+  `pytest tests/interoperability` reports `3 passed`, so the three
+  compatibility tests cannot silently skip in CI-style runs. Writable
+  scratch for the gateway profile and generated SDK sub-scripts is
+  controlled by `A2A_INTEROP_WORK_DIR` (default: the repository, which
+  is what the host runs use).
 * **Per-test venv python invocation:** the SDK sub-scripts
   (test 1 and test 2) run under
   `/home/hermes/.hermes/profiles/sven/workspace/hermes-agent-a2a-async-plugin/tests/interoperability/.venv-sdk/bin/python`

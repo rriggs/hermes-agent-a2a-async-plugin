@@ -61,9 +61,18 @@ setup_sdk_env.sh: done
 ```
 
 The venv is at `tests/interoperability/.venv-sdk/` (excluded from
-version control). The script is **refuses** to create a venv outside
-this directory; we never install the SDK into the Hermes runtime
-`.venv` per HANDOFF.md.
+version control). By default the script **refuses** to create a venv
+outside this directory, so the SDK never lands in the Hermes runtime
+`.venv`. A checkout that cannot be written to — the container suite
+mounts it read-only — names an absolute target instead:
+
+```bash
+SDK_VENV_DIR=/data/sdk-venv A2A_SDK_VENV=/data/sdk-venv \
+  ./tests/interoperability/setup_sdk_env.sh
+```
+
+`SDK_VENV_DIR` tells the setup script where to build; `A2A_SDK_VENV`
+tells the test where to look. `e2e/container/run-suite.sh` sets both.
 
 ## Run
 

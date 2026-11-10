@@ -1,12 +1,15 @@
 # Container end-to-end checks
 
-Two harnesses, one image. Both drive real Hermes processes with two scripted loopback
-servers (an OpenAI-compatible model and an A2A peer); nothing is mocked in the middle.
+Three runners, one image. The two E2E harnesses drive real Hermes processes with two scripted
+loopback servers (an OpenAI-compatible model and an A2A peer); nothing is mocked in the middle.
+The suite runner executes the whole pytest tree, including the official `a2a-sdk`
+cross-implementation tests.
 
 | Runner | Surface | What it proves |
 |---|---|---|
 | `run-container.sh` | classic CLI (`hermes chat`) | background mode refuses when the host cannot display a later turn |
 | `run-tui.sh` | TUI/websocket (`hermes gateway run` + `source=tui`) | the background result is injected into the originating session as a new turn |
+| `run-suite.sh` | full pytest tree + `plugins validate`/`doctor` | the plugin suite passes from a clean export, with the `a2a-sdk` compatibility tests actually running |
 
 ## Build (once)
 
@@ -77,6 +80,30 @@ the DB rows). The gateway log is `$DATA/home/.hermes/logs/gateway.log`.
 gateway owner, mints a session ticket, and dials `/api/ws`. The session declares `source=tui` on
 `session.create`, which is what makes `async_delivery_visible()` true for the plugin and what
 routes `notification.show` / the injected turn to this client.
+
+## 3. Full suite with the A2A SDK compatibility tests
+
+```bash
+E2E_IMAGE=localhost/hermes-e2e:local ./run-suite.sh /tmp/e2e-suite
+```
+
+This one is the release gate rather than a delivery proof. It exports `HEAD` (plus tracked
+worktree changes; `E2E_CLEAN=1` archives `HEAD` only), mounts it read-only, installs and enables
+the plugin in a disposable `HERMES_HOME`, runs `plugins list`/`validate`/`doctor`, then runs the
+whole pytest tree.
+
+Two things it does that a bare `pytest tests` inside the container does not:
+
+- It builds the pinned `a2a-sdk` venv at a writable path (`/data/sdk-venv`) and exports
+  `A2A_SDK_VENV`, because the export is read-only and the default location
+  `tests/interoperability/.venv-sdk` cannot be created there. Without this the three
+  cross-implementation tests skip.
+- It fails the run if those tests skip. The suite output is only a pass if
+  `pytest tests/interoperability` reports `3 passed`.
+
+Useful env: `E2E_EXPORT=/path/to/export` for a prepared tree, `E2E_EXTRA_FILES="tests/x.py"` to add
+an untracked file (a new test that is not committed yet), and `E2E_SDK_VENV=/path` to cache the
+SDK venv on the host across runs instead of rebuilding it inside `/data`.
 
 ## What the drivers script
 

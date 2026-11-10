@@ -29,10 +29,15 @@
 #                 works too but is NOT required).
 #   SDK_VERSION — override the a2a-sdk pin (default 1.1.2).
 #   SDK_EXTRAS  — pip extras to add (default "http-server").
+#   SDK_VENV_DIR — build the venv at this absolute path instead of
+#                 tests/interoperability/.venv-sdk. Required when the
+#                 repository is mounted read-only (container runs); the
+#                 test then needs A2A_SDK_VENV pointing at the same path.
+#   TEST_PYTHON — interpreter used to create the venv (default python3).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV="${HERE}/.venv-sdk"
+VENV="${SDK_VENV_DIR:-${HERE}/.venv-sdk}"
 SDK_VERSION="${SDK_VERSION:-1.1.2}"
 SDK_EXTRAS="${SDK_EXTRAS:-http-server}"
 PYTHON_BIN="${TEST_PYTHON:-python3}"
@@ -42,16 +47,33 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Sanity: the venv should live under tests/interoperability/. If the
-# operator points this script at the hermes runtime by mistake, the
-# .venv-sdk marker won't be there and we abort.
-case "${VENV}" in
-    "${HERE}/"*) ;;
-    *)
-        echo "setup_sdk_env.sh: refusing to create venv outside ${HERE}: ${VENV}" >&2
-        exit 1
-        ;;
-esac
+# Sanity: the venv lives under tests/interoperability/ unless the caller
+# explicitly names an absolute SDK_VENV_DIR (container runs mount the repo
+# read-only). Never install the SDK into the Hermes runtime venv.
+if [ -n "${SDK_VENV_DIR:-}" ]; then
+    case "${VENV}" in
+        /*) ;;
+        *)
+            echo "setup_sdk_env.sh: SDK_VENV_DIR must be an absolute path: ${VENV}" >&2
+            exit 1
+            ;;
+    esac
+    case "${VENV}" in
+        */.hermes/hermes-agent/.venv|*/.hermes/hermes-agent/.venv/*)
+            echo "setup_sdk_env.sh: refusing to install the SDK into the Hermes runtime venv: ${VENV}" >&2
+            exit 1
+            ;;
+    esac
+    mkdir -p "$(dirname "${VENV}")"
+else
+    case "${VENV}" in
+        "${HERE}/"*) ;;
+        *)
+            echo "setup_sdk_env.sh: refusing to create venv outside ${HERE}: ${VENV}" >&2
+            exit 1
+            ;;
+    esac
+fi
 
 # The hermes runtime's python 3.14 venv leaks onto PYTHONPATH during
 # subagent execution and breaks the SDK's pydantic_core ABI. Strip

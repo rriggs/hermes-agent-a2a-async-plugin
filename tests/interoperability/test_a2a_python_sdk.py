@@ -32,10 +32,12 @@ Two real cross-implementation exchanges, NO mocked HTTP:
    Hermes agent uses — no hand-rolled curl.
 
 The SDK venv is set up by `setup_sdk_env.sh` and lives at
-`tests/interoperability/.venv-sdk/`. If the venv is missing the test
-SKIPS (per the plan: "the SDK test must SKIP gracefully when
-tests/interoperability/.venv-sdk has not been set up, and PASS
-end-to-end after the setup script in your verification").
+`tests/interoperability/.venv-sdk/` by default. A run that cannot write
+inside the repository (the container suite mounts it read-only) builds
+the venv elsewhere and points `A2A_SDK_VENV` at it. If the venv is
+missing the test SKIPS (per the plan: "the SDK test must SKIP
+gracefully when tests/interoperability/.venv-sdk has not been set up,
+and PASS end-to-end after the setup script in your verification").
 """
 from __future__ import annotations
 
@@ -53,13 +55,19 @@ import pytest
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent.parent
-SDK_VENV = HERE / ".venv-sdk"
+# Default layout, or the path a read-only checkout had to build elsewhere
+# (``SDK_VENV_DIR`` on setup_sdk_env.sh, mirrored here as A2A_SDK_VENV).
+SDK_VENV = Path(os.environ.get("A2A_SDK_VENV") or (HERE / ".venv-sdk")).expanduser()
 SDK_PYTHON = SDK_VENV / "bin" / "python"
 SDK_ECHO_SERVER = HERE / "sdk_echo_server.py"
 
 PLUGIN_REPO = REPO_ROOT
 HERMES_TREE = Path("/home/hermes/.hermes/hermes-agent")
 HERMES_PYTHON = HERMES_TREE / ".venv/bin/python"
+# Writable root for the gateway profile and the generated SDK sub-scripts.
+# It defaults to the repository, so the host layout is unchanged; a
+# read-only export (the container suite) points it somewhere writable.
+WORK_DIR = Path(os.environ.get("A2A_INTEROP_WORK_DIR") or REPO_ROOT).expanduser()
 GATEWAY_LAUNCHER = REPO_ROOT / "tests" / "recovery" / "_gateway_launcher.py"
 
 # A2A v1.0 well-known Agent Card path. The plugin's adapter answers at
@@ -92,7 +100,8 @@ def pytest_collection_modifyitems(config, items):
     skip = pytest.mark.skip(
         reason=(
             f"SDK venv not set up at {SDK_VENV}. Run "
-            f"`{HERE / 'setup_sdk_env.sh'}` to install a2a-sdk=={SDK_VERSION}. "
+            f"`{HERE / 'setup_sdk_env.sh'}` to install a2a-sdk=={SDK_VERSION}, "
+            f"or point A2A_SDK_VENV at a venv built elsewhere. "
             "Per plan: SDK test must SKIP gracefully when .venv-sdk is missing."
         )
     )
@@ -142,7 +151,8 @@ def sdk_version() -> str:
     if not SDK_PYTHON.exists():
         pytest.skip(
             f"SDK venv not set up at {SDK_VENV}. Run "
-            f"`{HERE / 'setup_sdk_env.sh'}` to install a2a-sdk=={SDK_VERSION}."
+            f"`{HERE / 'setup_sdk_env.sh'}` to install a2a-sdk=={SDK_VERSION}, "
+            f"or point A2A_SDK_VENV at a venv built elsewhere."
         )
     v = _sdk_python_version()
     assert v, "SDK venv present but a2a-sdk is not importable"
@@ -165,10 +175,11 @@ def plugin_gateway():
     if not SDK_PYTHON.exists():
         pytest.skip(
             f"SDK venv not set up at {SDK_VENV}. Run "
-            f"`{HERE / 'setup_sdk_env.sh'}` to install a2a-sdk=={SDK_VERSION}."
+            f"`{HERE / 'setup_sdk_env.sh'}` to install a2a-sdk=={SDK_VERSION}, "
+            f"or point A2A_SDK_VENV at a venv built elsewhere."
         )
 
-    profile_home = REPO_ROOT / ".hermes" / "_interoperability_plugin_home"
+    profile_home = WORK_DIR / ".hermes" / "_interoperability_plugin_home"
     tasks_db = profile_home / "a2a_tasks.db"
     log_path = profile_home / "gateway.log"
     profile_home.mkdir(parents=True, exist_ok=True)
@@ -258,10 +269,10 @@ def _write_sdk_subprocess_script(body: str, name: str) -> Path:
 
     The script writes its result as a single JSON line on stdout
     (the parent parses one line per script). The script is written
-    under HERE/.tmp/ (excluded from version control) and removed on
-    teardown.
+    under ``<work dir>/tests/interoperability/.tmp/`` (excluded from
+    version control) and removed on teardown.
     """
-    tmp = HERE / ".tmp"
+    tmp = WORK_DIR / "tests" / "interoperability" / ".tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     path = tmp / name
     path.write_text(body, encoding="utf-8")

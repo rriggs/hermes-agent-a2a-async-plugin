@@ -100,6 +100,7 @@ def _make_working_db(path: Path, rows: list[dict] | None = None) -> Path:
             tenant TEXT NOT NULL DEFAULT '',
             state TEXT NOT NULL,
             reply TEXT NOT NULL DEFAULT '',
+            reply_parts TEXT NOT NULL DEFAULT '[]',
             created_at REAL NOT NULL,
             created_iso TEXT NOT NULL,
             completed_at REAL,
@@ -111,11 +112,11 @@ def _make_working_db(path: Path, rows: list[dict] | None = None) -> Path:
         con.execute(f"PRAGMA user_version = {A2A_TASK_SCHEMA_VERSION}")
         for r in (rows or []):
             con.execute(
-                "INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     r["task_id"], r["context_id"], r["peer"],
                     r.get("agent_slug", ""), r.get("tenant", ""),
-                    r["state"], r.get("reply", ""),
+                    r["state"], r.get("reply", ""), "[]",
                     r.get("created_at", time.time()),
                     r.get("created_iso", "2025-01-01T00:00:00.000Z"),
                     r.get("completed_at"), r.get("direction", "inbound"),
@@ -373,10 +374,10 @@ def test_storage_interrupted_write_is_recoverable_via_wal(tmp_path):
     try:
         bad.execute("BEGIN IMMEDIATE")
         bad.execute(
-            "INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 "interrupted-2", "ctx-interrupted", "peer-interrupted",
-                "", "", STATE_COMPLETED, "this should roll back",
+                "", "", STATE_COMPLETED, "this should roll back", "[]",
                 time.time(), "2025-01-01T00:00:00.000Z", time.time(),
                 "inbound", "local", "",
             ),
@@ -437,10 +438,10 @@ def test_storage_wal_recovery_after_kill(tmp_path):
     a.execute("PRAGMA journal_mode=WAL")
     a.execute("BEGIN")
     a.execute(
-        "INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             "wal-2", "ctx-wal", "peer-wal", "", "",
-            STATE_COMPLETED, "completed pre-kill",
+            STATE_COMPLETED, "completed pre-kill", "[]",
             time.time(), "2025-01-01T00:00:00.000Z", time.time(),
             "inbound", "local", "",
         ),
@@ -577,9 +578,9 @@ def test_storage_cross_process_kill_leaves_recoverable_db(
         "con = sqlite3.connect(db)\n"
         "con.execute('PRAGMA journal_mode=WAL')\n"
         "con.execute(\n"
-        "    'INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',\n"
+        "    'INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',\n"
         "    ('kill-1', 'ctx-kill', 'peer-kill', '', '',"
-        f" '{STATE_COMPLETED}', 'completed pre-kill',"
+        f" '{STATE_COMPLETED}', 'completed pre-kill', '[]',"
         " time.time(), '2025-01-01T00:00:00.000Z', time.time(),"
         " 'inbound', 'local', ''),\n"
         ")\n"

@@ -48,6 +48,18 @@ path for the worker's `sys.path`, so in any linked worktree the recovery worker 
 different tree (and wrote a schema-8 DB that this branch then refused to open). It now uses
 `PLUGIN_REPO` / `HERMES_TREE` from `tests/recovery/conftest.py`.
 
+### Round 3 (same day): the deadline did not survive a drip feed
+
+Amy's re-review at `66bf09b` retired both original findings and found one new P2: the absolute body
+deadline was enforced only between buffered reads. `rfile.read(64 KiB)` issues as many underlying
+socket reads as it needs, each restarting the idle timeout, so a peer sending one byte every 50 ms
+kept a large-body permit past the budget (reproduced here: no response after 0.9 s on a 0.25 s
+budget, one permit still held). `_read_body()` now uses `read1`, which performs at most one raw
+read, and recomputes the remaining absolute deadline before every read. Regression:
+`test_drip_fed_body_still_hits_the_deadline_while_the_drip_continues` asserts the 408 and the
+returned permit while the drip is still running; it fails at `66bf09b` with
+`no 408 after 0.800s with a 0.25s body deadline; drips=15, free_slots=1`.
+
 Verification of this round (worktree `fix/issue-13-inbound-file-parts`, uncommitted at the time of
 the run; the commit that follows carries the identical code plus this note):
 

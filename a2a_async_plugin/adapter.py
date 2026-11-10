@@ -52,7 +52,7 @@ from collections import deque
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FuturesTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Optional
+from typing import Any, Callable, cast, Dict, Optional
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -420,6 +420,11 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         The deadline is absolute rather than per-read so a peer dripping bytes
         cannot extend it, and a timeout closes the connection because the
         remaining body would be parsed as the next request.
+
+        ``read1`` is required rather than ``read``: the buffered ``read(n)``
+        issues as many underlying socket reads as it needs to fill ``n``
+        bytes, so each arriving byte restarts the idle timeout and control
+        never returns here to check the deadline (PR #19 review round 2).
         """
         if length <= 0:
             return b"{}"
@@ -430,6 +435,8 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
         set_timeout = getattr(connection, "settimeout", None)
         if not callable(set_timeout):
             return self.rfile.read(length)
+        read1 = getattr(self.rfile, "read1", None)
+        read_chunk = cast(Callable[[int], bytes], read1 if callable(read1) else self.rfile.read)
         deadline = time.monotonic() + _BODY_READ_TIMEOUT
         previous_timeout = connection.gettimeout()
         buffer = bytearray()
@@ -438,9 +445,9 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise _BodyReadTimeout("request body read timed out")
-                set_timeout(min(remaining, _BODY_READ_TIMEOUT))
+                set_timeout(remaining)
                 try:
-                    chunk = self.rfile.read(min(_BODY_READ_CHUNK, length - len(buffer)))
+                    chunk = read_chunk(min(_BODY_READ_CHUNK, length - len(buffer)))
                 except OSError as exc:  # socket.timeout is an OSError subclass
                     raise _BodyReadTimeout("request body read timed out") from exc
                 if not chunk:

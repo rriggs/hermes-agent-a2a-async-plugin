@@ -789,6 +789,56 @@ def test_incomplete_request_body_times_out_and_frees_the_slot(monkeypatch):
         thread.join(timeout=2)
 
 
+def test_drip_fed_body_still_hits_the_deadline_while_the_drip_continues(monkeypatch):
+    """A byte every 50 ms must not extend the absolute body deadline.
+
+    Regression for the buffered-read boundary: ``rfile.read(n)`` restarts the
+    socket idle timeout on every arriving byte, so a deadline checked only
+    between calls never fires. The drip must still be running when the 408
+    land, and the permit must come back.
+    """
+    monkeypatch.setattr(adapter_module, "_BODY_READ_TIMEOUT", 0.25, raising=False)
+    adapter = _body_slot_adapter()
+    server, thread = _start_body_server(adapter)
+    stalled = _stall_body(server.server_port)
+    stop = threading.Event()
+    drips = [0]
+
+    def drip():
+        while not stop.wait(0.05):
+            try:
+                stalled.sendall(b"x")
+                drips[0] += 1
+            except OSError:
+                return
+
+    sender = threading.Thread(target=drip, daemon=True)
+    sender.start()
+    try:
+        stalled.settimeout(0.8)
+        started = time.monotonic()
+        try:
+            data = stalled.recv(4096)
+        except socket.timeout:
+            raise AssertionError(
+                f"no 408 after {time.monotonic() - started:.3f}s with a 0.25s "
+                f"body deadline; drips={drips[0]}, "
+                f"free_slots={adapter._body_read_slots._value}"
+            ) from None
+        status = data.split(b"\r\n", 1)[0].decode(errors="replace")
+
+        assert " 408 " in status, status
+        assert drips[0] > 0, "the sender never dripped, the control proved nothing"
+        _wait_for_slot_value(adapter._body_read_slots, 2)
+    finally:
+        stop.set()
+        sender.join(timeout=1)
+        stalled.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def test_long_text_part_does_not_truncate_the_file_locator(tmp_path, monkeypatch):
     inbox = tmp_path / "a2a_files"
     monkeypatch.setenv("A2A_FILES_DIR", str(inbox))

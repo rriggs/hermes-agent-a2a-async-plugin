@@ -639,3 +639,139 @@ def test_subscribe_live_completion_emits_the_persisted_parts(monkeypatch, tmp_pa
         frame["artifactUpdate"] for frame in sink.frames() if "artifactUpdate" in frame
     )
     assert artifact["artifact"]["parts"] == [expected]
+
+
+def test_routed_profile_file_reply_returns_a_file_part(monkeypatch, tmp_path):
+    """A routed profile's MEDIA carrier is encoded, not passed through as text."""
+    adapter = _adapter_at(monkeypatch, tmp_path)
+    image = tmp_path / "routed.png"
+    image.write_bytes(b"routed generated image")
+    monkeypatch.setattr(adapter, "_forward_to_profile", lambda *args: (
+        f"Generated image\nMEDIA:{image}", protocol.STATE_COMPLETED,
+    ))
+    agent = {
+        "slug": "other", "tenant": "other", "profile": "other", "local": False,
+        "output_modes": ["image/png"],
+    }
+
+    response = adapter._rpc_message_send(
+        "request-routed-file",
+        {
+            "message": {"parts": [protocol.text_part("generate image")]},
+            "configuration": {"acceptedOutputModes": ["image/png"]},
+        },
+        "peer", agent=agent,
+    )
+
+    parts = response["result"]["artifacts"][0]["parts"]
+    files = [part for part in parts if "raw" in part]
+    assert files, parts
+    assert base64.b64decode(files[0]["raw"]) == image.read_bytes()
+    assert files[0]["mediaType"] == "image/png"
+
+
+def test_routed_profile_rejected_file_mode_keeps_the_media_text(monkeypatch, tmp_path):
+    """When the peer refuses the carrier, the routed reply keeps its directive."""
+    adapter = _adapter_at(monkeypatch, tmp_path)
+    image = tmp_path / "routed-text.png"
+    image.write_bytes(b"routed generated image")
+    raw = f"Generated image\nMEDIA:{image}"
+    monkeypatch.setattr(
+        adapter, "_forward_to_profile", lambda *args: (raw, protocol.STATE_COMPLETED),
+    )
+    agent = {
+        "slug": "other", "tenant": "other", "profile": "other", "local": False,
+        "output_modes": ["image/png"],
+    }
+
+    response = adapter._rpc_message_send(
+        "request-routed-legacy",
+        {
+            "message": {"parts": [protocol.text_part("generate image")]},
+            "configuration": {"acceptedOutputModes": ["text/plain"]},
+        },
+        "peer", agent=agent,
+    )
+
+    parts = response["result"]["artifacts"][0]["parts"]
+    assert parts == [protocol.text_part(raw)]
+
+
+def _stash_a_file(adapter, context_id, payload=b"stash"):
+    part = protocol.file_part(
+        raw=base64.b64encode(payload).decode("ascii"),
+        filename="stash.bin", media_type="application/octet-stream",
+    )
+    adapter._stash_turn_attachments(context_id, "text", [part])
+    return part
+
+
+def test_completed_host_turn_releases_the_attachment_stash(monkeypatch, tmp_path):
+    """A delivered turn must not keep a second, encoded copy of its file."""
+    adapter, pending = _adapter_with_pending(
+        monkeypatch, tmp_path, "task-stash", output_modes=["image/png"],
+        accepted=["image/png"], context_id="ctx-stash",
+    )
+    image = tmp_path / "stash.png"
+    image.write_bytes(b"generated image")
+
+    async def handler(event):
+        return f"Generated image\nMEDIA:{image}"
+
+    adapter._message_handler = handler
+    event = _host_event(adapter, "ctx-stash", "task-stash")
+    asyncio.run(adapter._process_message_background(event, adapter._event_session_key(event)))
+    state, reply = adapter._await_reply(pending)
+    adapter._finalize_task(pending, state, reply)
+
+    stored = adapter.tasks.get("task-stash")
+    assert stored is not None
+    assert stored["state"] == protocol.STATE_COMPLETED
+    assert "ctx-stash" not in adapter._pending_attachments
+
+
+def test_file_only_host_turn_releases_the_attachment_stash(monkeypatch, tmp_path):
+    adapter, pending = _adapter_with_pending(
+        monkeypatch, tmp_path, "task-stash-only", output_modes=["image/png"],
+        accepted=["image/png"], context_id="ctx-stash-only",
+    )
+    image = tmp_path / "stash-only.png"
+    image.write_bytes(b"generated image")
+
+    async def handler(event):
+        return f"MEDIA:{image}"
+
+    adapter._message_handler = handler
+    event = _host_event(adapter, "ctx-stash-only", "task-stash-only")
+    asyncio.run(adapter._process_message_background(event, adapter._event_session_key(event)))
+    state, reply = adapter._await_reply(pending)
+    adapter._finalize_task(pending, state, reply)
+
+    assert "ctx-stash-only" not in adapter._pending_attachments
+
+
+def test_abandoned_attachment_stash_is_swept_by_other_context_traffic(monkeypatch, tmp_path):
+    """Expiry is not hostage to the abandoned context's own next request."""
+    from a2a_async_plugin.adapter import _ATTACHMENT_STASH_TTL
+
+    adapter = _adapter_at(monkeypatch, tmp_path)
+    _stash_a_file(adapter, "ctx-abandoned")
+    with adapter._pending_lock:
+        adapter._pending_attachments["ctx-abandoned"]["created"] -= _ATTACHMENT_STASH_TTL + 1
+    live = _stash_a_file(adapter, "ctx-live", b"live")
+
+    assert "ctx-abandoned" not in adapter._pending_attachments
+    assert adapter._pending_attachments["ctx-live"]["parts"] == [live]
+
+
+def test_failed_turn_drops_its_attachment_stash(monkeypatch, tmp_path):
+    """A turn that dies after extraction must not leave encoded payloads."""
+    from gateway.platforms.base import ProcessingOutcome
+
+    adapter = _adapter_at(monkeypatch, tmp_path)
+    _stash_a_file(adapter, "ctx-fail")
+    event = _host_event(adapter, "ctx-fail", "task-fail")
+
+    asyncio.run(adapter.on_processing_complete(event, ProcessingOutcome.FAILURE))
+
+    assert "ctx-fail" not in adapter._pending_attachments

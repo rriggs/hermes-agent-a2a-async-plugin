@@ -149,8 +149,10 @@ Attachments are assembled at the host delivery boundary, not inside `send()`. Th
 `_extract_response_content()` strips `MEDIA:` directives and image links before the text send, so
 the adapter overrides it to stash the extracted files, settles the task with text plus parts on the
 send (or in `_deliver_attachments` for a file-only reply, where no text send happens at all), and
-makes the native upload hooks return success because A2A carries files inside the task. A stash
-that is never claimed expires after 120 seconds.
+makes the native upload hooks return success because A2A carries files inside the task. A send
+removes the entry from the stash as it takes it, so the encoded payload does not outlive delivery;
+a turn that ends without delivering drops its entry, and the watchdog sweeps anything older than
+120 seconds independently of the originating context.
 
 Configuration example:
 
@@ -186,6 +188,22 @@ All four of Amy's probes (three findings plus her non-blocking MEDIA-retention d
 the fixed tree. The new regressions fail on `434f178` with the exact defects, verified in a detached
 worktree.
 
+### PR #23 review round 2 (`88120f9`)
+
+Two P2s, no P1:
+
+- **Routed profiles never emitted a FilePart.** The forwarded reply went straight into
+  `build_output_parts()` without splitting its `MEDIA` carriers, so an advertised image mode still
+  produced text with a path. The non-local path now extracts and encodes attachments with the same
+  limits and validation as local replies, and the legacy fallback keeps the raw directive when the
+  peer does not accept the carrier. Regressions cover accepted and rejected file modes on that
+  route.
+- **The attachment stash retained encoded payloads after delivery.** A claim marked the entry
+  instead of removing it, the early return skipped the TTL, and only another extraction for the
+  same context could clear it, so each completed turn kept a full base64 copy. A claim now pops the
+  entry, turn completion drops it, and the watchdog sweeps expired entries regardless of context.
+  Regressions cover delivered, file-only, failed, and abandoned-expired turns.
+
 ## SubscribeToTask output parts (Issue #20)
 
 Issue [#20](https://github.com/rriggs/hermes-agent-a2a-async-plugin/issues/20) tracks a gap exposed
@@ -202,12 +220,12 @@ Four regressions cover already-terminal and live subscriptions with both a `Data
 
 ## Current verification for #14 + #20 (2026-11-10, round 2)
 
-Tested on `fix/issue-14-outbound-parts` after the PR #23 review fixes and the folded #20 fix,
-before committing them:
+Tested on `fix/issue-14-outbound-parts` after the PR #23 review fixes, the folded #20 fix, and the
+second repair delta, before committing the delta:
 
-- Host `pytest tests -q -p no:cacheprovider`: **420 passed, 3 skipped** (the three live-peer gates;
+- Host `pytest tests -q -p no:cacheprovider`: **426 passed, 3 skipped** (the three live-peer gates;
   the SDK venv exists in this checkout, so the interoperability module ran).
-- Clean-export container suite (`e2e/container/run-suite.sh`): **421 passed, 2 skipped**; the three
+- Clean-export container suite (`e2e/container/run-suite.sh`): **427 passed, 2 skipped**; the three
   `a2a-sdk` interoperability tests ran and passed.
 - TUI delivery E2E: PASS; watch complete, result published.
 - Classic CLI refusal E2E: PASS; `refused=true`, `peer_polls=0`, `watch_rows=0`.
@@ -223,7 +241,9 @@ uses a `text/plain` file part, and `test_forwarded_agent_honors_advertised_json`
 `_rpc_message_stream` drops `parts=parts`. For #20,
 `test_subscribe_already_terminal_emits_the_persisted_parts` and
 `test_subscribe_live_completion_emits_the_persisted_parts` are parametrized over `DataPart` and
-`FilePart` and all four cases fail on `87b9ae8`.
+`FilePart` and all four cases fail on `87b9ae8`. For the second delta,
+`test_routed_profile_file_reply_returns_a_file_part` and the four stash-lifetime regressions
+(delivered, file-only, failed turn, abandoned-expired) fail on `88120f9`.
 
 Push payloads remain text-only; that is out of scope for #14/#20.
 

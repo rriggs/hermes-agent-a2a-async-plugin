@@ -181,6 +181,12 @@ def build_output_parts(text: str, attachments: Optional[list[dict]] = None, *,
     their media type.
     """
     local_modes = normalize_output_modes(output_modes)
+    if accepted_output_modes is None:
+        # Pre-v1.0 caller: an omitted acceptedOutputModes means the legacy
+        # text-carrier contract, not "text/plain MIME is acceptable". Matching
+        # on MIME alone would let a text/plain FilePart through, which is a
+        # different carrier than an older peer knows how to handle.
+        return [text_part(text)] if text else []
     peer_modes = normalize_output_modes(accepted_output_modes, default=("text/plain",))
     parts: list[dict] = []
     if text:

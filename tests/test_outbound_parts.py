@@ -406,7 +406,7 @@ class _SseSink:
         return payloads
 
 
-def _adapter_with_pending(monkeypatch, tmp_path, task_id, *, output_modes, accepted):
+def _adapter_at(monkeypatch, tmp_path):
     from gateway.config import PlatformConfig
     from a2a_async_plugin.adapter import A2AAdapter
 
@@ -414,16 +414,21 @@ def _adapter_with_pending(monkeypatch, tmp_path, task_id, *, output_modes, accep
     monkeypatch.setenv("A2A_TASKS_DB", str(tmp_path / "tasks.db"))
     monkeypatch.setenv("A2A_FILES_DIR", str(tmp_path / "files"))
     monkeypatch.delenv("A2A_PORT", raising=False)
-    adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"port": 0}))
+    return A2AAdapter(PlatformConfig(enabled=True, extra={"port": 0}))
+
+
+def _adapter_with_pending(monkeypatch, tmp_path, task_id, *, output_modes, accepted,
+                          context_id="ctx-stream"):
+    adapter = _adapter_at(monkeypatch, tmp_path)
     adapter.tasks = protocol.TaskStore(str(tmp_path / "tasks.db"))
-    adapter.tasks.create(task_id, "ctx-stream", "peer")
+    adapter.tasks.create(task_id, context_id, "peer")
     future = adapter._add_pending(
-        task_id, "ctx-stream", output_modes=output_modes,
+        task_id, context_id, output_modes=output_modes,
         accepted_output_modes=accepted,
     )
-    adapter._note_turn_start("ctx-stream", task_id)
+    adapter._note_turn_start(context_id, task_id)
     pending = {
-        "task_id": task_id, "context_id": "ctx-stream", "peer": "peer",
+        "task_id": task_id, "context_id": context_id, "peer": "peer",
         "future": future, "created_iso": "", "started": time.time(),
     }
     return adapter, pending
@@ -477,3 +482,101 @@ def test_terminal_event_with_only_file_parts_still_emits_the_artifact():
         frame["artifactUpdate"] for frame in sink.frames() if "artifactUpdate" in frame
     )
     assert artifact["artifact"]["parts"] == [file_part]
+
+
+def _host_event(adapter, context_id, task_id):
+    from gateway.platforms.base import MessageEvent, MessageType
+
+    return MessageEvent(
+        text="generate", message_type=MessageType.TEXT,
+        source=adapter.build_source(chat_id=context_id, chat_type="dm", user_id="peer"),
+        message_id=task_id,
+    )
+
+
+def test_host_response_delivery_attaches_the_media_file(monkeypatch, tmp_path):
+    """The real host path strips MEDIA before send(): the file must still ship.
+
+    This drives the inherited response pipeline rather than calling send()
+    directly, so it fails if attachments are only extracted inside send().
+    """
+    adapter, pending = _adapter_with_pending(
+        monkeypatch, tmp_path, "task-host", output_modes=["image/png"],
+        accepted=["image/png"], context_id="ctx-host",
+    )
+    source = tmp_path / "image.png"
+    source.write_bytes(b"generated image")
+
+    async def handler(event):
+        return f"Generated image\nMEDIA:{source}"
+
+    adapter._message_handler = handler
+    event = _host_event(adapter, "ctx-host", "task-host")
+    asyncio.run(adapter._process_message_background(event, adapter._event_session_key(event)))
+    state, reply = adapter._await_reply(pending)
+    adapter._finalize_task(pending, state, reply)
+
+    record = adapter.tasks.get("task-host")
+    assert record is not None
+    file_parts = [part for part in record["reply_parts"] if "raw" in part]
+    assert file_parts, record["reply_parts"]
+    assert base64.b64decode(file_parts[0]["raw"]) == b"generated image"
+    assert file_parts[0]["mediaType"] == "image/png"
+
+
+def test_host_response_delivery_of_a_file_only_reply_settles_the_task(monkeypatch, tmp_path):
+    """No text means no send(); the attachment hook is the only settlement point."""
+    adapter, pending = _adapter_with_pending(
+        monkeypatch, tmp_path, "task-file-only", output_modes=["image/png"],
+        accepted=["image/png"], context_id="ctx-file-only",
+    )
+    source = tmp_path / "only.png"
+    source.write_bytes(b"file only")
+
+    async def handler(event):
+        return f"MEDIA:{source}"
+
+    adapter._message_handler = handler
+    event = _host_event(adapter, "ctx-file-only", "task-file-only")
+    asyncio.run(adapter._process_message_background(event, adapter._event_session_key(event)))
+    state, reply = adapter._await_reply(pending)
+    adapter._finalize_task(pending, state, reply)
+
+    record = adapter.tasks.get("task-file-only")
+    assert record is not None
+    assert any("raw" in part for part in record["reply_parts"]), record["reply_parts"]
+
+
+def test_missing_output_preferences_keep_the_legacy_text_carrier():
+    """Omitted acceptedOutputModes means text-only, even for a text/plain file."""
+    report = protocol.file_part(raw="aGVsbG8=", filename="report.txt", media_type="text/plain")
+
+    legacy = protocol.build_output_parts("report", [report], accepted_output_modes=None)
+    explicit = protocol.build_output_parts("report", [report], accepted_output_modes=["text/plain"])
+
+    assert legacy == [protocol.text_part("report")]
+    assert explicit == [protocol.text_part("report"), report]
+
+
+def test_forwarded_agent_honors_advertised_json(monkeypatch, tmp_path):
+    """A routed (non-local) profile negotiates output modes like a local one."""
+    adapter = _adapter_at(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        adapter, "_forward_to_profile",
+        lambda *args: ('{"answer":42}', protocol.STATE_COMPLETED),
+    )
+    agent = {
+        "slug": "other", "tenant": "other", "profile": "other", "local": False,
+        "output_modes": ["application/json"],
+    }
+
+    response = adapter._rpc_message_send(
+        "request-forwarded",
+        {
+            "message": {"parts": [protocol.text_part("return json")]},
+            "configuration": {"acceptedOutputModes": ["application/json"]},
+        },
+        "peer", agent=agent,
+    )
+
+    assert response["result"]["artifacts"][0]["parts"] == [protocol.data_part({"answer": 42})]

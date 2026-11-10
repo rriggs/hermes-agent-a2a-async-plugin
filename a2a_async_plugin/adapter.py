@@ -82,6 +82,11 @@ _BODY_READ_TIMEOUT = 30.0
 _BODY_READ_CHUNK = 64 * 1024
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
 
+# How long a host-extracted attachment set stays attachable to a task. The
+# host extracts and then sends within one turn, so this only bounds a stash
+# that was never consumed (a turn that produced files but no send).
+_ATTACHMENT_STASH_TTL = 120.0
+
 
 def _reply_timeout() -> Optional[float]:
     """Optional cap for blocking reply waits, in seconds.
@@ -631,6 +636,11 @@ class A2AAdapter(BasePlatformAdapter):
         self._pending: Dict[str, tuple[str, Future]] = {}
         self._pending_order: Dict[str, deque[str]] = {}
         self._pending_output_settings: Dict[str, dict] = {}
+        # Files the host extracted from THIS turn's response, waiting to be
+        # attached to the task when the text send settles it. The host strips
+        # MEDIA directives before send() runs, so this stash is the only place
+        # the attachment paths survive (see _extract_response_content).
+        self._pending_attachments: Dict[str, dict] = {}
         self._pending_lock = threading.Lock()
 
         # Reply attribution (per context id). adapter.send() receives only the
@@ -742,6 +752,7 @@ class A2AAdapter(BasePlatformAdapter):
             self._pending.clear()
             self._pending_order.clear()
             self._pending_output_settings.clear()
+            self._pending_attachments.clear()
 
     # ── Orphaned task watchdog ─────────────────────────────────────────────
 
@@ -1001,19 +1012,23 @@ class A2AAdapter(BasePlatformAdapter):
                         self._pending_order.pop(entry[0], None)
 
     def _resolve_task(self, task_id: str, state: str, text: str,
-                      attachments: Optional[list[dict]] = None) -> bool:
+                      attachments: Optional[list[dict]] = None,
+                      raw_text: Optional[str] = None) -> bool:
         with self._pending_lock:
             entry = self._pending.get(task_id)
             if entry and not entry[1].done():
                 settings = self._pending_output_settings.get(task_id)
                 if settings is not None:
                     settings["attachments"] = list(attachments or [])
+                    if raw_text is not None:
+                        settings["raw_text"] = raw_text
                 entry[1].set_result((state, text))
                 return True
         return False
 
     def _resolve_oldest_for_context(self, context_id: str, state: str, text: str,
-                                    attachments: Optional[list[dict]] = None) -> bool:
+                                    attachments: Optional[list[dict]] = None,
+                                    raw_text: Optional[str] = None) -> bool:
         with self._pending_lock:
             for task_id in self._pending_order.get(context_id, ()):
                 entry = self._pending.get(task_id)
@@ -1021,6 +1036,8 @@ class A2AAdapter(BasePlatformAdapter):
                     settings = self._pending_output_settings.get(task_id)
                     if settings is not None:
                         settings["attachments"] = list(attachments or [])
+                        if raw_text is not None:
+                            settings["raw_text"] = raw_text
                     entry[1].set_result((state, text))
                     return True
         return False
@@ -1058,7 +1075,8 @@ class A2AAdapter(BasePlatformAdapter):
             arrivals.append(task_id)
 
     def _settle_turn(self, context_id: str, state: str, text: str,
-                     attachments: Optional[list[dict]] = None) -> "int | None":
+                     attachments: Optional[list[dict]] = None,
+                     raw_text: Optional[str] = None) -> "int | None":
         """Settle every task the current turn is answering.
 
         The turn's trigger task plus every arrival whose text was folded into that
@@ -1079,7 +1097,7 @@ class A2AAdapter(BasePlatformAdapter):
             return None
         settled = 0
         for task_id in batch:
-            if self._resolve_task(task_id, state, text, attachments):
+            if self._resolve_task(task_id, state, text, attachments, raw_text):
                 settled += 1
         return settled
 
@@ -1221,9 +1239,21 @@ class A2AAdapter(BasePlatformAdapter):
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
         self._register_inline_push(task_id, params, agent=agent)
 
+        task_configuration = params.get("configuration")
+        if not isinstance(task_configuration, dict):
+            task_configuration = {}
+
         if not agent.get("local", True):
             reply, state = self._forward_to_profile(agent, peer, context_id, framed)
-            self.tasks.complete(task_id, state, reply)
+            # A routed profile can advertise structured output just like a
+            # local one, so it must negotiate the same way. The subprocess
+            # returns text; JSON and file modes still apply to it.
+            reply_parts = protocol.build_output_parts(
+                reply,
+                output_modes=self._effective_output_modes(agent),
+                accepted_output_modes=task_configuration.get("acceptedOutputModes"),
+            )
+            stored = self.tasks.complete(task_id, state, reply, reply_parts=reply_parts)
             protocol.persist_message(context_id, "agent", reply, task_id, conv_dir=self._conversations_dir)
             security.audit("outbound", peer, task_id, reply)
             if state == protocol.STATE_COMPLETED:
@@ -1232,7 +1262,10 @@ class A2AAdapter(BasePlatformAdapter):
             else:
                 protocol.metrics.tasks_failed += 1
             self._send_push_notification(task_id, context_id, reply, state)
-            return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
+            task = (protocol.TaskStore.to_task(stored) if stored else protocol.build_task(
+                task_id, context_id, state, reply, created_at=rec["created_iso"],
+            ))
+            return task, None
 
         if self._loop is None or self._message_handler is None:
             self.tasks.complete(task_id, protocol.STATE_FAILED, "")
@@ -1243,9 +1276,6 @@ class A2AAdapter(BasePlatformAdapter):
                 created_at=rec["created_iso"],
             ), None
 
-        task_configuration = params.get("configuration")
-        if not isinstance(task_configuration, dict):
-            task_configuration = {}
         fut = self._add_pending(
             task_id,
             context_id,
@@ -1440,6 +1470,16 @@ class A2AAdapter(BasePlatformAdapter):
                 output_modes=output_settings.get("output_modes", self._output_modes),
                 accepted_output_modes=output_settings.get("accepted_output_modes"),
             )
+            if output_settings.get("attachments") and not any(
+                    "raw" in part or "url" in part or "data" in part for part in reply_parts):
+                # Negotiation rejected every file carrier. A direct call's raw
+                # reply still contains the MEDIA directive, so deliver that
+                # rather than a stripped line pointing at a file the peer
+                # never received. (On the host path the directive is already
+                # gone before send(), so this is a no-op there.)
+                fallback = output_settings.get("raw_text")
+                if isinstance(fallback, str) and fallback.strip():
+                    reply_parts = [protocol.text_part(fallback)]
             stored = self.tasks.complete(task_id, state, reply, reply_parts=reply_parts)
             if stored is None:
                 # Another writer (watchdog, cancellation, shutdown) settled the row
@@ -1961,37 +2001,182 @@ class A2AAdapter(BasePlatformAdapter):
 
         reply_text = content or ""
         attachments: list[dict] = []
-        try:
-            media_files, reply_text = BasePlatformAdapter.extract_media(reply_text)
-            media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
-            image_urls, _ = BasePlatformAdapter.extract_images(reply_text)
-            sources = [path for path, _is_voice in media_files]
-            sources.extend(url for url, _alt_text in image_urls)
-            remaining_bytes = protocol.MAX_OUTBOUND_FILE_BYTES
-            for source in sources[:32]:
-                part, error = await asyncio.to_thread(
-                    protocol.outbound_file_part, source, max_bytes=remaining_bytes,
-                )
-                if part is None:
-                    logger.debug("A2A: outbound attachment omitted (%s)", error)
-                    continue
-                attachments.append(part)
-                raw = part.get("raw")
-                if isinstance(raw, str):
-                    remaining_bytes = max(0, remaining_bytes - max(0, len(raw) * 3 // 4 - raw.count("=")))
-        except Exception as exc:
-            logger.debug("A2A: outbound attachments could not be prepared (%s)", type(exc).__name__)
+        stash = self._claim_turn_attachments(chat_id)
+        if stash is not None:
+            # Normal host path: _extract_response_content already split the
+            # reply and stashed the files; `content` is the stripped text.
+            attachments = list(stash["parts"])
+            reply_text = content or stash.get("text", "")
+        else:
+            # Direct call (tools, tests, an out-of-band send): no host split
+            # happened, so do it here. In the real gateway this branch sees
+            # text with MEDIA directives already removed.
+            reply_text, attachments = await self._extract_attachments(reply_text)
 
         settled = self._settle_turn(
             chat_id, protocol.STATE_COMPLETED, reply_text, attachments,
+            raw_text=content or "",
         )
         if settled is None and not self._resolve_oldest_for_context(
-                chat_id, protocol.STATE_COMPLETED, reply_text, attachments):
+                chat_id, protocol.STATE_COMPLETED, reply_text, attachments,
+                raw_text=content or ""):
             # No waiter (e.g. a late chunk or out-of-band send) — drop it.
             logger.debug("A2A: send() for context %s had no pending waiter", chat_id)
         elif settled:
             logger.debug("A2A: reply for context %s settled %d task(s)", chat_id, settled)
         return SendResult(success=True, message_id=message_id)
+
+    # ── Host response-delivery integration ────────────────────────────────
+    #
+    # The base adapter splits a response before calling send(): its
+    # ``_extract_response_content`` strips MEDIA: directives and Markdown image
+    # links, the remaining text goes through ``send()``, and the files are then
+    # pushed to whatever native upload hooks the platform implements
+    # (``send_image_file`` / ``send_document`` / ...). A2A has no separate
+    # upload channel -- files travel as FileParts inside the task -- so the
+    # split has to be reassembled here:
+    #
+    #   1. stash the extracted files when the host extracts them;
+    #   2. settle the task with text + parts on the text send (or in
+    #      ``_deliver_attachments`` when the reply is file-only and no text
+    #      send happens at all);
+    #   3. make the native hooks succeed without uploading anything.
+    #
+    # Without step 1 the MEDIA path is already gone by the time ``send()`` runs,
+    # which is why an in-send extraction alone produces text-only replies on the
+    # real host path.
+
+    async def _extract_response_content(self, response, event, session_key, *,
+                                        is_ephemeral_response):
+        extracted = await super()._extract_response_content(
+            response, event, session_key, is_ephemeral_response=is_ephemeral_response,
+        )
+        chat_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
+        if chat_id:
+            parts = await asyncio.to_thread(
+                self._build_attachments,
+                extracted.media_files, extracted.images, extracted.local_files,
+            )
+            self._stash_turn_attachments(chat_id, extracted.text_content, parts)
+        return extracted
+
+    def _build_attachments(self, media_files=None, images=None, local_files=None) -> list[dict]:
+        """Encode the host's extracted files as FileParts (thread-safe, no I/O race)."""
+        sources = [path for path, _is_voice in (media_files or [])]
+        sources.extend(url for url, _alt in (images or []))
+        sources.extend(local_files or [])
+        parts: list[dict] = []
+        remaining = protocol.MAX_OUTBOUND_FILE_BYTES
+        seen: set[str] = set()
+        for source in sources:
+            if len(parts) >= 32:
+                break
+            key = str(source)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                part, error = protocol.outbound_file_part(source, max_bytes=remaining)
+            except Exception as exc:  # never let one bad path kill the reply
+                logger.debug("A2A: outbound attachment could not be prepared (%s)", type(exc).__name__)
+                continue
+            if part is None:
+                logger.debug("A2A: outbound attachment omitted (%s)", error)
+                continue
+            parts.append(part)
+            raw = part.get("raw")
+            if isinstance(raw, str):
+                remaining = max(0, remaining - max(0, len(raw) * 3 // 4 - raw.count("=")))
+        return parts
+
+    async def _extract_attachments(self, text: str) -> tuple[str, list[dict]]:
+        """Split a direct-call reply (no host extraction) into text + FileParts."""
+        try:
+            media_files, reply_text = BasePlatformAdapter.extract_media(text)
+            media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+            image_urls, reply_text = BasePlatformAdapter.extract_images(reply_text)
+            parts = await asyncio.to_thread(
+                self._build_attachments, media_files, image_urls, None,
+            )
+            return reply_text, parts
+        except Exception as exc:
+            logger.debug("A2A: outbound attachments could not be prepared (%s)", type(exc).__name__)
+            return text, []
+
+    def _stash_turn_attachments(self, chat_id: str, text: str, parts: list[dict]) -> None:
+        with self._pending_lock:
+            if not parts:
+                self._pending_attachments.pop(chat_id, None)
+                return
+            self._pending_attachments[chat_id] = {
+                "text": text, "parts": parts, "claimed": False, "created": time.time(),
+            }
+
+    def _claim_turn_attachments(self, chat_id: str) -> Optional[dict]:
+        """Take this turn's attachments for the text send, once and once only."""
+        with self._pending_lock:
+            entry = self._pending_attachments.get(chat_id)
+            if entry is None or entry.get("claimed"):
+                return None
+            if time.time() - entry.get("created", 0.0) > _ATTACHMENT_STASH_TTL:
+                self._pending_attachments.pop(chat_id, None)
+                return None
+            entry["claimed"] = True
+            return dict(entry)
+
+    def _peek_turn_attachments(self, chat_id: str) -> Optional[dict]:
+        with self._pending_lock:
+            entry = self._pending_attachments.get(chat_id)
+            return dict(entry) if entry else None
+
+    async def _deliver_attachments(self, event, extracted, metadata, *,
+                                   anything_sent, record_delivery) -> None:
+        """A2A delivers attachments inside the task, never through the transport.
+
+        When the reply is file-only the host sends no text, so nothing has
+        settled the task yet: settle it here. Either way, report success so a
+        media-only turn does not mark the turn FAILED.
+        """
+        chat_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
+        entry = self._peek_turn_attachments(chat_id) if chat_id else None
+        if entry is not None and not entry.get("claimed"):
+            claimed = self._claim_turn_attachments(chat_id)
+            if claimed is not None:
+                settled = self._settle_turn(
+                    chat_id, protocol.STATE_COMPLETED, claimed.get("text", ""), claimed["parts"],
+                    raw_text=claimed.get("text", ""),
+                )
+                if settled is None:
+                    self._resolve_oldest_for_context(
+                        chat_id, protocol.STATE_COMPLETED, claimed.get("text", ""), claimed["parts"],
+                        raw_text=claimed.get("text", ""),
+                    )
+                entry = claimed
+        if entry is not None:
+            record_delivery(SendResult(
+                success=True, message_id=str(int(time.time() * 1000)),
+            ))
+
+    @staticmethod
+    def _inline_attachment_result() -> SendResult:
+        """Native upload hooks are not part of this transport; the part is in the task."""
+        return SendResult(success=True, message_id=str(int(time.time() * 1000)))
+
+    async def send_image_file(self, chat_id, image_path, caption=None,
+                              reply_to=None, metadata=None, **kwargs) -> SendResult:
+        return self._inline_attachment_result()
+
+    async def send_document(self, chat_id, file_path, caption=None, file_name=None,
+                            reply_to=None, metadata=None, **kwargs) -> SendResult:
+        return self._inline_attachment_result()
+
+    async def send_video(self, chat_id, video_path, caption=None,
+                         reply_to=None, metadata=None, **kwargs) -> SendResult:
+        return self._inline_attachment_result()
+
+    async def send_voice(self, chat_id, audio_path, caption=None,
+                         reply_to=None, metadata=None, **kwargs) -> SendResult:
+        return self._inline_attachment_result()
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Record which task this turn was started for.

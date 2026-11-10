@@ -24,7 +24,7 @@ Current state:
 The plugin manifest declares:
 
 - name: `a2a-async`
-- version: `0.4.2`
+- version: `0.5.0` (0.4.2 plus the #14 outbound-parts feature and the schema-7 to 8 migration)
 - kind: `platform`
 - requires Hermes: `>=0.22.2`
 - thirteen tools in the shared `a2a` toolset
@@ -145,6 +145,13 @@ reply. Safe public HTTP(S) URLs are carried as URL file parts. Terminal reply pa
 `TaskStore.reply_parts` (schema version 8), included in completed task messages/artifacts, and
 preserved across restarts.
 
+Attachments are assembled at the host delivery boundary, not inside `send()`. The base adapter's
+`_extract_response_content()` strips `MEDIA:` directives and image links before the text send, so
+the adapter overrides it to stash the extracted files, settles the task with text plus parts on the
+send (or in `_deliver_attachments` for a file-only reply, where no text send happens at all), and
+makes the native upload hooks return success because A2A carries files inside the task. A stash
+that is never claimed expires after 120 seconds.
+
 Configuration example:
 
 ```yaml
@@ -154,9 +161,28 @@ a2a:
     image: [text/plain, image/png]
 ```
 
-Issue #14 is implemented on `fix/issue-14-outbound-parts`, rebased onto `main` (`1f715d3`) so it
-no longer stacks on a feature branch. The branch is local only and not yet pushed. Rob retains
-review and merge control.
+Issue #14 is implemented on `fix/issue-14-outbound-parts`, rebased onto `main` (`1f715d3`), pushed,
+and open as PR [#23](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/23). Amy reviewed
+`434f178` and returned REQUEST CHANGES with one P1 and two P2s; the fixes are local, uncommitted at
+the time of writing, and not yet pushed or re-submitted. Rob retains review and merge control.
+
+### PR #23 review round (2026-11-10)
+
+- **P1 file emission was disconnected from host delivery.** Attachments were extracted only inside
+  `send()`, but the host strips `MEDIA:` first and then calls the native upload hooks, so a real
+  turn produced a text-only task and logged `send_image_file fallback`. Fixed at the boundary:
+  `_extract_response_content` override (+ stash), settlement on the text send, `_deliver_attachments`
+  for file-only replies, native hooks as success no-ops.
+- **P2 omitted `acceptedOutputModes` still allowed a raw FilePart.** A `text/plain` attachment
+  matched the legacy MIME list. Missing preferences now mean the text-carrier contract: no file
+  parts at all.
+- **P2 routed profiles bypassed negotiation.** `_prepare_task` returned the forwarded reply before
+  capturing modes or building parts. The non-local path now negotiates, persists `reply_parts`, and
+  returns the stored task.
+
+All four of Amy's probes (three findings plus her non-blocking MEDIA-retention diagnostic) pass on
+the fixed tree. The new regressions fail on `434f178` with the exact defects, verified in a detached
+worktree.
 
 ## SubscribeToTask output parts (Issue #20)
 
@@ -173,31 +199,30 @@ SubscribeToTask fix there or leave it explicitly deferred to #20. Either way, te
 already-terminal subscription and a live subscription that receives completion, with DataPart and
 FilePart payloads.
 
-## Current verification for #14 (2026-11-10)
+## Current verification for #14 (2026-11-10, round 2)
 
-Tested on `fix/issue-14-outbound-parts` rebased onto `main` (`1f715d3`), before the commit, with the
-seven tracked files below plus the new `tests/test_outbound_parts.py`:
+Tested on `fix/issue-14-outbound-parts` after the PR #23 review fixes, before committing them:
 
-- Host `pytest tests -q -p no:cacheprovider`: **412 passed, 3 skipped** (the three live-peer gates;
+- Host `pytest tests -q -p no:cacheprovider`: **416 passed, 3 skipped** (the three live-peer gates;
   the SDK venv exists in this checkout, so the interoperability module ran).
-- Clean-export container suite (`e2e/container/run-suite.sh`): **413 passed, 2 skipped**; the three
+- Clean-export container suite (`e2e/container/run-suite.sh`): **417 passed, 2 skipped**; the three
   `a2a-sdk` interoperability tests ran and passed.
-- TUI delivery E2E: PASS; watch complete, result published, two status notifications.
+- TUI delivery E2E: PASS; watch complete, result published.
 - Classic CLI refusal E2E: PASS; `refused=true`, `peer_polls=0`, `watch_rows=0`.
 - `plugins validate` / `plugins doctor`: passed inside the container gate (13 tools, 3 hooks).
 - `git diff --check`: clean.
 
-The stream surface has its own regression,
-`test_message_stream_emits_the_persisted_data_part_in_the_artifact`. It fails when
-`_rpc_message_stream` drops `parts=parts` (verified by mutation, not assumed), so the terminal SSE
-artifact is wired to the stored parts rather than to re-rendered text.
+Regressions added in this round, each proven to fail on `434f178`:
+`test_host_response_delivery_attaches_the_media_file` and
+`test_host_response_delivery_of_a_file_only_reply_settles_the_task` drive the inherited
+`_process_message_background` pipeline (not a direct `send()`), `test_missing_output_preferences_keep_the_legacy_text_carrier`
+uses a `text/plain` file part, and `test_forwarded_agent_honors_advertised_json` goes through
+`_rpc_message_send` with a non-local agent. The earlier stream regression still fails when
+`_rpc_message_stream` drops `parts=parts`.
 
 Left to Issue #20 deliberately: `_rpc_tasks_subscribe` still calls `_emit_terminal` without parts,
 and the already-terminal branch of `_rpc_message_stream` re-renders the task message's text. Both
 paths are recorded there instead of being fixed quietly in this change.
-
-After the commit the tracked tree is clean; the untracked files are the planning and issue drafts
-that predate this work and must remain untouched.
 
 ## Architecture
 

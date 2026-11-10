@@ -14,23 +14,39 @@ Wire shape follows A2A Protocol v1.0 (JSON-RPC 2.0 binding over HTTP):
   - Push notification configs carry ``configId`` + ``createdAt`` and can be
     passed inline in ``message/send`` via configuration.taskPushNotificationConfig
 
-We deliberately implement the subset of A2A needed for text task exchange with
-stdlib only (no a2a-sdk). ``extract_text`` stays tolerant of v0.3 peers.
+We deliberately implement the A2A subset needed by Hermes with stdlib only
+(no a2a-sdk). Inbound text, data, and file Parts are rendered for the agent;
+``extract_text`` stays tolerant of v0.3 peers.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
+import http.client
+import ipaddress
 import json
 import copy
 import logging
+import math
+import mimetypes
 import os
+import socket
+import shutil
 import sqlite3
+import ssl
+import stat
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
+from urllib.error import URLError
 import uuid
 from collections import OrderedDict, defaultdict, deque
 from concurrent.futures import Future
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -132,6 +148,7 @@ def build_agent_card(
     push_notifications: bool = False,
     auth_required: bool = False,
     tenant: str = "",
+    input_modes: Optional[list[str]] = None,
 ) -> dict:
     """Construct an A2A v1.0 Agent Card document.
 
@@ -162,7 +179,7 @@ def build_agent_card(
             "stateTransitionHistory": False,
             "extendedAgentCard": False,
         },
-        "defaultInputModes": ["text/plain"],
+        "defaultInputModes": input_modes or ["text/plain"],
         "defaultOutputModes": ["text/plain"],
         "skills": skills or [],
     }
@@ -312,7 +329,407 @@ def message_with_parts(role: str, parts: list[dict], context_id: str = "") -> di
     return msg
 
 
-def extract_text(message_or_params: dict) -> str:
+_DEFAULT_MAX_INBOUND_FILE_MB = 20.0
+_DEFAULT_INBOUND_FILE_TTL_DAYS = 7.0
+MAX_JSON_BODY_BYTES = 32 * 1024 * 1024
+_DEFAULT_INBOUND_FILE_MEDIA_TYPES = (
+    "image/avif", "image/bmp", "image/gif", "image/heic", "image/jpeg",
+    "image/png", "image/svg+xml", "image/tiff", "image/webp",
+    "audio/aac", "audio/flac", "audio/mp4", "audio/mpeg", "audio/ogg",
+    "audio/wav", "audio/webm",
+    "video/mp4", "video/ogg", "video/quicktime", "video/webm",
+    "text/csv", "text/html", "text/markdown", "text/plain", "text/xml", "text/yaml",
+    "application/json", "application/pdf", "application/rtf", "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "application/vnd.oasis.opendocument.presentation",
+    "application/zip",
+)
+
+
+@dataclass(frozen=True)
+class InboundFilePolicy:
+    files_dir: Path
+    max_bytes: int
+    media_types: tuple[str, ...]
+    ttl_seconds: int
+
+
+def _profiled_env(name: str) -> str:
+    """Read a setting from the active multiplex profile, never its bridged default env."""
+    try:
+        from agent.secret_scope import current_secret_scope, get_secret, is_multiplex_active
+    except ImportError:
+        return os.getenv(name, "").strip()
+    try:
+        scoped = bool(is_multiplex_active() and current_secret_scope() is not None)
+    except Exception:
+        return os.getenv(name, "").strip()
+    if scoped:
+        try:
+            return (get_secret(name) or "").strip()
+        except Exception:
+            logger.warning("A2A: could not read profile-scoped setting %s", name, exc_info=True)
+            return ""
+    return os.getenv(name, "").strip()
+
+
+def _files_dir() -> Path:
+    """Resolve the active profile's A2A attachment inbox."""
+    override = _profiled_env("A2A_FILES_DIR")
+    if override:
+        return Path(override).expanduser()
+    try:
+        from hermes_constants import get_hermes_home
+        base = Path(get_hermes_home())
+    except Exception:
+        base = Path(_profiled_env("HERMES_HOME") or "~/.hermes").expanduser()
+    return base / "a2a_files"
+
+
+def _max_inbound_file_bytes() -> int:
+    try:
+        megabytes = float(_profiled_env("A2A_MAX_INBOUND_FILE_MB") or _DEFAULT_MAX_INBOUND_FILE_MB)
+    except (TypeError, ValueError):
+        megabytes = _DEFAULT_MAX_INBOUND_FILE_MB
+    if not math.isfinite(megabytes) or megabytes <= 0:
+        megabytes = _DEFAULT_MAX_INBOUND_FILE_MB
+    return max(1, int(megabytes * 1024 * 1024))
+
+
+def _inbound_file_ttl_seconds() -> int:
+    try:
+        days = float(_profiled_env("A2A_INBOUND_FILE_TTL_DAYS") or _DEFAULT_INBOUND_FILE_TTL_DAYS)
+    except (TypeError, ValueError):
+        days = _DEFAULT_INBOUND_FILE_TTL_DAYS
+    if not math.isfinite(days) or days < 0:
+        days = _DEFAULT_INBOUND_FILE_TTL_DAYS
+    return int(days * 24 * 60 * 60)
+
+
+def _allowed_inbound_file_media_types() -> tuple[str, ...]:
+    configured = _profiled_env("A2A_INBOUND_FILE_MEDIA_TYPES")
+    if configured:
+        return tuple(item.strip().lower() for item in configured.split(",") if item.strip())
+    return _DEFAULT_INBOUND_FILE_MEDIA_TYPES
+
+
+def _normalise_media_type(media_type: Any) -> str:
+    return str(media_type or "").split(";", 1)[0].strip().lower()
+
+
+def _inbound_media_type(media_type: Any, filename: str) -> str:
+    declared = _normalise_media_type(media_type)
+    if declared:
+        return declared
+    guessed, _encoding = mimetypes.guess_type(filename)
+    return _normalise_media_type(guessed)
+
+
+def _inbound_media_type_allowed(media_type: str,
+                                allowed_media_types: Optional[tuple[str, ...]] = None) -> bool:
+    candidate = _normalise_media_type(media_type)
+    if not candidate or "/" not in candidate:
+        return False
+    active_allowlist = (allowed_media_types if allowed_media_types is not None
+                        else _allowed_inbound_file_media_types())
+    for allowed in active_allowlist:
+        if allowed == "*/*" or allowed == candidate:
+            return True
+        if allowed.endswith("/*") and candidate.startswith(allowed[:-1]):
+            return True
+    return False
+
+
+def capture_inbound_file_policy() -> InboundFilePolicy:
+    """Capture profile-specific attachment settings before entering HTTP worker threads."""
+    return InboundFilePolicy(
+        files_dir=_files_dir().expanduser().resolve(),
+        max_bytes=_max_inbound_file_bytes(),
+        media_types=_allowed_inbound_file_media_types(),
+        ttl_seconds=_inbound_file_ttl_seconds(),
+    )
+
+
+def inbound_file_input_modes(policy: Optional[InboundFilePolicy] = None) -> list[str]:
+    media_types = policy.media_types if policy is not None else _allowed_inbound_file_media_types()
+    return list(dict.fromkeys(("text/plain", *media_types)))
+
+
+def _inbound_task_dir_name(task_id: str) -> str:
+    safe = _safe_name(task_id)
+    if safe == task_id and len(safe) <= 200:
+        return safe
+    suffix = hashlib.sha256(task_id.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    return f"{safe[:180]}-{suffix}"
+
+
+def _safe_inbound_filename(filename: Any) -> str:
+    raw = str(filename or "attachment").replace("\\", "/").split("/")[-1]
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in raw)
+    safe = safe.lstrip(".")[:128]
+    return safe or "attachment"
+
+
+def _inbound_url_filename(url: str) -> str:
+    try:
+        return urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]
+    except ValueError:
+        return ""
+
+
+def _save_inbound_file(payload: bytes, filename: Any, task_id: str,
+                       files_dir: Optional["os.PathLike[str]"] = None) -> tuple[Optional[Path], str]:
+    safe_name = _safe_inbound_filename(filename)
+    root = Path(files_dir) if files_dir is not None else _files_dir()
+    root = root.expanduser().resolve()
+    task_id = task_id or uuid.uuid4().hex
+    task_dir = root / _inbound_task_dir_name(task_id)
+    try:
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        task_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if task_dir.is_symlink() or task_dir.resolve().parent != root:
+            raise OSError("task inbox escaped the configured files directory")
+        os.chmod(task_dir, 0o700)
+        task_id_path = task_dir / ".a2a-task-id"
+        try:
+            task_id_fd = os.open(task_id_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(task_id_fd, "w", encoding="utf-8") as task_id_file:
+                task_id_file.write(json.dumps({"task_id": task_id}))
+        stem, suffix = os.path.splitext(safe_name)
+        for index in range(10_000):
+            name = safe_name if index == 0 else f"{stem or 'attachment'}-{index}{suffix}"
+            path = task_dir / name
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+            except FileExistsError:
+                try:
+                    existing_fd = os.open(
+                        path,
+                        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0),
+                    )
+                    with os.fdopen(existing_fd, "rb") as existing:
+                        existing_stat = os.fstat(existing.fileno())
+                        if (stat.S_ISREG(existing_stat.st_mode)
+                                and existing_stat.st_size == len(payload)
+                                and existing.read() == payload):
+                            os.fchmod(existing.fileno(), 0o600)
+                            os.utime(task_dir, None)
+                            return path, ""
+                except OSError:
+                    pass
+                continue
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(payload)
+            except Exception:
+                path.unlink(missing_ok=True)
+                raise
+            return path, ""
+        raise OSError("too many files with the same name")
+    except OSError as exc:
+        logger.warning("A2A: could not materialize inbound file %r: %s", safe_name, exc)
+        return None, f"[file: {safe_name}] could not be saved ({type(exc).__name__})"
+
+
+def cleanup_inbound_files(files_dir: Optional["os.PathLike[str]"], task_store: Any = None,
+                          *, now: Optional[float] = None,
+                          ttl_seconds: Optional[int] = None) -> int:
+    """Remove expired task inboxes, retaining files for active tasks and within the configured TTL."""
+    ttl = _inbound_file_ttl_seconds() if ttl_seconds is None else int(ttl_seconds)
+    if ttl <= 0:
+        return 0
+    root = Path(files_dir) if files_dir is not None else _files_dir()
+    root = root.expanduser().resolve()
+    current_time = time.time() if now is None else now
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return 0
+
+    removed = 0
+    for task_dir in entries:
+        try:
+            directory_stat = task_dir.lstat()
+        except OSError:
+            continue
+        if not stat.S_ISDIR(directory_stat.st_mode):
+            continue
+        task_id = task_dir.name
+        metadata_path = task_dir / ".a2a-task-id"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if isinstance(metadata, dict) and isinstance(metadata.get("task_id"), str):
+                task_id = metadata["task_id"]
+        except (OSError, ValueError):
+            pass
+
+        record = None
+        if task_store is not None:
+            try:
+                record = task_store.get(task_id)
+            except Exception:
+                logger.debug("A2A: could not inspect task %s during inbox cleanup", task_id, exc_info=True)
+                continue
+        if record and record.get("state") not in TERMINAL_STATES:
+            continue
+        try:
+            completed_at = float((record or {}).get("completed_at") or directory_stat.st_mtime)
+        except (TypeError, ValueError):
+            completed_at = directory_stat.st_mtime
+        last_activity = max(completed_at, directory_stat.st_mtime)
+        if current_time - last_activity < ttl:
+            continue
+        try:
+            shutil.rmtree(task_dir)
+        except OSError:
+            logger.debug("A2A: could not remove expired file inbox %s", task_dir, exc_info=True)
+        else:
+            removed += 1
+    return removed
+
+
+def _materialize_raw_file(raw: str, filename: Any, media_type: str, task_id: str,
+                          policy: InboundFilePolicy) -> tuple[Optional[Path], str]:
+    safe_name = _safe_inbound_filename(filename)
+    max_bytes = policy.max_bytes
+    if len(raw) > 4 * ((max_bytes + 2) // 3):
+        return None, f"[file: {safe_name}] rejected: exceeds the {max_bytes}-byte inbound file limit"
+    if not _inbound_media_type_allowed(media_type, policy.media_types):
+        return None, f"[file: {safe_name}] rejected: media type {media_type or 'application/octet-stream'} is not allowed"
+    try:
+        payload = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError):
+        return None, f"[file: {safe_name}] rejected: invalid base64 payload"
+    if len(payload) > max_bytes:
+        return None, f"[file: {safe_name}] rejected: exceeds the {max_bytes}-byte inbound file limit"
+    return _save_inbound_file(payload, safe_name, task_id, policy.files_dir)
+
+
+def _resolve_public_file_address(url: str) -> Optional[str]:
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        hostname = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+    except ValueError:
+        return None
+    if (parsed.scheme.lower() not in {"http", "https"} or not hostname
+            or parsed.username is not None or parsed.password is not None
+            or any(ord(char) < 33 for char in url)):
+        return None
+    try:
+        addresses = {ipaddress.ip_address(hostname)}
+    except ValueError:
+        try:
+            resolved = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+            addresses = {ipaddress.ip_address(info[4][0]) for info in resolved}
+        except (OSError, ValueError, IndexError):
+            return None
+    if not addresses or not all(address.is_global for address in addresses):
+        return None
+    return sorted(addresses, key=lambda address: (address.version, int(address)))[0].compressed
+
+
+def _safe_inbound_url(url: str) -> bool:
+    return _resolve_public_file_address(url) is not None
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, host, connect_address: str, **kwargs):
+        self._connect_address = connect_address
+        super().__init__(host, **kwargs)
+
+    def connect(self):
+        self.sock = socket.create_connection((self._connect_address, self.port), self.timeout)
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, connect_address: str, tls_server_name: str, **kwargs):
+        self._connect_address = connect_address
+        self._tls_server_name = tls_server_name
+        self._tls_context = kwargs.get("context") or ssl.create_default_context()
+        super().__init__(host, **kwargs)
+
+    def connect(self):
+        sock = socket.create_connection((self._connect_address, self.port), self.timeout)
+        self.sock = self._tls_context.wrap_socket(sock, server_hostname=self._tls_server_name)
+
+
+class _PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        address = _resolve_public_file_address(req.full_url)
+        if address is None:
+            raise URLError("inbound file URL resolved to a non-public address")
+        return self.do_open(
+            lambda host, **kwargs: _PinnedHTTPConnection(host, address, **kwargs), req)
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self):
+        self._tls_context = ssl.create_default_context()
+        super().__init__(context=self._tls_context)
+
+    def https_open(self, req):
+        address = _resolve_public_file_address(req.full_url)
+        if address is None:
+            raise URLError("inbound file URL resolved to a non-public address")
+        hostname = urllib.parse.urlsplit(req.full_url).hostname or ""
+        return self.do_open(
+            lambda host, **kwargs: _PinnedHTTPSConnection(host, address, hostname, **kwargs),
+            req, context=self._tls_context,
+        )
+
+
+class _SafeInboundFileRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _safe_inbound_url(newurl):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _materialize_url_file(url: str, filename: Any, task_id: str, media_type: str,
+                          policy: InboundFilePolicy) -> tuple[Optional[Path], str]:
+    safe_name = _safe_inbound_filename(filename)
+    if not _safe_inbound_url(url):
+        return None, "URL is not an allowed public HTTP(S) address"
+    if media_type and not _inbound_media_type_allowed(media_type, policy.media_types):
+        return None, f"media type {media_type} is not allowed"
+    max_bytes = policy.max_bytes
+    try:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _PinnedHTTPHandler(), _PinnedHTTPSHandler(),
+            _SafeInboundFileRedirectHandler())
+        request = urllib.request.Request(url, headers={"User-Agent": "Hermes-A2A/1.0"})
+        with opener.open(request, timeout=15) as response:
+            response_media_type = _normalise_media_type(response.headers.get("Content-Type", ""))
+            effective_media_type = response_media_type or media_type
+            if not _inbound_media_type_allowed(effective_media_type, policy.media_types):
+                return None, f"download media type {effective_media_type or 'unknown'} is not allowed"
+            try:
+                declared_size = int(response.headers.get("Content-Length", ""))
+            except (TypeError, ValueError):
+                declared_size = 0
+            if declared_size > max_bytes:
+                return None, f"download exceeds the {max_bytes}-byte inbound file limit"
+            payload = response.read(max_bytes + 1)
+        if len(payload) > max_bytes:
+            return None, f"download exceeds the {max_bytes}-byte inbound file limit"
+    except Exception as exc:
+        logger.debug("A2A: inbound file download failed for %r (%s)", safe_name, type(exc).__name__)
+        return None, f"download failed ({type(exc).__name__})"
+    return _save_inbound_file(payload, safe_name, task_id, policy.files_dir)
+
+
+def extract_text(message_or_params: dict, *, task_id: str = "",
+                 files_dir: Optional["os.PathLike[str]"] = None,
+                 file_policy: Optional[InboundFilePolicy] = None,
+                 max_chars: Optional[int] = None) -> str:
     """Pull concatenated text from an A2A Message / Task-result / params payload.
 
     v1.0 Parts carry a ``text`` member directly; v0.3 used ``kind: "text"``
@@ -320,49 +737,81 @@ def extract_text(message_or_params: dict) -> str:
     ``part["text"]``, so presence of a string ``text`` member is the test.
 
     File and data Parts are rendered into the text stream so the agent sees
-    them: file Parts with a URL include the URL and filename; data Parts
-    include their JSON-serialised content. Raw (base64) file Parts are noted
-    but not decoded (the agent can't act on binary inline).
+    them: raw file Parts are materialized under a task-scoped inbox and their
+    absolute paths are included; safe public URL file Parts are downloaded and
+    retain their original URL and filename;
+    data Parts include their JSON-serialised content.
+
+    ``max_chars`` bounds the prose (text and data Parts). File locator lines
+    are never charged against it: a caller that truncates a listing must not
+    drop the path of a file it just materialized, which is what happened when
+    a long TextPart preceded a FilePart (PR #19 review P2).
     """
+    policy = file_policy or capture_inbound_file_policy()
+    if files_dir is not None:
+        policy = InboundFilePolicy(
+            files_dir=Path(files_dir).expanduser().resolve(),
+            max_bytes=policy.max_bytes,
+            media_types=policy.media_types,
+            ttl_seconds=policy.ttl_seconds,
+        )
     msg = message_or_params.get("message", message_or_params)
     parts = msg.get("parts", []) if isinstance(msg, dict) else []
-    chunks = []
+    # (is_locator, text): locators are file lines the caller must always see,
+    # prose is charged against ``max_chars``.
+    entries: list[tuple[bool, str]] = []
     for part in parts:
         if not isinstance(part, dict):
             continue
         # v1.0 text part (member-presence discrimination)
         txt = part.get("text")
         if isinstance(txt, str):
-            chunks.append(txt)
+            entries.append((False, txt))
             continue
         # v0.3 compatibility: kind == "text"
         if part.get("kind") == "text" and isinstance(part.get("text"), str):
-            chunks.append(part["text"])
+            entries.append((False, part["text"]))
             continue
         # v1.0 file part with URL
         url = part.get("url")
         if isinstance(url, str) and url:
-            fname = part.get("filename") or part.get("name") or ""
-            mtype = part.get("mediaType") or part.get("mimeType") or ""
+            url_name = _inbound_url_filename(url)
+            fname = _safe_inbound_filename(part.get("filename") or part.get("name") or url_name)
+            mtype = _inbound_media_type(part.get("mediaType") or part.get("mimeType"), fname)
             label = f"[file: {fname}]" if fname else "[file]"
-            chunks.append(f"{label} {url}" + (f" ({mtype})" if mtype else ""))
+            path, error = _materialize_url_file(url, fname, task_id, mtype, policy)
+            detail = f"{label} {url}" + (f" ({mtype})" if mtype else "")
+            if path is not None:
+                detail += f" downloaded_to={path} ({path.stat().st_size} bytes)"
+            else:
+                detail += f" (not downloaded: {error})"
+            entries.append((True, detail))
             continue
         # v0.3 file part with nested file.fileWithUri
         v03_file = part.get("file")
         if isinstance(v03_file, dict) and isinstance(v03_file.get("fileWithUri"), str):
             uri = v03_file["fileWithUri"]
-            fname = v03_file.get("name") or ""
-            mtype = v03_file.get("mimeType") or ""
+            fname = _safe_inbound_filename(v03_file.get("name") or _inbound_url_filename(uri))
+            mtype = _inbound_media_type(v03_file.get("mimeType"), fname)
             label = f"[file: {fname}]" if fname else "[file]"
-            chunks.append(f"{label} {uri}" + (f" ({mtype})" if mtype else ""))
+            path, error = _materialize_url_file(uri, fname, task_id, mtype, policy)
+            detail = f"{label} {uri}" + (f" ({mtype})" if mtype else "")
+            if path is not None:
+                detail += f" downloaded_to={path} ({path.stat().st_size} bytes)"
+            else:
+                detail += f" (not downloaded: {error})"
+            entries.append((True, detail))
             continue
-        # v1.0 file part with raw bytes (base64) — note but don't decode
+        # v1.0 file part with raw bytes (base64)
         if isinstance(part.get("raw"), str):
-            fname = part.get("filename") or ""
-            mtype = part.get("mediaType") or ""
+            fname = _safe_inbound_filename(part.get("filename"))
+            mtype = _inbound_media_type(part.get("mediaType"), fname)
             label = f"[file: {fname}]" if fname else "[file]"
-            size_note = f"{len(part['raw'])} bytes base64-encoded"
-            chunks.append(f"{label} {size_note}" + (f" ({mtype})" if mtype else ""))
+            path, error = _materialize_raw_file(part["raw"], fname, mtype, task_id, policy)
+            if path is not None:
+                entries.append((True, f"{label} {path} ({mtype + ', ' if mtype else ''}{path.stat().st_size} bytes)"))
+            else:
+                entries.append((True, error + (f" ({mtype})" if mtype else "")))
             continue
         # v1.0 data part — include JSON content
         data = part.get("data")
@@ -372,7 +821,7 @@ def extract_text(message_or_params: dict) -> str:
             except (TypeError, ValueError):
                 rendered = str(data)
             mtype = part.get("mediaType") or "application/json"
-            chunks.append(f"[data ({mtype})]\n{rendered}")
+            entries.append((False, f"[data ({mtype})]\n{rendered}"))
             continue
         # v0.3 data part: kind == "data"
         if part.get("kind") == "data" and part.get("data") is not None:
@@ -380,9 +829,41 @@ def extract_text(message_or_params: dict) -> str:
                 rendered = json.dumps(part["data"], ensure_ascii=False, default=str)
             except (TypeError, ValueError):
                 rendered = str(part["data"])
-            chunks.append(f"[data]\n{rendered}")
+            entries.append((False, f"[data]\n{rendered}"))
             continue
-    return "\n".join(chunks).strip()
+    return _render_entries(entries, max_chars)
+
+
+_MAX_LOCATOR_CHARS = 20_000  # bounds a peer that sends thousands of file Parts
+
+
+def _render_entries(entries: "list[tuple[bool, str]]", max_chars: Optional[int]) -> str:
+    """Join extraction entries, truncating prose but never file locators."""
+    if max_chars is None:
+        return "\n".join(text for _is_locator, text in entries).strip()
+    budget = max(0, int(max_chars))
+    rendered: list[str] = []
+    locator_budget = _MAX_LOCATOR_CHARS
+    omitted_locators = 0
+    for is_locator, text in entries:
+        if is_locator:
+            if locator_budget <= 0:
+                omitted_locators += 1
+                continue
+            locator_budget -= len(text)
+            rendered.append(text)
+            continue
+        if budget <= 0:
+            continue
+        if len(text) > budget:
+            rendered.append(text[:budget] + " [truncated]")
+            budget = 0
+        else:
+            rendered.append(text)
+            budget -= len(text)
+    if omitted_locators:
+        rendered.append(f"[{omitted_locators} further file parts omitted]")
+    return "\n".join(rendered).strip()
 
 
 def extract_context_id(params: dict) -> str:

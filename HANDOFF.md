@@ -1,28 +1,86 @@
 # A2A Async Standalone Plugin Handoff
 
-Date: 2026-09-25
+Date: 2026-11-10
 Owner: Sven
 Repository: https://github.com/rriggs/hermes-agent-a2a-async-plugin.git
 Workspace: /home/hermes/.hermes/profiles/sven/workspace/hermes-agent-a2a-async-plugin
 
 ## Current status
 
-The standalone plugin provides the inbound asynchronous A2A gateway adapter, durable protocol/task state, security helpers, and outbound synchronous/asynchronous client tools.
+The standalone plugin provides the inbound asynchronous A2A gateway adapter, durable protocol/task
+state, security helpers, and outbound synchronous/asynchronous client tools.
 
-Current pushed HEAD:
+Branch under review:
 
-- `a4d68e8 fix(a2a): log scoped agent name resolution errors`
-- Branch: `main`
-- Remote: `origin/main`
-- The five commits after `61a95e3` were pushed successfully.
+- `fix/issue-13-inbound-file-parts` — PR [#19](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/19),
+  based on `main` at `42c6237`. This branch carries inbound `FilePart` materialization (Issue #13)
+  plus the fixes for the two findings in Amy's request-changes review (below).
+- `main` is `42c6237`. The #13 change has not merged, so nothing here is released or deployed.
 
 The plugin manifest declares:
 
 - name: `a2a-async`
-- version: `0.1.6`
+- version: `0.4.2`
 - kind: `platform`
-- requires Hermes: `>=0.21.3`
-- ten tools in the shared `a2a` toolset
+- requires Hermes: `>=0.22.2`
+- thirteen tools in the shared `a2a` toolset
+
+## PR #19 review round 2 (2026-11-10)
+
+Amy's request-changes review at `53df155` carried two reproduced findings. Both are fixed here:
+
+- **P1 body-slot starvation.** Every POST charged one of two global body-read admission slots
+  before reading. Two clients that sent `Content-Length` and stalled held both slots forever, and
+  a complete `GetTask` waited five seconds for a slot and then got HTTP 429. Fix: a slot is charged
+  only for declared bodies over `256` KiB, and `_read_body()` enforces a 30-second wall-clock
+  deadline (not a per-read timeout, so a drip feed cannot extend it). A timeout answers `408` and
+  closes the connection. See `a2a_async_plugin/adapter.py` (`_BODY_SLOT_MIN_BYTES`,
+  `_BODY_READ_TIMEOUT`, `_read_body`).
+- **P2 attachment path truncated out of `a2a_get_task`.** The tool sliced the concatenated
+  extraction at 2,000/4,000 characters, so a long TextPart ahead of a FilePart dropped the path of
+  a file that had already been written to disk. Fix: `protocol.extract_text(..., max_chars=)`
+  budgets prose separately from file locator lines, which are always rendered (bounded at 20,000
+  characters with an explicit omission marker). The tool passes its existing 2,000/4,000 budgets
+  through instead of slicing the result.
+
+Also fixed in this round: `tests/recovery/test_caller_restart.py` hardcoded the operator workspace
+path for the worker's `sys.path`, so in any linked worktree the recovery worker imported a
+different tree (and wrote a schema-8 DB that this branch then refused to open). It now uses
+`PLUGIN_REPO` / `HERMES_TREE` from `tests/recovery/conftest.py`.
+
+### Round 3 (same day): the deadline did not survive a drip feed
+
+Amy's re-review at `66bf09b` retired both original findings and found one new P2: the absolute body
+deadline was enforced only between buffered reads. `rfile.read(64 KiB)` issues as many underlying
+socket reads as it needs, each restarting the idle timeout, so a peer sending one byte every 50 ms
+kept a large-body permit past the budget (reproduced here: no response after 0.9 s on a 0.25 s
+budget, one permit still held). `_read_body()` now uses `read1`, which performs at most one raw
+read, and recomputes the remaining absolute deadline before every read. Regression:
+`test_drip_fed_body_still_hits_the_deadline_while_the_drip_continues` asserts the 408 and the
+returned permit while the drip is still running; it fails at `66bf09b` with
+`no 408 after 0.800s with a 0.25s body deadline; drips=15, free_slots=1`.
+
+Verification of this round (worktree `fix/issue-13-inbound-file-parts`; round 2 ran uncommitted at
+`66bf09b`, round 3 at `cc6a408`):
+
+- Host suite: 389 passed, 3 skipped with the `tests/interoperability/.venv-sdk` venv present; a
+  clean checkout without that venv is 386 passed, 6 skipped. The three remaining skips are the
+  live-peer gates (`A2A_LIVE_PEER_PROFILE` unset by design) and the runtime-registration test,
+  whose `HERMES_TREE/.venv/bin/hermes` path does not exist in this core checkout.
+- Clean-export container suite at `cc6a408` (Podman, disposable home, loopback peer): 387 passed,
+  5 skipped; `plugins validate` passed, `plugins doctor` reported 13 tools / 3 hooks with only the
+  expected warnings.
+- Amy's nine independent controls, run unchanged against the clean export at `/review/plugin`:
+  9 passed (her drip control was the one failure she reported at `66bf09b`).
+- TUI delivery E2E: PASS (`delivered: true`, watch `complete`, publication published, two status
+  notifications).
+- Classic CLI refusal E2E: PASS (`refused: true`, `peer_polls: 0`, `watch_rows: 0`).
+- New regression tests fail on the tree they were written against and pass on this head:
+  `test_stalled_attachment_bodies_do_not_starve_a_small_jsonrpc_request` reproduces the 429 on
+  `53df155`, `test_incomplete_request_body_times_out_and_frees_the_slot`,
+  `test_long_text_part_does_not_truncate_the_file_locator`, and
+  `test_extract_text_budget_keeps_every_file_locator` fail on `53df155`;
+  `test_drip_fed_body_still_hits_the_deadline_while_the_drip_continues` fails on `66bf09b`.
 
 ## Recent Agent Card identity fix
 
@@ -46,6 +104,22 @@ platforms:
 ```
 
 The code and tests cover scoped precedence, unscoped environment fallback, config fallback, and hostname fallback. The README documents the configuration surface.
+
+## Inbound attachments (Issue #13)
+
+Inbound A2A `FilePart` payloads are materialized beneath the active profile's `a2a_files` inbox and
+rendered to the agent as task-scoped paths. Files are mode `0600`, task directories are mode `0700`,
+raw payloads default to a 20 MiB per-file limit, and terminal inboxes default to a seven-day TTL.
+URL parts are fetched only from globally routable HTTP(S) addresses with DNS-pinned connections,
+redirect validation, no environment proxy, and the same byte limit. The Agent Card advertises
+`text/plain` plus the active inbound media allowlist. JSON-RPC requests and peer responses have a
+32 MiB body cap; at most two large (> `256` KiB) bodies are ingested concurrently, and every body
+must complete within 30 seconds or the adapter answers `408` (see review round 2 above).
+
+Configuration: `A2A_FILES_DIR`, `A2A_MAX_INBOUND_FILE_MB`,
+`A2A_INBOUND_FILE_MEDIA_TYPES`, and `A2A_INBOUND_FILE_TTL_DAYS`. In the current worktree this
+change is still under review and is not part of `main`; outbound `DataPart`/`FilePart` emission is
+tracked separately in Issue #14.
 
 ## Architecture
 

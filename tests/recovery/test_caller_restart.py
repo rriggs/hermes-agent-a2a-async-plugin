@@ -68,6 +68,7 @@ from a2a_async_plugin.protocol import (
     TaskStore,
 )
 
+from .conftest import HERMES_TREE, PLUGIN_REPO
 from .fake_peer import FakePeer
 
 
@@ -254,8 +255,8 @@ def test_caller_hardkill_outbound_task_remains_queryable_and_nonterminal(
     # worker's PYTHONPATH must include both the hermes source tree
     # (for ``hermes_constants`` etc.) and the plugin repo (for
     # ``a2a_async_plugin``).
-    plugin_repo = "/home/hermes/.hermes/profiles/sven/workspace/hermes-agent-a2a-async-plugin"
-    hermes_tree = "/home/hermes/.hermes/hermes-agent"
+    plugin_repo = str(PLUGIN_REPO)
+    hermes_tree = str(HERMES_TREE)
     worker.write_text(f"""
 import os, json, time, sys, urllib.request
 # Ensure the plugin repo is importable in the worker process —

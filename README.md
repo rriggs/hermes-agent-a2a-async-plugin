@@ -268,9 +268,12 @@ ZIP formats. Unsupported media types remain visible to the agent as an explicit 
   watchdog interval.
 
 Inbound JSON-RPC request bodies and peer JSON responses are capped at `32` MiB. The inbound adapter
-actively ingests at most two request bodies concurrently. This accommodates the default 20 MiB
-raw-file cap plus base64 and JSON overhead while limiting concurrent inbound request-body buffers to
-`64` MiB per adapter.
+actively ingests at most two large request bodies concurrently, where "large" means over `256` KiB;
+that accommodates the default 20 MiB raw-file cap plus base64 and JSON overhead while limiting
+concurrent inbound request-body buffers to `64` MiB per adapter. Smaller calls are read without an
+admission slot so a JSON-RPC operation never queues behind a stalled attachment upload, and every
+body must arrive within 30 seconds of the request line or the adapter answers `408` and closes the
+connection.
 
 ## Architecture
 

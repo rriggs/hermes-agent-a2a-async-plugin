@@ -71,7 +71,15 @@ _DEFAULT_PORT = 9900
 _ORPHAN_TIMEOUT = 300  # seconds before a pending task is considered orphaned
 _WATCHDOG_INTERVAL = 60  # seconds between orphaned task watchdog runs
 _MAX_BODY = protocol.MAX_JSON_BODY_BYTES  # Fits a 20MiB raw attachment's base64 plus JSON overhead.
-_MAX_CONCURRENT_BODY_READS = 2  # Caps concurrent request-body buffers at 64MiB per adapter.
+# Caps concurrent LARGE request-body buffers at 64MiB per adapter. Bodies at
+# or below _BODY_SLOT_MIN_BYTES are read without a slot: a small JSON-RPC call
+# must never queue behind a stalled attachment upload (PR #19 review P1).
+_MAX_CONCURRENT_BODY_READS = 2
+_BODY_SLOT_MIN_BYTES = 256 * 1024
+# Wall-clock budget for one request body. A per-read socket timeout alone is
+# not enough: a peer that drips one byte per interval resets it forever.
+_BODY_READ_TIMEOUT = 30.0
+_BODY_READ_CHUNK = 64 * 1024
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
 
 
@@ -282,6 +290,10 @@ def _method_info(method: str) -> tuple[str, bool]:
     return mapping.get(method, ("", False))
 
 
+class _BodyReadTimeout(Exception):
+    """The request body did not arrive within ``_BODY_READ_TIMEOUT``."""
+
+
 class _A2AServer(ThreadingHTTPServer):
     """ThreadingHTTPServer that carries a reference to its adapter."""
 
@@ -374,20 +386,72 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             self._json(401, protocol.jsonrpc_error(None, protocol.ERR_UNAUTHORIZED, "unauthorized"))
             return
 
-        if not adapter._body_read_slots.acquire(timeout=5):
-            self._json(429, protocol.jsonrpc_error(None, protocol.ERR_RATE_LIMITED, "request body capacity is full"))
-            return
-        body_slot_state = getattr(adapter, "_body_read_slot_state", None)
-        if body_slot_state is not None:
-            body_slot_state.held = True
+        # Admission control only covers bodies large enough to matter for
+        # memory. Charging a slot for every POST let two stalled attachment
+        # uploads starve a complete GetTask into a 429 (PR #19 review P1).
+        slot_held = False
+        try:
+            declared = int(self.headers.get("Content-Length", 0) or 0)
+        except (TypeError, ValueError):
+            declared = 0
+        if declared > _BODY_SLOT_MIN_BYTES:
+            if not adapter._body_read_slots.acquire(timeout=5):
+                self._json(429, protocol.jsonrpc_error(None, protocol.ERR_RATE_LIMITED, "request body capacity is full"))
+                return
+            slot_held = True
+            body_slot_state = getattr(adapter, "_body_read_slot_state", None)
+            if body_slot_state is not None:
+                body_slot_state.held = True
         try:
             self._handle_post_request(adapter, identity)
         finally:
-            release = getattr(adapter, "_release_body_read_slot", None)
-            if callable(release):
-                release()
-            else:
-                adapter._body_read_slots.release()
+            if slot_held:
+                release = getattr(adapter, "_release_body_read_slot", None)
+                if callable(release):
+                    release()
+                else:
+                    adapter._body_read_slots.release()
+
+    def _read_body(self, length: int) -> bytes:
+        """Read exactly ``length`` request-body bytes under a wall-clock deadline.
+
+        The read slot caps memory, not time: without a deadline two clients
+        that send a ``Content-Length`` and then stall hold both slots forever.
+        The deadline is absolute rather than per-read so a peer dripping bytes
+        cannot extend it, and a timeout closes the connection because the
+        remaining body would be parsed as the next request.
+        """
+        if length <= 0:
+            return b"{}"
+        connection = getattr(self, "connection", None)
+        if connection is None:
+            # In-process test doubles expose ``rfile`` with no socket behind it.
+            return self.rfile.read(length)
+        set_timeout = getattr(connection, "settimeout", None)
+        if not callable(set_timeout):
+            return self.rfile.read(length)
+        deadline = time.monotonic() + _BODY_READ_TIMEOUT
+        previous_timeout = connection.gettimeout()
+        buffer = bytearray()
+        try:
+            while len(buffer) < length:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise _BodyReadTimeout("request body read timed out")
+                set_timeout(min(remaining, _BODY_READ_TIMEOUT))
+                try:
+                    chunk = self.rfile.read(min(_BODY_READ_CHUNK, length - len(buffer)))
+                except OSError as exc:  # socket.timeout is an OSError subclass
+                    raise _BodyReadTimeout("request body read timed out") from exc
+                if not chunk:
+                    raise _BodyReadTimeout("connection closed before the request body arrived")
+                buffer.extend(chunk)
+        finally:
+            try:
+                set_timeout(previous_timeout)
+            except OSError:
+                pass
+        return bytes(buffer)
 
     def _handle_post_request(self, adapter: "A2AAdapter", identity: str) -> None:
         try:
@@ -398,9 +462,15 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             if length > _MAX_BODY:
                 self._json(413, protocol.jsonrpc_error(None, protocol.ERR_PARSE, "payload too large"))
                 return
-            raw = self.rfile.read(length) if length else b"{}"
+            raw = self._read_body(length) if length else b"{}"
             req = json.loads(raw.decode("utf-8"))
             del raw
+        except _BodyReadTimeout:
+            # The body is incomplete, so the connection cannot be reused and
+            # the request never became a JSON-RPC message.
+            self.close_connection = True
+            self._json(408, protocol.jsonrpc_error(None, protocol.ERR_PARSE, "request body read timed out"))
+            return
         except Exception:
             self._json(400, protocol.jsonrpc_error(None, protocol.ERR_PARSE, "parse error"))
             return

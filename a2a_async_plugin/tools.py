@@ -533,13 +533,13 @@ def a2a_get_task(args: dict, **_: Any) -> str:
     lines = [f"[{agent} · task {payload.get('id', task_id)} · {state}]"]
     msg = status.get("message")
     if msg:
-        txt = protocol.extract_text(msg, task_id=task_id)
+        txt = protocol.extract_text(msg, task_id=task_id, max_chars=2000)
         if txt:
-            lines.append(txt[:2000])
+            lines.append(txt)
     for artifact in payload.get("artifacts", []) or []:
-        txt = protocol.extract_text(artifact, task_id=task_id)
+        txt = protocol.extract_text(artifact, task_id=task_id, max_chars=4000)
         if txt:
-            lines.append(f"[artifact] {txt[:4000]}")
+            lines.append(f"[artifact] {txt}")
     return "\n".join(lines)
 
 

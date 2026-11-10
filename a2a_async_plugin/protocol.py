@@ -728,7 +728,8 @@ def _materialize_url_file(url: str, filename: Any, task_id: str, media_type: str
 
 def extract_text(message_or_params: dict, *, task_id: str = "",
                  files_dir: Optional["os.PathLike[str]"] = None,
-                 file_policy: Optional[InboundFilePolicy] = None) -> str:
+                 file_policy: Optional[InboundFilePolicy] = None,
+                 max_chars: Optional[int] = None) -> str:
     """Pull concatenated text from an A2A Message / Task-result / params payload.
 
     v1.0 Parts carry a ``text`` member directly; v0.3 used ``kind: "text"``
@@ -740,6 +741,11 @@ def extract_text(message_or_params: dict, *, task_id: str = "",
     absolute paths are included; safe public URL file Parts are downloaded and
     retain their original URL and filename;
     data Parts include their JSON-serialised content.
+
+    ``max_chars`` bounds the prose (text and data Parts). File locator lines
+    are never charged against it: a caller that truncates a listing must not
+    drop the path of a file it just materialized, which is what happened when
+    a long TextPart preceded a FilePart (PR #19 review P2).
     """
     policy = file_policy or capture_inbound_file_policy()
     if files_dir is not None:
@@ -751,18 +757,20 @@ def extract_text(message_or_params: dict, *, task_id: str = "",
         )
     msg = message_or_params.get("message", message_or_params)
     parts = msg.get("parts", []) if isinstance(msg, dict) else []
-    chunks = []
+    # (is_locator, text): locators are file lines the caller must always see,
+    # prose is charged against ``max_chars``.
+    entries: list[tuple[bool, str]] = []
     for part in parts:
         if not isinstance(part, dict):
             continue
         # v1.0 text part (member-presence discrimination)
         txt = part.get("text")
         if isinstance(txt, str):
-            chunks.append(txt)
+            entries.append((False, txt))
             continue
         # v0.3 compatibility: kind == "text"
         if part.get("kind") == "text" and isinstance(part.get("text"), str):
-            chunks.append(part["text"])
+            entries.append((False, part["text"]))
             continue
         # v1.0 file part with URL
         url = part.get("url")
@@ -777,7 +785,7 @@ def extract_text(message_or_params: dict, *, task_id: str = "",
                 detail += f" downloaded_to={path} ({path.stat().st_size} bytes)"
             else:
                 detail += f" (not downloaded: {error})"
-            chunks.append(detail)
+            entries.append((True, detail))
             continue
         # v0.3 file part with nested file.fileWithUri
         v03_file = part.get("file")
@@ -792,7 +800,7 @@ def extract_text(message_or_params: dict, *, task_id: str = "",
                 detail += f" downloaded_to={path} ({path.stat().st_size} bytes)"
             else:
                 detail += f" (not downloaded: {error})"
-            chunks.append(detail)
+            entries.append((True, detail))
             continue
         # v1.0 file part with raw bytes (base64)
         if isinstance(part.get("raw"), str):
@@ -801,9 +809,9 @@ def extract_text(message_or_params: dict, *, task_id: str = "",
             label = f"[file: {fname}]" if fname else "[file]"
             path, error = _materialize_raw_file(part["raw"], fname, mtype, task_id, policy)
             if path is not None:
-                chunks.append(f"{label} {path} ({mtype + ', ' if mtype else ''}{path.stat().st_size} bytes)")
+                entries.append((True, f"{label} {path} ({mtype + ', ' if mtype else ''}{path.stat().st_size} bytes)"))
             else:
-                chunks.append(error + (f" ({mtype})" if mtype else ""))
+                entries.append((True, error + (f" ({mtype})" if mtype else "")))
             continue
         # v1.0 data part — include JSON content
         data = part.get("data")
@@ -813,7 +821,7 @@ def extract_text(message_or_params: dict, *, task_id: str = "",
             except (TypeError, ValueError):
                 rendered = str(data)
             mtype = part.get("mediaType") or "application/json"
-            chunks.append(f"[data ({mtype})]\n{rendered}")
+            entries.append((False, f"[data ({mtype})]\n{rendered}"))
             continue
         # v0.3 data part: kind == "data"
         if part.get("kind") == "data" and part.get("data") is not None:
@@ -821,9 +829,41 @@ def extract_text(message_or_params: dict, *, task_id: str = "",
                 rendered = json.dumps(part["data"], ensure_ascii=False, default=str)
             except (TypeError, ValueError):
                 rendered = str(part["data"])
-            chunks.append(f"[data]\n{rendered}")
+            entries.append((False, f"[data]\n{rendered}"))
             continue
-    return "\n".join(chunks).strip()
+    return _render_entries(entries, max_chars)
+
+
+_MAX_LOCATOR_CHARS = 20_000  # bounds a peer that sends thousands of file Parts
+
+
+def _render_entries(entries: "list[tuple[bool, str]]", max_chars: Optional[int]) -> str:
+    """Join extraction entries, truncating prose but never file locators."""
+    if max_chars is None:
+        return "\n".join(text for _is_locator, text in entries).strip()
+    budget = max(0, int(max_chars))
+    rendered: list[str] = []
+    locator_budget = _MAX_LOCATOR_CHARS
+    omitted_locators = 0
+    for is_locator, text in entries:
+        if is_locator:
+            if locator_budget <= 0:
+                omitted_locators += 1
+                continue
+            locator_budget -= len(text)
+            rendered.append(text)
+            continue
+        if budget <= 0:
+            continue
+        if len(text) > budget:
+            rendered.append(text[:budget] + " [truncated]")
+            budget = 0
+        else:
+            rendered.append(text)
+            budget -= len(text)
+    if omitted_locators:
+        rendered.append(f"[{omitted_locators} further file parts omitted]")
+    return "\n".join(rendered).strip()
 
 
 def extract_context_id(params: dict) -> str:

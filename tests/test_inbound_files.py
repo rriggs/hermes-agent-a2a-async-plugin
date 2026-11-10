@@ -10,7 +10,9 @@ import os
 from pathlib import Path
 import socket
 import stat
+import sys
 import threading
+import time
 from types import SimpleNamespace
 from typing import Any, cast
 import urllib.request
@@ -650,3 +652,193 @@ def test_get_task_returns_materialized_artifact_path(tmp_path, monkeypatch):
     assert "get.png" in rendered
     assert str(inbox / "remote-task-get") in rendered
     assert (inbox / "remote-task-get" / "get.png").read_bytes() == payload
+
+
+# --------------------------------------------------------------------------
+# PR #19 review regressions: P1 body-read starvation, P2 locator truncation
+# --------------------------------------------------------------------------
+
+class _QuietServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer that ignores writes to sockets the test closed."""
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
+def _body_slot_adapter():
+    class Security:
+        def authenticate(self, *_args):
+            return "peer"
+
+        def is_trusted_peer(self, _identity):
+            return True
+
+    adapter = SimpleNamespace(
+        _security_context=Security(),
+        _body_read_slots=threading.BoundedSemaphore(2),
+        _body_read_slot_state=threading.local(),
+        _rate_limiter=SimpleNamespace(allow=lambda _identity: True),
+        _route_for_request=lambda *_args: {"agent": {"name": "test"}},
+    )
+
+    def release():
+        state = adapter._body_read_slot_state
+        if getattr(state, "held", False):
+            state.held = False
+            adapter._body_read_slots.release()
+
+    adapter._release_body_read_slot = release
+    return adapter
+
+
+def _start_body_server(adapter):
+    server = _QuietServer(("127.0.0.1", 0), adapter_module.A2ARequestHandler)
+    server.adapter = adapter
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread
+
+
+def _stall_body(port, declared=300_000):
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    sock.sendall(
+        b"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        + f"Content-Length: {declared}\r\n\r\n{{".encode()
+    )
+    return sock
+
+
+def _small_json_rpc_status(port):
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "not/a/method", "params": {}}).encode()
+    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+    try:
+        sock.sendall(
+            b"POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return data.split(b"\r\n", 1)[0].decode(errors="replace")
+    finally:
+        sock.close()
+
+
+def _wait_for_slot_value(slots, expected, timeout=5.0):
+    """Wait until ``slots`` has ``expected`` free permits; tests peek only."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if slots._value == expected:  # noqa: SLF001 - deterministic test sync
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"semaphore stayed at {slots._value}, expected {expected}")
+
+
+def test_stalled_attachment_bodies_do_not_starve_a_small_jsonrpc_request():
+    adapter = _body_slot_adapter()
+    server, thread = _start_body_server(adapter)
+    stalled = []
+    try:
+        stalled.append(_stall_body(server.server_port))
+        stalled.append(_stall_body(server.server_port))
+        # Both admission slots are held by uploads that never complete.
+        _wait_for_slot_value(adapter._body_read_slots, 0)
+
+        status = _small_json_rpc_status(server.server_port)
+
+        assert " 200 " in status, status
+    finally:
+        for sock in stalled:
+            sock.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_incomplete_request_body_times_out_and_frees_the_slot(monkeypatch):
+    monkeypatch.setattr(adapter_module, "_BODY_READ_TIMEOUT", 0.25, raising=False)
+    adapter = _body_slot_adapter()
+    server, thread = _start_body_server(adapter)
+    stalled = _stall_body(server.server_port)
+    try:
+        # One of the two slots is held by the stalled upload.
+        _wait_for_slot_value(adapter._body_read_slots, 1)
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = stalled.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        status = data.split(b"\r\n", 1)[0].decode(errors="replace")
+
+        assert " 408 " in status, status
+        _wait_for_slot_value(adapter._body_read_slots, 2)
+    finally:
+        stalled.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_long_text_part_does_not_truncate_the_file_locator(tmp_path, monkeypatch):
+    inbox = tmp_path / "a2a_files"
+    monkeypatch.setenv("A2A_FILES_DIR", str(inbox))
+    monkeypatch.setenv("A2A_TASKS_DB", str(tmp_path / "a2a_tasks.db"))
+    payload = b"\x89PNG\r\n\x1a\nlong text before the file"
+    task = {
+        "id": "task-long-text",
+        "contextId": "ctx-long-text",
+        "status": {
+            "state": protocol.STATE_COMPLETED,
+            "message": {
+                "role": "ROLE_AGENT",
+                "parts": [
+                    {"text": "y" * 2500},
+                    {
+                        "raw": base64.b64encode(payload).decode("ascii"),
+                        "filename": "page-003.png",
+                        "mediaType": "image/png",
+                    },
+                ],
+            },
+        },
+    }
+    monkeypatch.setattr(tools, "_resolve_peer", lambda _agent: {"url": "http://peer"})
+    monkeypatch.setattr(tools, "_rpc_request", lambda *_args, **_kwargs: {"result": task})
+
+    rendered = tools.a2a_get_task({"agent": "peer", "task_id": "task-long-text"})
+
+    path = inbox / "task-long-text" / "page-003.png"
+    assert str(path) in rendered
+    assert path.read_bytes() == payload
+    # The prose is still bounded; only the locator escapes the budget.
+    assert "y" * 2000 + " [truncated]" in rendered
+    assert "y" * 2001 not in rendered
+
+
+def test_extract_text_budget_keeps_every_file_locator(tmp_path, monkeypatch):
+    inbox = tmp_path / "a2a_files"
+    monkeypatch.setenv("A2A_FILES_DIR", str(inbox))
+    parts = [{"text": "z" * 5000}]
+    for index in range(3):
+        parts.append({
+            "raw": base64.b64encode(f"file-{index}".encode()).decode("ascii"),
+            "filename": f"f{index}.png",
+            "mediaType": "image/png",
+        })
+
+    rendered = protocol.extract_text({"parts": parts}, task_id="budget-task", max_chars=100)
+
+    for index in range(3):
+        assert str(inbox / "budget-task" / f"f{index}.png") in rendered
+    assert rendered.count("[truncated]") == 1
+    assert "z" * 100 in rendered

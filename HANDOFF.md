@@ -164,7 +164,9 @@ a2a:
 Issue #14 is implemented on `fix/issue-14-outbound-parts`, rebased onto `main` (`1f715d3`), pushed,
 and open as PR [#23](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/23). Amy reviewed
 `434f178` and returned REQUEST CHANGES with one P1 and two P2s; the fixes are local, uncommitted at
-the time of writing, and not yet pushed or re-submitted. Rob retains review and merge control.
+the time of writing, and not yet pushed or re-submitted. Issue #20 is folded into the same round.
+Rob retains review and merge control. The PR body still says #20 is deferred; it must be updated
+when the fixes are pushed.
 
 ### PR #23 review round (2026-11-10)
 
@@ -187,42 +189,43 @@ worktree.
 ## SubscribeToTask output parts (Issue #20)
 
 Issue [#20](https://github.com/rriggs/hermes-agent-a2a-async-plugin/issues/20) tracks a gap exposed
-by #14: `_rpc_tasks_subscribe()` waits for the task state and reply, then calls `_emit_terminal()`
-without the persisted `reply_parts`. A completed task subscribed through SSE therefore emits a
-text-only status message instead of its stored `DataPart` or `FilePart` artifact. `tasks/get`
-does render those persisted parts.
+by #14: `_rpc_tasks_subscribe()` waited for the task state and reply, then called
+`_emit_terminal()` without the persisted `reply_parts`, so a completed task subscribed through SSE
+emitted a text-only status message instead of its stored `DataPart` or `FilePart` artifact.
+`tasks/get` already rendered those parts.
 
-A local probe against the current #14 worktree confirmed this: a task stored with
-`DataPart({"answer": 42})` produced a terminal `statusUpdate` with only a `TextPart`, no
-`artifactUpdate`, and no JSON `DataPart`. Before opening the #14 PR, decide whether to include the
-SubscribeToTask fix there or leave it explicitly deferred to #20. Either way, test both an
-already-terminal subscription and a live subscription that receives completion, with DataPart and
-FilePart payloads.
+Fixed in PR #23, since it is the same surface: the subscribe path re-reads the row after the
+watcher resolves and passes its parts to `_emit_terminal`, and the already-terminal branch of
+`message/stream` now renders the parts carried by the terminal task instead of re-extracting text.
+Four regressions cover already-terminal and live subscriptions with both a `DataPart` and a
+`FilePart`; all four fail on `87b9ae8`.
 
-## Current verification for #14 (2026-11-10, round 2)
+## Current verification for #14 + #20 (2026-11-10, round 2)
 
-Tested on `fix/issue-14-outbound-parts` after the PR #23 review fixes, before committing them:
+Tested on `fix/issue-14-outbound-parts` after the PR #23 review fixes and the folded #20 fix,
+before committing them:
 
-- Host `pytest tests -q -p no:cacheprovider`: **416 passed, 3 skipped** (the three live-peer gates;
+- Host `pytest tests -q -p no:cacheprovider`: **420 passed, 3 skipped** (the three live-peer gates;
   the SDK venv exists in this checkout, so the interoperability module ran).
-- Clean-export container suite (`e2e/container/run-suite.sh`): **417 passed, 2 skipped**; the three
+- Clean-export container suite (`e2e/container/run-suite.sh`): **421 passed, 2 skipped**; the three
   `a2a-sdk` interoperability tests ran and passed.
 - TUI delivery E2E: PASS; watch complete, result published.
 - Classic CLI refusal E2E: PASS; `refused=true`, `peer_polls=0`, `watch_rows=0`.
 - `plugins validate` / `plugins doctor`: passed inside the container gate (13 tools, 3 hooks).
 - `git diff --check`: clean.
 
-Regressions added in this round, each proven to fail on `434f178`:
+Regressions added in this round, each proven to fail on the pre-fix tree:
 `test_host_response_delivery_attaches_the_media_file` and
 `test_host_response_delivery_of_a_file_only_reply_settles_the_task` drive the inherited
 `_process_message_background` pipeline (not a direct `send()`), `test_missing_output_preferences_keep_the_legacy_text_carrier`
 uses a `text/plain` file part, and `test_forwarded_agent_honors_advertised_json` goes through
-`_rpc_message_send` with a non-local agent. The earlier stream regression still fails when
-`_rpc_message_stream` drops `parts=parts`.
+`_rpc_message_send` with a non-local agent. The stream regression still fails when
+`_rpc_message_stream` drops `parts=parts`. For #20,
+`test_subscribe_already_terminal_emits_the_persisted_parts` and
+`test_subscribe_live_completion_emits_the_persisted_parts` are parametrized over `DataPart` and
+`FilePart` and all four cases fail on `87b9ae8`.
 
-Left to Issue #20 deliberately: `_rpc_tasks_subscribe` still calls `_emit_terminal` without parts,
-and the already-terminal branch of `_rpc_message_stream` re-renders the task message's text. Both
-paths are recorded there instead of being fixed quietly in this change.
+Push payloads remain text-only; that is out of scope for #14/#20.
 
 ## Architecture
 

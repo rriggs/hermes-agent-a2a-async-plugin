@@ -6,7 +6,10 @@ from concurrent.futures import Future
 import hashlib
 import io
 import json
+import threading
 import time
+
+import pytest
 
 from a2a_async_plugin import protocol
 
@@ -580,3 +583,59 @@ def test_forwarded_agent_honors_advertised_json(monkeypatch, tmp_path):
     )
 
     assert response["result"]["artifacts"][0]["parts"] == [protocol.data_part({"answer": 42})]
+
+
+_SUBSCRIBE_PARTS = [
+    protocol.data_part({"answer": 42}),
+    protocol.file_part(raw="aGVsbG8=", filename="x.txt", media_type="text/plain"),
+]
+
+
+@pytest.mark.parametrize("expected", _SUBSCRIBE_PARTS, ids=["data", "file"])
+def test_subscribe_already_terminal_emits_the_persisted_parts(monkeypatch, tmp_path, expected):
+    """SubscribeToTask must render stored parts for a task that already finished."""
+    adapter = _adapter_at(monkeypatch, tmp_path)
+    adapter.tasks = protocol.TaskStore(str(tmp_path / "tasks.db"))
+    adapter.tasks.create("task-sub", "ctx-sub", "peer")
+    adapter.tasks.complete(
+        "task-sub", protocol.STATE_COMPLETED, "reply", reply_parts=[expected],
+    )
+    monkeypatch.setattr(adapter, "_sse_headers", lambda handler: None)
+    sink = _SseSink()
+
+    adapter._rpc_tasks_subscribe(sink, "req-sub", {"taskId": "task-sub"})
+
+    artifact = next(
+        frame["artifactUpdate"] for frame in sink.frames() if "artifactUpdate" in frame
+    )
+    assert artifact["artifact"]["parts"] == [expected]
+
+
+@pytest.mark.parametrize("expected", _SUBSCRIBE_PARTS, ids=["data", "file"])
+def test_subscribe_live_completion_emits_the_persisted_parts(monkeypatch, tmp_path, expected):
+    """A live subscription picks up parts persisted by the completing writer."""
+    adapter = _adapter_at(monkeypatch, tmp_path)
+    adapter.tasks = protocol.TaskStore(str(tmp_path / "tasks.db"))
+    adapter.tasks.create("task-live", "ctx-live", "peer")
+    adapter.tasks.set_state("task-live", protocol.STATE_WORKING)
+    monkeypatch.setattr(adapter, "_sse_headers", lambda handler: None)
+    sink = _SseSink()
+
+    worker = threading.Thread(
+        target=adapter._rpc_tasks_subscribe,
+        args=(sink, "req-live", {"taskId": "task-live"}),
+    )
+    worker.start()
+    deadline = time.time() + 3.0
+    while time.time() < deadline and not adapter.tasks._watchers.get("task-live"):
+        time.sleep(0.01)
+    adapter.tasks.complete(
+        "task-live", protocol.STATE_COMPLETED, "reply", reply_parts=[expected],
+    )
+    worker.join(timeout=5.0)
+
+    assert not worker.is_alive()
+    artifact = next(
+        frame["artifactUpdate"] for frame in sink.frames() if "artifactUpdate" in frame
+    )
+    assert artifact["artifact"]["parts"] == [expected]

@@ -1743,11 +1743,16 @@ class A2AAdapter(BasePlatformAdapter):
         try:
             terminal, pending = self._prepare_task(params, peer, agent=agent)
             if terminal is not None:
+                # Already-terminal responses (rejected, failed, anti-loop) can
+                # still carry parts; render them instead of re-extracting text.
+                terminal_parts = (
+                    (terminal.get("status", {}).get("message") or {}).get("parts")
+                )
                 self._emit_terminal(
                     handler, terminal["id"], terminal["contextId"],
                     terminal["status"]["state"],
                     protocol.extract_text(terminal.get("status", {}).get("message", {}) or {}),
-                    req_id=req_id,
+                    req_id=req_id, parts=terminal_parts,
                 )
                 return
 
@@ -1800,7 +1805,15 @@ class A2AAdapter(BasePlatformAdapter):
                         state, reply = rec["state"], rec.get("reply", "")
                         break
                     self._sse_write(handler, ": keepalive\n\n")
-            self._emit_terminal(handler, task_id, rec["context_id"], state, reply, req_id=req_id)
+            # Re-read the row: a live subscription completes while we wait, and
+            # the terminal event must carry the parts persisted at completion
+            # (tasks/get and message/stream already do).
+            stored = self.tasks.get(task_id, *self._scope_for_agent(agent)) or rec
+            parts = stored.get("reply_parts") or None
+            self._emit_terminal(
+                handler, task_id, rec["context_id"], state, reply,
+                req_id=req_id, parts=parts,
+            )
         except (BrokenPipeError, ConnectionResetError):
             logger.debug("A2A: subscribe client disconnected")
 

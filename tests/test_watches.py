@@ -2610,3 +2610,29 @@ def test_reconciled_duplicates_deliver_once_on_background_adoption(monkeypatch):
 
     assert "Delivered 1 queued message(s)" in result
     assert len(ctx.accepted) == 1, [c[:80] for c in ctx.accepted]
+
+
+def test_transfer_after_result_suppression_must_not_lose_the_new_owners_result():
+    """P1: suppression created by A's history must be reevaluated for B."""
+    ctx = _CountingCtx()
+    working = _duplicate_payload(state=protocol.STATE_WORKING)
+    del working["artifacts"]
+    manager = _manager(ScriptedPoll(working, _duplicate_payload()), ctx=ctx)
+    _add(manager)
+
+    manager.run_once(now=100.0)
+    assert len(ctx.accepted) == 1
+    # Record the terminal observation, then release before its publication. The
+    # artifact has never been delivered to any session.
+    tools._record_observation("t1", _duplicate_payload(), "peer", SESSION_ID)
+    assert len(ctx.accepted) == 1
+    assert manager.ownership.release("t1", SESSION_ID)
+
+    successor_ctx = _CountingCtx()
+    successor = _manager(ScriptedPoll(_duplicate_payload()), ctx=successor_ctx)
+    successor.add(session_id="sess-new",
+                  target={"session_key": "agent:main:telegram:dm:43"},
+                  tasks=[("peer", "t1")])
+    successor.run_once(now=300.0)
+
+    assert len(successor_ctx.accepted) == 1, [c[:80] for c in successor_ctx.accepted]

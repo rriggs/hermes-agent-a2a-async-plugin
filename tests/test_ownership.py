@@ -1126,3 +1126,67 @@ def test_reconciliation_coalesces_a_recovered_terminal_backlog():
                                              input_artifact_kind=True))
 
     assert [row["message_id"] for row in store.queued("t1")] == ["artifact-id:final"]
+
+
+def _covered_result_setup(store):
+    """A delivered history Message covers a never-delivered identical artifact."""
+    assert store.acquire("t1", SESSION_A)
+    store.record_messages(
+        "t1", [("history:0:abc", "progress", "The final answer", False)],
+        session_id=SESSION_A,
+    )
+    assert store.mark_delivered("t1", ["history:0:abc"], SESSION_A) == 1
+    queued = store.record_messages(
+        "t1", [("artifact-id:final", "result", "The final answer", True)],
+        session_id=SESSION_A, terminal=True,
+    )
+    assert queued == [], "the artifact is covered by this session's delivered history"
+    with sqlite3.connect(str(Path(store.db_path))) as con:
+        row = con.execute(
+            "SELECT delivered_at, suppressed_at, suppressed_for_session"
+            " FROM a2a_task_messages WHERE task_id='t1'"
+            " AND message_id='artifact-id:final'").fetchone()
+    assert row[0] is None and row[1] is not None and row[2] == SESSION_A
+
+
+def test_adoption_reevaluates_suppression_created_for_the_previous_owner():
+    """P1: the artifact was never delivered; the adopter must receive it."""
+    _task()
+    store = _store()
+    _covered_result_setup(store)
+    assert store.release("t1", SESSION_A)
+
+    assert store.acquire("t1", SESSION_B)
+    assert [row["message_id"] for row in store.queued("t1")] == ["artifact-id:final"]
+
+
+def test_transfer_reevaluates_suppression_created_for_the_previous_owner():
+    _task()
+    store = _store()
+    _covered_result_setup(store)
+
+    transferred, refused, _stopped, _dropped = store.transfer_many(
+        ["t1"], SESSION_A, SESSION_B)
+
+    assert transferred == ["t1"] and refused == []
+    assert [row["message_id"] for row in store.queued("t1")] == ["artifact-id:final"]
+
+
+def test_adoption_keeps_canonical_progress_suppression():
+    """Canonical duplicate suppression is representation-level, not per session."""
+    _task()
+    store = _store()
+    assert store.acquire("t1", SESSION_A)
+    queued = store.record_messages(
+        "t1",
+        [("history:0:abc", "progress", "The final answer", False),
+         ("artifact-id:final", "result", "The final answer", True)],
+        session_id=SESSION_A, terminal=True,
+    )
+    assert [row["message_id"] for row in queued] == ["artifact-id:final"]
+    assert store.release("t1", SESSION_A)
+
+    assert store.acquire("t1", SESSION_B)
+    assert [row["message_id"] for row in store.queued("t1")] == ["artifact-id:final"], (
+        "adoption resurrected the progress copy beside its artifact"
+    )

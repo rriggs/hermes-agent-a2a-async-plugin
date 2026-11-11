@@ -27,7 +27,7 @@ Current state:
 The plugin manifest declares:
 
 - name: `a2a-async`
-- version: `0.5.1` (0.5.0 plus the #21 duplicate-completion fix and the schema-8 to 9 message-table migration)
+- version: `0.5.1` (0.5.0 plus the #21 duplicate-completion fix and the schema-8 to 10 message-table migrations)
 - kind: `platform`
 - requires Hermes: `>=0.22.2`
 - thirteen tools in the shared `a2a` toolset
@@ -250,9 +250,15 @@ delivered history cannot swallow the adopter's never-delivered result (round 4, 
 runs only at the terminal observation, because a working artifact is mutable and unpublished;
 suppressing progress against it loses text the final revision no longer repeats (round 4, P2).
 The sweep/adoption path shares the coalescer, so a reconciled backlog delivers one copy rather
-than two (round 4, P2). Suppressed rows are excluded from `queued()`, from `publish_if_owned`,
-and from the outbox flush, which retires any pre-enqueued copy. Distinct text, other tasks, and
-other sessions' tasks are untouched.
+than two (round 4, P2). Suppression records the session whose delivery justified it
+(`suppressed_for_session`, schema 10) and distinguishes it from representation-level
+suppression, which has no session. On `acquire` and `transfer_many`, suppression justified by
+another session is cleared inside the ownership transaction, so adoption and backlog replay
+before any poll receive a body that was never delivered (round 5, P1); canonical duplicate
+suppression stays in force so adoption cannot resurrect a progress copy beside its artifact.
+Suppressed rows are excluded from `queued()`, from `publish_if_owned`, and from the outbox
+flush, which retires any pre-enqueued copy. Distinct text, other tasks, and other sessions'
+tasks are untouched.
 
 The receiver half also covers our own older emitters and any peer that violates §3.7. Tests assert
 the host-accepted injection count through the real watch path, the blocking `a2a_await` return
@@ -263,11 +269,14 @@ again, and the result must still be queued and delivered on recovery. That regre
 `d47afe4`, where suppression had consumed the undelivered answer. Review round 4 added three
 boundaries: ownership transfer must not let the old owner's acknowledgement suppress the adopter's
 result, a working artifact must not permanently suppress progress, and reconciliation must coalesce
-so adoption delivers one copy. All six fail on `d844152`.
+so adoption delivers one copy. All six fail on `d844152`. Review round 5 added the remaining
+timing boundary: suppression created by A's delivered history must be reevaluated when B adopts
+after the terminal observation. The adoption/transfer regressions fail on `ff26fa5` with the
+adopter receiving zero messages.
 
-Gates on the fixed tree: host **450 passed, 3 skipped**; container **451 passed, 2 skipped** with
+Gates on the fixed tree: host **454 passed, 3 skipped**; container **455 passed, 2 skipped** with
 all three `a2a-sdk` interoperability tests; TUI delivery and classic CLI refusal E2Es PASS;
-validate/doctor PASS (13 tools, 3 hooks). Plugin version is `0.5.1`, task schema is 9.
+validate/doctor PASS (13 tools, 3 hooks). Plugin version is `0.5.1`, task schema is 10.
 
 ## Verification at merge (2026-11-10)
 

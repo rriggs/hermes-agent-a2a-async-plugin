@@ -54,7 +54,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "1.0"
-A2A_TASK_SCHEMA_VERSION = 9
+A2A_TASK_SCHEMA_VERSION = 10
 MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024
 _DEFAULT_OUTPUT_MODES = ("text/plain", "application/json")
 
@@ -1454,6 +1454,7 @@ class TaskStore:
                 delivered_to_session TEXT NOT NULL DEFAULT '',
                 delivered_at REAL,
                 suppressed_at REAL,
+                suppressed_for_session TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (task_id, message_id)
             )"""
             )
@@ -1462,6 +1463,10 @@ class TaskStore:
             }
             if "suppressed_at" not in message_columns:
                 con.execute("ALTER TABLE a2a_task_messages ADD COLUMN suppressed_at REAL")
+            if "suppressed_for_session" not in message_columns:
+                con.execute(
+                    "ALTER TABLE a2a_task_messages"
+                    " ADD COLUMN suppressed_for_session TEXT NOT NULL DEFAULT ''")
             con.execute(
                 """CREATE INDEX IF NOT EXISTS idx_a2a_task_messages_pending
                        ON a2a_task_messages (task_id, delivered_at)"""

@@ -162,7 +162,34 @@ class OwnershipStore:
                                                       ELSE released_by_session_id END
                     WHERE task_id=? AND (owner_session_id='' OR owner_session_id=?)""",
                 (session_id, now, session_id, task_id, session_id))
+            if cur.rowcount == 1:
+                self._clear_foreign_suppression(con, [task_id], session_id)
             return cur.rowcount == 1
+
+    @staticmethod
+    def _clear_foreign_suppression(con: sqlite3.Connection, task_ids: Iterable[str],
+                                   session_id: str) -> None:
+        """Reevaluate suppression that was justified by a DIFFERENT session's delivery.
+
+        ``suppressed_for_session`` names the session whose delivered row covered the
+        suppressed one. That justification does not transfer with ownership: an adopter
+        never received the body. Clearing these marks inside the adoption transaction means
+        the backlog replay (which runs before any poll) sees them. Canonical duplicate
+        suppression (``suppressed_for_session=''``) is representation-level and stays in
+        force, so adoption cannot resurrect a progress copy beside its artifact, and a
+        session re-acquiring its own task keeps its own covered rows suppressed.
+        """
+        ids = [task_id for task_id in task_ids if task_id]
+        if not ids or not session_id:
+            return
+        marks = ",".join("?" for _ in ids)
+        con.execute(
+            f"""UPDATE a2a_task_messages
+                   SET suppressed_at=NULL, suppressed_for_session=''
+                 WHERE task_id IN ({marks}) AND suppressed_at IS NOT NULL
+                   AND delivered_at IS NULL
+                   AND suppressed_for_session NOT IN ('', ?)""",
+            (*ids, session_id))
 
     def release(self, task_id: str, session_id: str, now: Optional[float] = None) -> bool:
         """Give up ownership; the task becomes adoptable by any session."""
@@ -287,6 +314,9 @@ class OwnershipStore:
                           released_by_session_id=''
                     WHERE task_id IN ({marks})""",
                 (to_session, now, *ids))
+            # The receiving session has not seen anything the previous owner's
+            # deliveries covered; reevaluate those suppressions before its replay.
+            self._clear_foreign_suppression(con, ids, to_session)
             dropped: dict[str, set[str]] = {}
             for task_id in ids:
                 dropped.update(self._drop_publications(con, task_id))
@@ -395,7 +425,8 @@ class OwnershipStore:
                            text=excluded.text,
                            delivered_at=NULL,
                            delivered_to_session='',
-                           suppressed_at=NULL
+                           suppressed_at=NULL,
+                           suppressed_for_session=''
                        WHERE a2a_task_messages.text <> excluded.text
                           OR a2a_task_messages.kind <> excluded.kind""",
                     (task_id, message_id, kind or "progress", text or "", now))
@@ -455,7 +486,8 @@ class OwnershipStore:
                                text=excluded.text,
                                delivered_at=NULL,
                                delivered_to_session='',
-                               suppressed_at=NULL
+                               suppressed_at=NULL,
+                               suppressed_for_session=''
                            WHERE a2a_task_messages.text <> excluded.text
                               OR a2a_task_messages.kind <> excluded.kind""",
                         (task_id, message_id, kind or "progress", text or "", now))
@@ -530,21 +562,22 @@ class OwnershipStore:
             pending = [row["message_id"] for row in live if row["delivered_at"] is None]
             if result["delivered_at"] is not None:
                 # This session already has the body via the artifact.
-                if own(result):
-                    suppress = pending
-                else:
-                    suppress = []
+                suppress = pending if own(result) else []
+                covered = bool(suppress)
             elif any(own(row) for row in live):
                 # This session already has the body via the Message.
                 suppress = [result["message_id"]]
+                covered = True
             else:
                 # Both are pending for this session: the artifact is canonical.
+                # This suppression is representation-level, not tied to a session.
                 suppress = pending
+                covered = False
             for message_id in suppress:
                 con.execute(
-                    """UPDATE a2a_task_messages SET suppressed_at=?
+                    """UPDATE a2a_task_messages SET suppressed_at=?, suppressed_for_session=?
                         WHERE task_id=? AND message_id=? AND suppressed_at IS NULL""",
-                    (now, task_id, message_id))
+                    (now, session_id if covered else "", task_id, message_id))
 
     def queued(self, task_id: str) -> list[dict]:
         """Undelivered messages for one task, oldest first."""
@@ -839,7 +872,8 @@ class OwnershipStore:
                                text=excluded.text,
                                delivered_at=NULL,
                                delivered_to_session='',
-                               suppressed_at=NULL
+                               suppressed_at=NULL,
+                               suppressed_for_session=''
                            WHERE a2a_task_messages.text <> excluded.text
                               OR a2a_task_messages.kind <> excluded.kind""",
                         (task_id, message_id, kind or "progress", text or "", now))

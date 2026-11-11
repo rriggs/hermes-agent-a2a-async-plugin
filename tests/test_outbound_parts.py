@@ -14,7 +14,8 @@ import pytest
 from a2a_async_plugin import protocol
 
 
-def test_completed_task_exposes_same_data_parts_in_message_and_artifact():
+def test_completed_task_exposes_data_parts_only_in_the_artifact():
+    """§3.7: a completed task's output is an artifact, never a status Message."""
     parts = [protocol.data_part({"answer": 42, "ok": True})]
 
     task = protocol.build_task(
@@ -22,21 +23,21 @@ def test_completed_task_exposes_same_data_parts_in_message_and_artifact():
         parts=parts,
     )
 
-    assert task["status"]["message"]["parts"] == parts
+    assert "message" not in task["status"]
     assert task["artifacts"][0]["parts"] == parts
-    assert '"answer": 42' in protocol.extract_text(task["status"]["message"])
+    assert '"answer": 42' in protocol.extract_text(task["artifacts"][0])
 
 
 def test_extract_text_renders_null_data_part():
     assert protocol.extract_text({"parts": [protocol.data_part(None)]}) == "[data (application/json)]\nnull"
 
 
-def test_text_only_task_shape_is_unchanged():
+def test_text_only_task_puts_its_reply_in_the_artifact():
     task = protocol.build_task(
         "task-text", "ctx-text", protocol.STATE_COMPLETED, "plain reply",
     )
 
-    assert task["status"]["message"]["parts"] == [protocol.text_part("plain reply")]
+    assert "message" not in task["status"]
     assert task["artifacts"][0]["parts"] == [protocol.text_part("plain reply")]
 
 
@@ -235,7 +236,7 @@ def test_completed_reply_parts_survive_taskstore_restart(tmp_path):
     rendered = protocol.TaskStore.to_task(record)
 
     assert record["reply_parts"] == parts
-    assert rendered["status"]["message"]["parts"] == parts
+    assert "message" not in rendered["status"]
     assert rendered["artifacts"][0]["parts"] == parts
 
 
@@ -288,7 +289,7 @@ def test_final_adapter_reply_persists_negotiated_json_data_part(monkeypatch, tmp
     assert record is not None
     assert record["reply_parts"] == [protocol.data_part({"answer": 42})]
     rendered = protocol.TaskStore.to_task(record)
-    assert rendered["status"]["message"]["parts"] == record["reply_parts"]
+    assert "message" not in rendered["status"]
     assert rendered["artifacts"][0]["parts"] == record["reply_parts"]
 
 
@@ -355,7 +356,7 @@ def test_blocking_send_returns_the_persisted_data_part(monkeypatch, tmp_path):
     response = adapter._rpc_message_send("request-1", {}, "peer")
 
     task = response["result"]
-    assert task["status"]["message"]["parts"] == [protocol.data_part({"answer": 42})]
+    assert "message" not in task["status"]
     assert task["artifacts"][0]["parts"] == [protocol.data_part({"answer": 42})]
 
 
@@ -391,6 +392,105 @@ def test_prepare_task_captures_peer_accepted_output_modes(monkeypatch, tmp_path)
     assert settings["accepted_output_modes"] == ["application/json"]
     assert settings["output_modes"] == ["text/plain", "application/json"]
     adapter._loop.close()
+
+
+def test_status_update_drops_output_text_for_a_completed_state():
+    """§3.7: a completed status event carries state, not the task output."""
+    completed = protocol.status_update("t1", "c1", protocol.STATE_COMPLETED, "the answer")
+    working = protocol.status_update("t1", "c1", protocol.STATE_WORKING, "still working")
+
+    assert "message" not in completed["statusUpdate"]["status"]
+    assert working["statusUpdate"]["status"]["message"]["parts"] == [
+        protocol.text_part("still working")]
+
+
+def test_emit_terminal_sends_the_output_only_as_an_artifact(monkeypatch, tmp_path):
+    adapter = _adapter_at(monkeypatch, tmp_path)
+    sink = _SseSink()
+    parts = [protocol.text_part("the answer")]
+
+    adapter._emit_terminal(sink, "t1", "c1", protocol.STATE_COMPLETED, "the answer",
+                           req_id="r1", parts=parts)
+
+    frames = sink.frames()
+    artifact = next(f["artifactUpdate"] for f in frames if "artifactUpdate" in f)
+    status = [f["statusUpdate"] for f in frames if "statusUpdate" in f][-1]
+    assert artifact["artifact"]["parts"] == parts
+    assert "message" not in status["status"]
+
+
+def test_emit_terminal_falls_back_to_a_text_artifact_without_parts(monkeypatch, tmp_path):
+    adapter = _adapter_at(monkeypatch, tmp_path)
+    sink = _SseSink()
+
+    adapter._emit_terminal(sink, "t1", "c1", protocol.STATE_COMPLETED, "plain answer", req_id="r1")
+
+    frames = sink.frames()
+    artifact = next(f["artifactUpdate"] for f in frames if "artifactUpdate" in f)
+    status = [f["statusUpdate"] for f in frames if "statusUpdate" in f][-1]
+    assert artifact["artifact"]["parts"] == [protocol.text_part("plain answer")]
+    assert "message" not in status["status"]
+
+
+class _CaptureOpener:
+    def __init__(self):
+        self.payloads: list[dict] = []
+
+    def open(self, request, timeout=None):
+        self.payloads.append(json.loads(request.data.decode("utf-8")))
+
+        class _Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Response()
+
+
+def _patch_push_delivery(monkeypatch, adapter):
+    import a2a_async_plugin.adapter as adapter_module
+
+    monkeypatch.setattr(adapter.tasks, "pop_push_url", lambda task_id: "https://callback.test/hook")
+    monkeypatch.setattr(
+        adapter_module.security, "is_safe_callback_url",
+        lambda url, localhost_mode=False: True,
+    )
+    opener = _CaptureOpener()
+    monkeypatch.setattr(adapter_module.urllib.request, "build_opener", lambda *a: opener)
+    return opener
+
+
+def test_push_notification_for_a_completed_task_carries_the_task(monkeypatch, tmp_path):
+    """A push is one StreamResponse: for a completed task, the Task with artifacts."""
+    adapter = _adapter_at(monkeypatch, tmp_path)
+    adapter.tasks = protocol.TaskStore(str(tmp_path / "tasks.db"))
+    opener = _patch_push_delivery(monkeypatch, adapter)
+    parts = [protocol.text_part("the answer")]
+
+    adapter._send_push_notification("t1", "c1", "the answer", protocol.STATE_COMPLETED, parts=parts)
+
+    [payload] = opener.payloads
+    assert "statusUpdate" not in payload
+    assert payload["task"]["artifacts"][0]["parts"] == parts
+    assert "message" not in payload["task"]["status"]
+
+
+def test_push_notification_for_an_incomplete_task_keeps_the_status_message(monkeypatch, tmp_path):
+    adapter = _adapter_at(monkeypatch, tmp_path)
+    adapter.tasks = protocol.TaskStore(str(tmp_path / "tasks.db"))
+    opener = _patch_push_delivery(monkeypatch, adapter)
+
+    adapter._send_push_notification(
+        "t1", "c1", "need a file", protocol.STATE_INPUT_REQUIRED,
+    )
+
+    [payload] = opener.payloads
+    assert payload["statusUpdate"]["status"]["message"]["parts"] == [
+        protocol.text_part("need a file")]
 
 
 class _SseSink:

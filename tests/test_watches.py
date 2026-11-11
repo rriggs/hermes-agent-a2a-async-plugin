@@ -2409,3 +2409,86 @@ def test_reconciliation_backoff_skips_remaining_rows_for_the_same_peer(monkeypat
     manager._reconcile_outbound(time.time())
 
     assert len(calls) == 1, f"backed-off peer retried {len(calls)} times in one batch"
+
+
+# ── issue #21: one answer, two representations, one delivery ────────────────
+
+def _duplicate_payload(state=protocol.STATE_COMPLETED, text="The final answer",
+                       task_id="t1"):
+    """The payload from issue #21: peer history and result artifact, same text."""
+    return {"id": task_id, "contextId": "ctx-1", "status": {"state": state},
+            "history": [{"role": "ROLE_AGENT", "parts": [{"text": text}]}],
+            "artifacts": [{"artifactId": "final", "parts": [{"text": text}]}]}
+
+
+def test_a_history_message_repeating_the_artifact_injects_once():
+    ctx = FakeCtx()
+    manager = _manager(ScriptedPoll(_duplicate_payload()), ctx=ctx)
+    _add(manager)
+
+    assert manager.run_once(now=100.0) == 1
+
+    [injected] = ctx.injected
+    assert injected["content"].count("The final answer") == 1
+    assert "returned a result" in injected["content"]
+
+
+def test_a_status_message_repeating_the_artifact_injects_once():
+    payload = {"id": "t1", "contextId": "ctx-1",
+               "status": {"state": protocol.STATE_COMPLETED,
+                          "message": {"role": "ROLE_AGENT",
+                                      "parts": [{"text": "The final answer"}]}},
+               "artifacts": [{"artifactId": "final",
+                              "parts": [{"text": "The final answer"}]}]}
+    ctx = FakeCtx()
+    manager = _manager(ScriptedPoll(payload), ctx=ctx)
+    _add(manager)
+
+    manager.run_once(now=100.0)
+
+    assert len(ctx.injected) == 1
+
+
+def test_completion_after_the_history_text_was_delivered_injects_nothing_new():
+    ctx = FakeCtx()
+    manager = _manager(ScriptedPoll(
+        {"id": "t1", "contextId": "ctx-1", "status": {"state": protocol.STATE_WORKING},
+         "history": [{"role": "ROLE_AGENT", "parts": [{"text": "The final answer"}]}]},
+        _duplicate_payload(),
+    ), ctx=ctx)
+    _add(manager)
+
+    assert manager.run_once(now=100.0) == 1
+    assert len(ctx.injected) == 1
+    manager.run_once(now=200.0)
+
+    assert len(ctx.injected) == 1, [m["content"] for m in ctx.injected]
+
+
+def test_re_observing_the_duplicate_terminal_payload_injects_once():
+    ctx = FakeCtx()
+    manager = _manager(ScriptedPoll(_duplicate_payload()), ctx=ctx)
+    _add(manager)
+
+    manager.run_once(now=100.0)
+    manager.run_once(now=200.0)
+
+    assert len(ctx.injected) == 1
+
+
+def test_a_blocking_await_delivers_an_identical_history_and_artifact_once(monkeypatch):
+    """Blocking mode returns the backlog; a repeated history line would appear twice."""
+    ctx = FakeCtx()
+    monkeypatch.setattr(tools, "_CTX", ctx)
+    protocol.TaskStore().create("t1", "ctx-1", "peer", direction="outbound",
+                                remote_state=protocol.STATE_WORKING)
+    manager = _manager(ScriptedPoll(_duplicate_payload()))
+    assert manager.ownership.acquire("t1", SESSION_ID)
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+    monkeypatch.setattr(tools, "_rpc_request", lambda *a, **k: {"result": _duplicate_payload()})
+
+    out = tools.a2a_await(
+        {"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5}, SESSION_ID)
+
+    assert out.count("The final answer") == 1, out
+    assert manager.ownership.queued("t1") == []

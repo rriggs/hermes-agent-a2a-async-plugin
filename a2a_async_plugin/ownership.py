@@ -462,12 +462,69 @@ class OwnershipStore:
                                (task_id, message_id, kind, text, created_at)
                            VALUES (?, ?, ?, ?, ?)""",
                         (task_id, message_id, kind or "progress", text or "", now))
+            # One answer, two representations: a peer that repeats its final
+            # text in a Message (history or status) and in the result artifact
+            # must not produce two notifications. §3.7 puts results in
+            # artifacts, so the result is canonical (issue #21).
+            self._coalesce_identical_result_text(con, task_id, str(session_id or ""), now)
             rows = con.execute(
                 """SELECT * FROM a2a_task_messages
                     WHERE task_id=? AND delivered_at IS NULL
                     ORDER BY created_at, message_id""",
                 (task_id,)).fetchall()
             return [dict(r) for r in rows]
+
+    @staticmethod
+    def _coalesce_identical_result_text(con: sqlite3.Connection, task_id: str,
+                                        session_id: str, now: float) -> None:
+        """Deliver one body when a result repeats a peer Message's exact text.
+
+        A2A peers may expose the same final answer as a history/status Message
+        and as the result artifact. §3.7 makes the artifact canonical, so:
+
+        * both pending: the artifact publishes and the Message is marked
+          delivered;
+        * the Message was already delivered: the artifact is marked delivered
+          instead, so completion does not repeat the body;
+        * the artifact was delivered first: a later identical Message is
+          suppressed.
+
+        ``delivered_to_session`` records that the session has the BODY, which
+        it does through the other representation. Equality is exact and scoped
+        to one task; distinct text, other tasks, and other sessions' tasks are
+        untouched.
+        """
+        results = con.execute(
+            """SELECT message_id, text, delivered_at FROM a2a_task_messages
+                WHERE task_id=? AND kind='result'""",
+            (task_id,)).fetchall()
+        for result in results:
+            text = str(result["text"] or "")
+            if not text:
+                continue
+            peers = con.execute(
+                """SELECT message_id, delivered_at FROM a2a_task_messages
+                    WHERE task_id=? AND kind<>'result' AND text=?""",
+                (task_id, text)).fetchall()
+            if not peers:
+                continue
+            if result["delivered_at"] is not None:
+                con.execute(
+                    """UPDATE a2a_task_messages SET delivered_at=?, delivered_to_session=?
+                        WHERE task_id=? AND kind<>'result' AND text=?
+                          AND delivered_at IS NULL""",
+                    (now, session_id, task_id, text))
+            elif any(row["delivered_at"] is not None for row in peers):
+                con.execute(
+                    """UPDATE a2a_task_messages SET delivered_at=?, delivered_to_session=?
+                        WHERE task_id=? AND message_id=? AND delivered_at IS NULL""",
+                    (now, session_id, task_id, result["message_id"]))
+            else:
+                con.execute(
+                    """UPDATE a2a_task_messages SET delivered_at=?, delivered_to_session=?
+                        WHERE task_id=? AND kind<>'result' AND text=?
+                          AND delivered_at IS NULL""",
+                    (now, session_id, task_id, text))
 
     def queued(self, task_id: str) -> list[dict]:
         """Undelivered messages for one task, oldest first."""

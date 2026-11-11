@@ -1046,14 +1046,42 @@ def build_task(
     }
     reply_parts = copy.deepcopy(parts) if parts is not None else ([text_part(agent_text)] if agent_text else [])
     if reply_parts:
-        task["status"]["message"] = text_message(
-            ROLE_AGENT, agent_text, context_id, parts=reply_parts)
         if state == STATE_COMPLETED:
+            # Task outputs belong in artifacts, never in a status Message.
+            # A2A 1.0 §3.7: "Messages SHOULD NOT be used to deliver task
+            # outputs. Results SHOULD BE returned using Artifacts associated
+            # with a Task." Emitting the same parts in both places made every
+            # conformant client see (and deliver) the answer twice.
             task["artifacts"] = [{
                 "artifactId": uuid.uuid4().hex,
-                "parts": copy.deepcopy(reply_parts),
+                "parts": reply_parts,
             }]
+        else:
+            # Non-completed states have no output artifact: a working note, a
+            # clarification request, or a failure reason IS communication.
+            task["status"]["message"] = text_message(
+                ROLE_AGENT, agent_text, context_id, parts=reply_parts)
     return task
+
+
+def task_output_parts(task: dict) -> Optional[list[dict]]:
+    """The parts carrying a task's output: first artifact, else the status message.
+
+    A conformant peer returns results in artifacts. Older peers, and our own
+    emitter before §3.7 was enforced, may have put the answer in
+    ``status.message``; read both so a terminal task still renders.
+    """
+    if not isinstance(task, dict):
+        return None
+    for artifact in task.get("artifacts") or []:
+        if not isinstance(artifact, dict):
+            continue
+        parts = artifact.get("parts")
+        if parts:
+            return parts
+    message = (task.get("status") or {}).get("message") or {}
+    parts = message.get("parts") if isinstance(message, dict) else None
+    return parts or None
 
 
 # --------------------------------------------------------------------------
@@ -1062,11 +1090,19 @@ def build_task(
 
 def status_update(task_id: str, context_id: str, state: str, text: str = "", *,
                   parts: Optional[list[dict]] = None) -> dict:
-    """v1.0 StreamResponse with a statusUpdate member."""
+    """v1.0 StreamResponse with a statusUpdate member.
+
+    A status Message carries communication (progress, clarification, failure),
+    never a completed task's output: §3.7 puts results in artifacts, and a
+    status text repeating the artifact is exactly the duplicate #21 describes.
+    Text for a COMPLETED state is dropped here rather than left to each call
+    site, so no emitter can reintroduce it.
+    """
     status: dict[str, Any] = {"state": state, "timestamp": now_iso()}
-    reply_parts = copy.deepcopy(parts) if parts is not None else ([text_part(text)] if text else [])
-    if reply_parts:
-        status["message"] = text_message(ROLE_AGENT, text, context_id, parts=reply_parts)
+    if state != STATE_COMPLETED:
+        reply_parts = copy.deepcopy(parts) if parts is not None else ([text_part(text)] if text else [])
+        if reply_parts:
+            status["message"] = text_message(ROLE_AGENT, text, context_id, parts=reply_parts)
     return {"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}}
 
 

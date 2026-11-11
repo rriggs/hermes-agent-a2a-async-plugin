@@ -390,6 +390,70 @@ def test_a_refused_backlog_message_stays_queued():
     assert len(ctx.seen) == 1 and "one" in ctx.seen[0]
 
 
+def test_an_identical_result_repeating_a_history_message_queues_once():
+    """Issue #21: one answer, two representations, one delivery (§3.7)."""
+    _task()
+    store = _store()
+
+    queued = store.record_messages(
+        "t1",
+        [("history:0:abc", "progress", "The final answer", False),
+         ("artifact-id:final", "result", "The final answer", True)],
+        session_id=SESSION_A,
+    )
+
+    assert [row["message_id"] for row in queued] == ["artifact-id:final"]
+    assert store.queued("t1")[0]["kind"] == "result"
+
+
+def test_a_result_identical_to_an_already_delivered_history_message_is_not_queued():
+    _task()
+    store = _store()
+    assert store.acquire("t1", SESSION_A)
+    store.record_messages(
+        "t1", [("history:0:abc", "progress", "The final answer", False)],
+        session_id=SESSION_A,
+    )
+    assert store.mark_delivered("t1", ["history:0:abc"], SESSION_A) == 1
+
+    queued = store.record_messages(
+        "t1", [("artifact-id:final", "result", "The final answer", True)],
+        session_id=SESSION_A,
+    )
+
+    assert queued == []
+
+
+def test_distinct_history_and_artifact_text_are_both_delivered():
+    _task()
+    store = _store()
+
+    queued = store.record_messages(
+        "t1",
+        [("history:0:abc", "progress", "halfway there", False),
+         ("artifact-id:final", "result", "the finished answer", True)],
+        session_id=SESSION_A,
+    )
+
+    assert {row["message_id"] for row in queued} == {"history:0:abc", "artifact-id:final"}
+
+
+def test_identical_text_in_another_task_is_not_collapsed():
+    _task("t1")
+    _task("t2")
+    store = _store()
+
+    store.record_messages(
+        "t1", [("history:0:abc", "progress", "same words", False)], session_id=SESSION_A,
+    )
+    queued = store.record_messages(
+        "t2", [("artifact-id:final", "result", "same words", True)], session_id=SESSION_A,
+    )
+
+    assert [row["message_id"] for row in queued] == ["artifact-id:final"]
+    assert [row["message_id"] for row in store.queued("t1")] == ["history:0:abc"]
+
+
 def test_blocking_await_returns_progress_it_consumed(monkeypatch):
     _task()
     monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": "http://peer.invalid"})

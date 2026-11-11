@@ -27,7 +27,7 @@ Current state:
 The plugin manifest declares:
 
 - name: `a2a-async`
-- version: `0.5.0` (0.4.2 plus the #14 outbound-parts feature and the schema-7 to 8 migration)
+- version: `0.5.1` (0.5.0 plus the #21 duplicate-completion fix)
 - kind: `platform`
 - requires Hermes: `>=0.22.2`
 - thirteen tools in the shared `a2a` toolset
@@ -145,8 +145,9 @@ reply remains text-only for compatibility.
 
 Local file parts are restricted to regular non-symlink files and a 20 MiB aggregate raw-byte cap per
 reply. Safe public HTTP(S) URLs are carried as URL file parts. Terminal reply parts are stored in
-`TaskStore.reply_parts` (schema version 8), included in completed task messages/artifacts, and
-preserved across restarts.
+`TaskStore.reply_parts` (schema version 8), returned only as the completed task's artifact, and
+preserved across restarts. A completed task's result is never a status Message (A2A 1.0 §3.7);
+status messages carry progress, clarification, and failure reasons only.
 
 Attachments are assembled at the host delivery boundary, not inside `send()`. The base adapter's
 `_extract_response_content()` strips `MEDIA:` directives and image links before the text send, so
@@ -219,6 +220,38 @@ watcher resolves and passes its parts to `_emit_terminal`, and the already-termi
 `message/stream` now renders the parts carried by the terminal task instead of re-extracting text.
 Four regressions cover already-terminal and live subscriptions with both a `DataPart` and a
 `FilePart`; all four fail on `87b9ae8`.
+
+## Duplicate completion text (Issue #21)
+
+Issue [#21](https://github.com/rriggs/hermes-agent-a2a-async-plugin/issues/21) reported the final
+answer arriving twice: once as a progress note and once as a result. Two distinct mechanisms
+produced it, and both are fixed.
+
+**Emitter (our side).** `protocol.build_task()` put the reply parts in `status.message` AND cloned
+them into `artifacts[0]`, so every completed task exposed its output twice on the wire. A2A 1.0
+§3.7 says messages are not the output channel: "Messages SHOULD NOT be used to deliver task
+outputs. Results SHOULD BE returned using Artifacts associated with a Task." A completed task now
+carries its parts only in the artifact; `status_update()` refuses text for `COMPLETED`;
+`_emit_terminal()` always emits the output as an artifact (falling back to a text part) with a
+state-only status event; and a completed push notification carries `{"task": ...}` instead of a
+status message with the answer. Non-completed states keep their status message: a clarification
+request or a failure reason is communication, not output.
+
+**Receiver (peer side).** A peer may still repeat its final text in history or `status.message`
+and in the result artifact, which is a SHOULD violation a client must tolerate.
+`OwnershipStore.record_messages()` now coalesces exact-text duplicates within one task, in the same
+transaction that records them: when both are pending, the result is delivered and the Message is
+marked delivered; when the Message was already delivered, the artifact is not queued again.
+Distinct text, other tasks, and other sessions' tasks are untouched.
+
+The receiver half also covers our own older emitters and any peer that violates §3.7. Tests assert
+the host-accepted injection count through the real watch path, the blocking `a2a_await` return
+value, and the store's undelivered rows; the pre-fix tree fails twelve of them, including the
+blocking duplicate rendered as `[queued progress] ...` followed by the same text as the result.
+
+Gates on the fixed tree: host **440 passed, 3 skipped**; container **441 passed, 2 skipped** with
+all three `a2a-sdk` interoperability tests; TUI delivery and classic CLI refusal E2Es PASS;
+validate/doctor PASS (13 tools, 3 hooks). Plugin version is `0.5.1`.
 
 ## Verification at merge (2026-11-10)
 

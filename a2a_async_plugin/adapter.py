@@ -1276,7 +1276,8 @@ class A2AAdapter(BasePlatformAdapter):
                 protocol.metrics.tasks_completed += 1
             else:
                 protocol.metrics.tasks_failed += 1
-            self._send_push_notification(task_id, context_id, routed_text, state)
+            self._send_push_notification(task_id, context_id, routed_text, state,
+                                         parts=reply_parts)
             task = (protocol.TaskStore.to_task(stored) if stored else protocol.build_task(
                 task_id, context_id, state, routed_text, created_at=rec["created_iso"],
             ))
@@ -1506,7 +1507,7 @@ class A2AAdapter(BasePlatformAdapter):
             else:
                 protocol.metrics.tasks_failed += 1
 
-            self._send_push_notification(task_id, context_id, reply, state)
+            self._send_push_notification(task_id, context_id, reply, state, parts=reply_parts)
             return state, reply
         finally:
             self._pop_pending(task_id)
@@ -1730,9 +1731,14 @@ class A2AAdapter(BasePlatformAdapter):
         closure signals terminal state, no ``final`` field).
 
         ``req_id`` is threaded into JSON-RPC-wrapped SSE frames per §9.4."""
-        if parts and state == protocol.STATE_COMPLETED:
-            self._sse_write(handler, protocol.sse_data(
-                protocol.artifact_update(task_id, context_id, reply, parts=parts), req_id))
+        if state == protocol.STATE_COMPLETED:
+            # The output travels as an artifact; the status event carries state
+            # only. A text status message here is the §3.7 violation that made
+            # clients deliver the same answer twice (#21).
+            output_parts = parts or ([protocol.text_part(reply)] if (reply or "").strip() else None)
+            if output_parts:
+                self._sse_write(handler, protocol.sse_data(
+                    protocol.artifact_update(task_id, context_id, reply, parts=output_parts), req_id))
             self._sse_write(handler, protocol.sse_data(
                 protocol.status_update(task_id, context_id, state), req_id))
         else:
@@ -1750,14 +1756,16 @@ class A2AAdapter(BasePlatformAdapter):
             terminal, pending = self._prepare_task(params, peer, agent=agent)
             if terminal is not None:
                 # Already-terminal responses (rejected, failed, anti-loop) can
-                # still carry parts; render them instead of re-extracting text.
-                terminal_parts = (
-                    (terminal.get("status", {}).get("message") or {}).get("parts")
+                # still carry text; render it from the artifact when one exists,
+                # else from the status message.
+                terminal_parts = protocol.task_output_parts(terminal)
+                terminal_text = (
+                    protocol.extract_text({"parts": terminal_parts}, task_id=terminal["id"])
+                    if terminal_parts else ""
                 )
                 self._emit_terminal(
                     handler, terminal["id"], terminal["contextId"],
-                    terminal["status"]["state"],
-                    protocol.extract_text(terminal.get("status", {}).get("message", {}) or {}),
+                    terminal["status"]["state"], terminal_text,
                     req_id=req_id, parts=terminal_parts,
                 )
                 return
@@ -1947,7 +1955,8 @@ class A2AAdapter(BasePlatformAdapter):
                 f"push config not found for task: {task_id}")
         return protocol.jsonrpc_result(req_id, {"deleted": True})
 
-    def _send_push_notification(self, task_id: str, context_id: str, reply: str, state: str) -> None:
+    def _send_push_notification(self, task_id: str, context_id: str, reply: str, state: str,
+                                parts: Optional[list[dict]] = None) -> None:
         """POST a v1.0 StreamResponse payload to the task's registered callback.
 
         Validates the callback URL to prevent SSRF — blocks internal/private
@@ -1968,7 +1977,13 @@ class A2AAdapter(BasePlatformAdapter):
             return
 
         # Push payload uses the StreamResponse format (same as streaming).
-        payload = protocol.status_update(task_id, context_id, state, (reply or "")[:2000])
+        # A completed task's output is not a Message (§3.7), so a completed
+        # notification carries the Task itself, which includes its artifacts.
+        if state == protocol.STATE_COMPLETED:
+            payload = {"task": protocol.build_task(
+                task_id, context_id, state, reply or "", parts=parts)}
+        else:
+            payload = protocol.status_update(task_id, context_id, state, (reply or "")[:2000])
 
         headers = {"Content-Type": "application/json"}
 

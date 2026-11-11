@@ -757,7 +757,8 @@ class WatchStore:
                 marks = ",".join("?" for _ in ids)
                 rows = con.execute(
                     f"""SELECT message_id, text, delivered_at FROM a2a_task_messages
-                         WHERE task_id=? AND message_id IN ({marks})""",
+                         WHERE task_id=? AND message_id IN ({marks})
+                           AND delivered_at IS NULL AND suppressed_at IS NULL""",
                     (task_id, *ids)).fetchall()
                 undelivered = {r["message_id"]: str(r["text"] or "")
                                for r in rows if r["delivered_at"] is None}
@@ -1510,14 +1511,20 @@ class WatchManager:
 
     @staticmethod
     def _message_already_delivered(con: sqlite3.Connection, meta: dict) -> bool:
-        """True when the outbox row's durable message was already accepted by another path."""
+        """True when the outbox row's durable message is already settled.
+
+        Settled means delivered to a session, or suppressed because an equivalent
+        artifact carries the same body (§3.7, #21). A suppressed row must not be
+        published: it is the duplicate half, not a missing one.
+        """
         task_id = str(meta.get("task_id") or "")
         message_id = str(meta.get("message_id") or "")
         if not task_id or not message_id:
             return False
         row = con.execute(
             """SELECT 1 FROM a2a_task_messages
-                WHERE task_id=? AND message_id=? AND delivered_at IS NOT NULL""",
+                WHERE task_id=? AND message_id=?
+                  AND (delivered_at IS NOT NULL OR suppressed_at IS NOT NULL)""",
             (task_id, message_id)).fetchone()
         return row is not None
 
@@ -1667,8 +1674,9 @@ class WatchManager:
                 and not self.ownership.has_kind(task_id, "result")):
             entries.append((f"state:{raw_state}", "result",
                             f"task reached {_short_state(raw_state)} with no text reply", False))
-        return self.ownership.record_messages(task_id, entries, session_id=session_id,
-                                              state=state, reply=reply)
+        return self.ownership.record_messages(
+            task_id, entries, session_id=session_id, state=state, reply=reply,
+            terminal=raw_state in protocol.TERMINAL_STATES)
 
     def _note_peer_failure(self, peer: str, now: float) -> None:
         """Back off a peer after a failed reconciliation attempt (60s doubling, capped at 1h)."""

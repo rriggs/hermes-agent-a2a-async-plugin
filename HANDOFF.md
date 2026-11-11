@@ -27,7 +27,7 @@ Current state:
 The plugin manifest declares:
 
 - name: `a2a-async`
-- version: `0.5.0` (0.4.2 plus the #14 outbound-parts feature and the schema-7 to 8 migration)
+- version: `0.5.1` (0.5.0 plus the #21 duplicate-completion fix and the schema-8 to 10 message-table migrations)
 - kind: `platform`
 - requires Hermes: `>=0.22.2`
 - thirteen tools in the shared `a2a` toolset
@@ -145,8 +145,9 @@ reply remains text-only for compatibility.
 
 Local file parts are restricted to regular non-symlink files and a 20 MiB aggregate raw-byte cap per
 reply. Safe public HTTP(S) URLs are carried as URL file parts. Terminal reply parts are stored in
-`TaskStore.reply_parts` (schema version 8), included in completed task messages/artifacts, and
-preserved across restarts.
+`TaskStore.reply_parts` (schema version 8), returned only as the completed task's artifact, and
+preserved across restarts. A completed task's result is never a status Message (A2A 1.0 §3.7);
+status messages carry progress, clarification, and failure reasons only.
 
 Attachments are assembled at the host delivery boundary, not inside `send()`. The base adapter's
 `_extract_response_content()` strips `MEDIA:` directives and image links before the text send, so
@@ -219,6 +220,63 @@ watcher resolves and passes its parts to `_emit_terminal`, and the already-termi
 `message/stream` now renders the parts carried by the terminal task instead of re-extracting text.
 Four regressions cover already-terminal and live subscriptions with both a `DataPart` and a
 `FilePart`; all four fail on `87b9ae8`.
+
+## Duplicate completion text (Issue #21)
+
+Issue [#21](https://github.com/rriggs/hermes-agent-a2a-async-plugin/issues/21) reported the final
+answer arriving twice: once as a progress note and once as a result. Two distinct mechanisms
+produced it, and both are fixed.
+
+**Emitter (our side).** `protocol.build_task()` put the reply parts in `status.message` AND cloned
+them into `artifacts[0]`, so every completed task exposed its output twice on the wire. A2A 1.0
+§3.7 says messages are not the output channel: "Messages SHOULD NOT be used to deliver task
+outputs. Results SHOULD BE returned using Artifacts associated with a Task." A completed task now
+carries its parts only in the artifact; `status_update()` refuses text for `COMPLETED`;
+`_emit_terminal()` always emits the output as an artifact (falling back to a text part) with a
+state-only status event; and a completed push notification carries `{"task": ...}` instead of a
+status message with the answer. Non-completed states keep their status message: a clarification
+request or a failure reason is communication, not output.
+
+**Receiver (peer side).** A peer may still repeat its final text in history or `status.message`
+and in the result artifact, which is a SHOULD violation a client must tolerate.
+`OwnershipStore.record_messages()` and `reconcile_observation()` coalesce exact-text duplicates
+within one task in the same transaction that records them. The duplicate half is marked
+`suppressed_at` (schema 9), which is deliberately NOT `delivered_at`: suppression retires a row
+from delivery without claiming the host accepted it. When both are pending the Message is
+suppressed and the artifact stays queued, so a refused artifact survives re-observation and is
+delivered when the host recovers (review round 3, P1). Suppression is scoped to the delivery
+session: only an acknowledgement from the session being recorded counts, so a previous owner's
+delivered history cannot swallow the adopter's never-delivered result (round 4, P1). Coalescing
+runs only at the terminal observation, because a working artifact is mutable and unpublished;
+suppressing progress against it loses text the final revision no longer repeats (round 4, P2).
+The sweep/adoption path shares the coalescer, so a reconciled backlog delivers one copy rather
+than two (round 4, P2). Suppression records the session whose delivery justified it
+(`suppressed_for_session`, schema 10) and distinguishes it from representation-level
+suppression, which has no session. On `acquire` and `transfer_many`, suppression justified by
+another session is cleared inside the ownership transaction, so adoption and backlog replay
+before any poll receive a body that was never delivered (round 5, P1); canonical duplicate
+suppression stays in force so adoption cannot resurrect a progress copy beside its artifact.
+Suppressed rows are excluded from `queued()`, from `publish_if_owned`, and from the outbox
+flush, which retires any pre-enqueued copy. Distinct text, other tasks, and other sessions'
+tasks are untouched.
+
+The receiver half also covers our own older emitters and any peer that violates §3.7. Tests assert
+the host-accepted injection count through the real watch path, the blocking `a2a_await` return
+value, and the store's undelivered rows; the pre-fix tree fails twelve of them, including the
+blocking duplicate rendered as `[queued progress] ...` followed by the same text as the result.
+Review round 3 added the refusal case: the host refuses the artifact, the payload is observed
+again, and the result must still be queued and delivered on recovery. That regression fails on
+`d47afe4`, where suppression had consumed the undelivered answer. Review round 4 added three
+boundaries: ownership transfer must not let the old owner's acknowledgement suppress the adopter's
+result, a working artifact must not permanently suppress progress, and reconciliation must coalesce
+so adoption delivers one copy. All six fail on `d844152`. Review round 5 added the remaining
+timing boundary: suppression created by A's delivered history must be reevaluated when B adopts
+after the terminal observation. The adoption/transfer regressions fail on `ff26fa5` with the
+adopter receiving zero messages.
+
+Gates on the fixed tree: host **454 passed, 3 skipped**; container **455 passed, 2 skipped** with
+all three `a2a-sdk` interoperability tests; TUI delivery and classic CLI refusal E2Es PASS;
+validate/doctor PASS (13 tools, 3 hooks). Plugin version is `0.5.1`, task schema is 10.
 
 ## Verification at merge (2026-11-10)
 

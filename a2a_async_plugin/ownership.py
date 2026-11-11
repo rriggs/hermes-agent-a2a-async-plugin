@@ -162,7 +162,34 @@ class OwnershipStore:
                                                       ELSE released_by_session_id END
                     WHERE task_id=? AND (owner_session_id='' OR owner_session_id=?)""",
                 (session_id, now, session_id, task_id, session_id))
+            if cur.rowcount == 1:
+                self._clear_foreign_suppression(con, [task_id], session_id)
             return cur.rowcount == 1
+
+    @staticmethod
+    def _clear_foreign_suppression(con: sqlite3.Connection, task_ids: Iterable[str],
+                                   session_id: str) -> None:
+        """Reevaluate suppression that was justified by a DIFFERENT session's delivery.
+
+        ``suppressed_for_session`` names the session whose delivered row covered the
+        suppressed one. That justification does not transfer with ownership: an adopter
+        never received the body. Clearing these marks inside the adoption transaction means
+        the backlog replay (which runs before any poll) sees them. Canonical duplicate
+        suppression (``suppressed_for_session=''``) is representation-level and stays in
+        force, so adoption cannot resurrect a progress copy beside its artifact, and a
+        session re-acquiring its own task keeps its own covered rows suppressed.
+        """
+        ids = [task_id for task_id in task_ids if task_id]
+        if not ids or not session_id:
+            return
+        marks = ",".join("?" for _ in ids)
+        con.execute(
+            f"""UPDATE a2a_task_messages
+                   SET suppressed_at=NULL, suppressed_for_session=''
+                 WHERE task_id IN ({marks}) AND suppressed_at IS NOT NULL
+                   AND delivered_at IS NULL
+                   AND suppressed_for_session NOT IN ('', ?)""",
+            (*ids, session_id))
 
     def release(self, task_id: str, session_id: str, now: Optional[float] = None) -> bool:
         """Give up ownership; the task becomes adoptable by any session."""
@@ -287,6 +314,9 @@ class OwnershipStore:
                           released_by_session_id=''
                     WHERE task_id IN ({marks})""",
                 (to_session, now, *ids))
+            # The receiving session has not seen anything the previous owner's
+            # deliveries covered; reevaluate those suppressions before its replay.
+            self._clear_foreign_suppression(con, ids, to_session)
             dropped: dict[str, set[str]] = {}
             for task_id in ids:
                 dropped.update(self._drop_publications(con, task_id))
@@ -394,7 +424,9 @@ class OwnershipStore:
                            kind=excluded.kind,
                            text=excluded.text,
                            delivered_at=NULL,
-                           delivered_to_session=''
+                           delivered_to_session='',
+                           suppressed_at=NULL,
+                           suppressed_for_session=''
                        WHERE a2a_task_messages.text <> excluded.text
                           OR a2a_task_messages.kind <> excluded.kind""",
                     (task_id, message_id, kind or "progress", text or "", now))
@@ -410,7 +442,8 @@ class OwnershipStore:
                         messages: Iterable[tuple[str, str, str, bool]],
                         *, session_id: str = "",
                         require_owner: bool = False,
-                        state: str = "", reply: str = "") -> Optional[list[dict]]:
+                        state: str = "", reply: str = "",
+                        terminal: bool = False) -> Optional[list[dict]]:
         """Apply one observation's message upserts under the ownership write lock.
 
         ``messages`` is ``(message_id, kind, text, update_existing)`` per peer message. Recording
@@ -452,7 +485,9 @@ class OwnershipStore:
                                kind=excluded.kind,
                                text=excluded.text,
                                delivered_at=NULL,
-                               delivered_to_session=''
+                               delivered_to_session='',
+                               suppressed_at=NULL,
+                               suppressed_for_session=''
                            WHERE a2a_task_messages.text <> excluded.text
                               OR a2a_task_messages.kind <> excluded.kind""",
                         (task_id, message_id, kind or "progress", text or "", now))
@@ -462,19 +497,94 @@ class OwnershipStore:
                                (task_id, message_id, kind, text, created_at)
                            VALUES (?, ?, ?, ?, ?)""",
                         (task_id, message_id, kind or "progress", text or "", now))
+            # One answer, two representations: a peer that repeats its final
+            # text in a Message (history or status) and in the result artifact
+            # must not produce two notifications. §3.7 puts results in
+            # artifacts, so the result is canonical (issue #21). Only the
+            # terminal observation is a final deliverable: a working artifact is
+            # mutable and unpublished, so suppressing progress against it would
+            # lose a note the final revision no longer repeats.
+            if terminal:
+                self._coalesce_identical_result_text(con, task_id, str(session_id or ""), now)
             rows = con.execute(
                 """SELECT * FROM a2a_task_messages
-                    WHERE task_id=? AND delivered_at IS NULL
+                    WHERE task_id=? AND delivered_at IS NULL AND suppressed_at IS NULL
                     ORDER BY created_at, message_id""",
                 (task_id,)).fetchall()
             return [dict(r) for r in rows]
+
+    @staticmethod
+    def _coalesce_identical_result_text(con: sqlite3.Connection, task_id: str,
+                                        session_id: str, now: float) -> None:
+        """Retire the duplicate representation without claiming it was delivered.
+
+        A2A peers may expose the same final answer as a history/status Message
+        and as the result artifact. §3.7 makes the artifact canonical, so:
+
+        * both pending: the Message is SUPPRESSED (``suppressed_at``) and the
+          artifact stays queued. Suppression is not acknowledgement: if the
+          host refuses the artifact, it remains deliverable, which a synthetic
+          ``delivered_at`` mark would have hidden (review round 3, P1);
+        * a Message was delivered to the SAME session: the artifact is
+          suppressed instead, so completion does not repeat a body the session
+          already has;
+        * the artifact was delivered to the same session first: a later
+          identical Message is suppressed.
+
+        Only an acknowledgement from the session being recorded counts. A
+        previous owner's delivered row must not suppress the new owner's
+        result after adoption (review round 4, P1). Equality is exact and
+        scoped to one task; distinct text, other tasks, and other sessions'
+        tasks are untouched. A suppressed row is excluded from ``queued()`` and
+        from both delivery paths.
+        """
+        def own(row) -> bool:
+            return (row["delivered_at"] is not None
+                    and str(row["delivered_to_session"] or "") == session_id)
+
+        results = con.execute(
+            """SELECT message_id, text, delivered_at, delivered_to_session, suppressed_at
+                 FROM a2a_task_messages
+                WHERE task_id=? AND kind='result'""",
+            (task_id,)).fetchall()
+        for result in results:
+            text = str(result["text"] or "")
+            if not text or result["suppressed_at"] is not None:
+                continue
+            peers = con.execute(
+                """SELECT message_id, delivered_at, delivered_to_session, suppressed_at
+                     FROM a2a_task_messages
+                    WHERE task_id=? AND kind<>'result' AND text=?""",
+                (task_id, text)).fetchall()
+            live = [row for row in peers if row["suppressed_at"] is None]
+            if not live:
+                continue
+            pending = [row["message_id"] for row in live if row["delivered_at"] is None]
+            if result["delivered_at"] is not None:
+                # This session already has the body via the artifact.
+                suppress = pending if own(result) else []
+                covered = bool(suppress)
+            elif any(own(row) for row in live):
+                # This session already has the body via the Message.
+                suppress = [result["message_id"]]
+                covered = True
+            else:
+                # Both are pending for this session: the artifact is canonical.
+                # This suppression is representation-level, not tied to a session.
+                suppress = pending
+                covered = False
+            for message_id in suppress:
+                con.execute(
+                    """UPDATE a2a_task_messages SET suppressed_at=?, suppressed_for_session=?
+                        WHERE task_id=? AND message_id=? AND suppressed_at IS NULL""",
+                    (now, session_id if covered else "", task_id, message_id))
 
     def queued(self, task_id: str) -> list[dict]:
         """Undelivered messages for one task, oldest first."""
         with self._session() as con:
             rows = con.execute(
                 """SELECT * FROM a2a_task_messages
-                    WHERE task_id=? AND delivered_at IS NULL
+                    WHERE task_id=? AND delivered_at IS NULL AND suppressed_at IS NULL
                     ORDER BY created_at, message_id""",
                 (task_id,)).fetchall()
         return [dict(r) for r in rows]
@@ -575,6 +685,7 @@ class OwnershipStore:
                 con.execute(
                     """UPDATE a2a_task_messages SET delivered_at=?, delivered_to_session=?
                         WHERE task_id=? AND message_id=? AND delivered_at IS NULL
+                          AND suppressed_at IS NULL
                           AND EXISTS (SELECT 1 FROM a2a_tasks
                                        WHERE task_id=? AND owner_session_id=?)""",
                     (now, session_id, task_id, message_id, task_id, session_id))
@@ -591,7 +702,8 @@ class OwnershipStore:
             cur = con.execute(
                 f"""UPDATE a2a_task_messages
                        SET delivered_to_session=?, delivered_at=?
-                     WHERE task_id=? AND message_id IN ({marks}) AND delivered_at IS NULL""",
+                     WHERE task_id=? AND message_id IN ({marks}) AND delivered_at IS NULL
+                       AND suppressed_at IS NULL""",
                 (session_id, now, task_id, *ids))
             return cur.rowcount
 
@@ -759,7 +871,9 @@ class OwnershipStore:
                                kind=excluded.kind,
                                text=excluded.text,
                                delivered_at=NULL,
-                               delivered_to_session=''
+                               delivered_to_session='',
+                               suppressed_at=NULL,
+                               suppressed_for_session=''
                            WHERE a2a_task_messages.text <> excluded.text
                               OR a2a_task_messages.kind <> excluded.kind""",
                         (task_id, message_id, kind or "progress", text or "", now))
@@ -769,6 +883,13 @@ class OwnershipStore:
                                (task_id, message_id, kind, text, created_at)
                            VALUES (?, ?, ?, ?, ?)""",
                         (task_id, message_id, kind or "progress", text or "", now))
+            # Reconciliation is the second observation path (sweep/adoption): a
+            # recovered terminal task must coalesce here too, or its backlog
+            # delivers the history copy and the artifact copy as two callbacks.
+            # The task is unowned while this runs, so no session's acknowledgement
+            # applies; the artifact stays queued for the adopter.
+            if terminal:
+                self._coalesce_identical_result_text(con, task_id, "", now)
             return True
 
     def mark_reconciled(self, task_id: str, now: Optional[float] = None,

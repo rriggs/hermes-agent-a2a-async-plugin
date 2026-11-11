@@ -390,6 +390,98 @@ def test_a_refused_backlog_message_stays_queued():
     assert len(ctx.seen) == 1 and "one" in ctx.seen[0]
 
 
+def test_an_identical_result_repeating_a_history_message_queues_once():
+    """Issue #21: one answer, two representations, one delivery (§3.7)."""
+    _task()
+    store = _store()
+
+    queued = store.record_messages(
+        "t1",
+        [("history:0:abc", "progress", "The final answer", False),
+         ("artifact-id:final", "result", "The final answer", True)],
+        session_id=SESSION_A, terminal=True,
+    )
+
+    assert [row["message_id"] for row in queued] == ["artifact-id:final"]
+    with sqlite3.connect(str(Path(store.db_path))) as con:
+        history = con.execute(
+            "SELECT delivered_at, suppressed_at FROM a2a_task_messages"
+            " WHERE task_id='t1' AND message_id='history:0:abc'").fetchone()
+    assert history is not None
+    assert history[0] is None, "suppression must not claim host acceptance"
+    assert history[1] is not None
+
+
+def test_a_suppressed_duplicate_leaves_the_result_deliverable():
+    """P1: a refused artifact must survive re-observation of the same payload.
+
+    Suppressing the history Message used to mark it delivered; the next
+    observation then treated that synthetic mark as proof and consumed the
+    still-pending artifact, losing the answer.
+    """
+    _task()
+    store = _store()
+    entries = [("history:0:abc", "progress", "The final answer", False),
+               ("artifact-id:final", "result", "The final answer", True)]
+
+    assert [row["message_id"] for row in store.record_messages(
+        "t1", entries, session_id=SESSION_A, terminal=True)] == ["artifact-id:final"]
+    # The host refused the artifact, so nothing was acknowledged. A second
+    # observation of the same terminal payload must still offer it.
+    assert [row["message_id"] for row in store.record_messages(
+        "t1", entries, session_id=SESSION_A, terminal=True)] == ["artifact-id:final"]
+    assert [row["message_id"] for row in store.queued("t1")] == ["artifact-id:final"]
+
+
+def test_a_result_identical_to_an_already_delivered_history_message_is_not_queued():
+    _task()
+    store = _store()
+    assert store.acquire("t1", SESSION_A)
+    store.record_messages(
+        "t1", [("history:0:abc", "progress", "The final answer", False)],
+        session_id=SESSION_A,
+    )
+    assert store.mark_delivered("t1", ["history:0:abc"], SESSION_A) == 1
+
+    queued = store.record_messages(
+        "t1", [("artifact-id:final", "result", "The final answer", True)],
+        session_id=SESSION_A, terminal=True,
+    )
+
+    assert queued == []
+    assert store.queued("t1") == []
+
+
+def test_distinct_history_and_artifact_text_are_both_delivered():
+    _task()
+    store = _store()
+
+    queued = store.record_messages(
+        "t1",
+        [("history:0:abc", "progress", "halfway there", False),
+         ("artifact-id:final", "result", "the finished answer", True)],
+        session_id=SESSION_A,
+    )
+
+    assert {row["message_id"] for row in queued} == {"history:0:abc", "artifact-id:final"}
+
+
+def test_identical_text_in_another_task_is_not_collapsed():
+    _task("t1")
+    _task("t2")
+    store = _store()
+
+    store.record_messages(
+        "t1", [("history:0:abc", "progress", "same words", False)], session_id=SESSION_A,
+    )
+    queued = store.record_messages(
+        "t2", [("artifact-id:final", "result", "same words", True)], session_id=SESSION_A,
+    )
+
+    assert [row["message_id"] for row in queued] == ["artifact-id:final"]
+    assert [row["message_id"] for row in store.queued("t1")] == ["history:0:abc"]
+
+
 def test_blocking_await_returns_progress_it_consumed(monkeypatch):
     _task()
     monkeypatch.setattr(tools, "_resolve_peer", lambda name: {"url": "http://peer.invalid"})
@@ -970,3 +1062,131 @@ def test_abandon_with_expected_state_keeps_a_recovered_answer():
     row = protocol.TaskStore().get("t1")
     assert row["state"] == protocol.STATE_COMPLETED
     assert row["reply"] == "the answer"
+
+
+def test_another_sessions_acknowledgement_does_not_suppress_the_new_result():
+    """P1: delivered marks are per delivery session, not global suppression proof."""
+    _task()
+    store = _store()
+    assert store.acquire("t1", SESSION_A)
+    store.record_messages(
+        "t1", [("history:0:abc", "progress", "The final answer", False)],
+        session_id=SESSION_A,
+    )
+    assert store.mark_delivered("t1", ["history:0:abc"], SESSION_A) == 1
+    assert store.release("t1", SESSION_A)
+
+    queued = store.record_messages(
+        "t1", [("artifact-id:final", "result", "The final answer", True)],
+        session_id=SESSION_B, terminal=True,
+    )
+
+    assert [row["message_id"] for row in queued] == ["artifact-id:final"], (
+        "the adopter's never-delivered result was suppressed by the old owner's ack"
+    )
+
+
+def test_a_working_artifact_does_not_suppress_distinct_progress():
+    """P2: a mutable, unpublished working artifact is not a final deliverable."""
+    _task()
+    store = _store()
+
+    queued = store.record_messages(
+        "t1",
+        [("history:0:abc", "progress", "checkpoint ready", False),
+         ("artifact-id:final", "result", "checkpoint ready", True)],
+        session_id=SESSION_A, terminal=False,
+    )
+    assert {row["message_id"] for row in queued} == {"history:0:abc", "artifact-id:final"}
+
+    queued = store.record_messages(
+        "t1", [("artifact-id:final", "result", "finished answer", True)],
+        session_id=SESSION_A, terminal=True,
+    )
+    assert {row["message_id"] for row in queued} == {"history:0:abc", "artifact-id:final"}
+    with sqlite3.connect(str(Path(store.db_path))) as con:
+        suppressed = con.execute(
+            "SELECT suppressed_at FROM a2a_task_messages"
+            " WHERE task_id='t1' AND message_id='history:0:abc'").fetchone()[0]
+    assert suppressed is None
+
+
+def test_reconciliation_coalesces_a_recovered_terminal_backlog():
+    """P2: the sweep/adoption path must share the coalescer."""
+    _task()
+    store = _store()
+    payload = {"id": "t1", "contextId": "ctx-1",
+               "status": {"state": protocol.STATE_COMPLETED},
+               "history": [{"role": "ROLE_AGENT", "parts": [{"text": "The final answer"}]}],
+               "artifacts": [{"artifactId": "final", "parts": [{"text": "The final answer"}]}]}
+
+    assert store.reconcile_observation(
+        "t1", protocol.STATE_COMPLETED, reply="The final answer",
+        messages=tools._observation_messages(payload, protocol.STATE_COMPLETED,
+                                             input_artifact_kind=True))
+
+    assert [row["message_id"] for row in store.queued("t1")] == ["artifact-id:final"]
+
+
+def _covered_result_setup(store):
+    """A delivered history Message covers a never-delivered identical artifact."""
+    assert store.acquire("t1", SESSION_A)
+    store.record_messages(
+        "t1", [("history:0:abc", "progress", "The final answer", False)],
+        session_id=SESSION_A,
+    )
+    assert store.mark_delivered("t1", ["history:0:abc"], SESSION_A) == 1
+    queued = store.record_messages(
+        "t1", [("artifact-id:final", "result", "The final answer", True)],
+        session_id=SESSION_A, terminal=True,
+    )
+    assert queued == [], "the artifact is covered by this session's delivered history"
+    with sqlite3.connect(str(Path(store.db_path))) as con:
+        row = con.execute(
+            "SELECT delivered_at, suppressed_at, suppressed_for_session"
+            " FROM a2a_task_messages WHERE task_id='t1'"
+            " AND message_id='artifact-id:final'").fetchone()
+    assert row[0] is None and row[1] is not None and row[2] == SESSION_A
+
+
+def test_adoption_reevaluates_suppression_created_for_the_previous_owner():
+    """P1: the artifact was never delivered; the adopter must receive it."""
+    _task()
+    store = _store()
+    _covered_result_setup(store)
+    assert store.release("t1", SESSION_A)
+
+    assert store.acquire("t1", SESSION_B)
+    assert [row["message_id"] for row in store.queued("t1")] == ["artifact-id:final"]
+
+
+def test_transfer_reevaluates_suppression_created_for_the_previous_owner():
+    _task()
+    store = _store()
+    _covered_result_setup(store)
+
+    transferred, refused, _stopped, _dropped = store.transfer_many(
+        ["t1"], SESSION_A, SESSION_B)
+
+    assert transferred == ["t1"] and refused == []
+    assert [row["message_id"] for row in store.queued("t1")] == ["artifact-id:final"]
+
+
+def test_adoption_keeps_canonical_progress_suppression():
+    """Canonical duplicate suppression is representation-level, not per session."""
+    _task()
+    store = _store()
+    assert store.acquire("t1", SESSION_A)
+    queued = store.record_messages(
+        "t1",
+        [("history:0:abc", "progress", "The final answer", False),
+         ("artifact-id:final", "result", "The final answer", True)],
+        session_id=SESSION_A, terminal=True,
+    )
+    assert [row["message_id"] for row in queued] == ["artifact-id:final"]
+    assert store.release("t1", SESSION_A)
+
+    assert store.acquire("t1", SESSION_B)
+    assert [row["message_id"] for row in store.queued("t1")] == ["artifact-id:final"], (
+        "adoption resurrected the progress copy beside its artifact"
+    )

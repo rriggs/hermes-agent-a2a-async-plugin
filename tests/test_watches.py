@@ -2409,3 +2409,230 @@ def test_reconciliation_backoff_skips_remaining_rows_for_the_same_peer(monkeypat
     manager._reconcile_outbound(time.time())
 
     assert len(calls) == 1, f"backed-off peer retried {len(calls)} times in one batch"
+
+
+# ── issue #21: one answer, two representations, one delivery ────────────────
+
+def _duplicate_payload(state=protocol.STATE_COMPLETED, text="The final answer",
+                       task_id="t1"):
+    """The payload from issue #21: peer history and result artifact, same text."""
+    return {"id": task_id, "contextId": "ctx-1", "status": {"state": state},
+            "history": [{"role": "ROLE_AGENT", "parts": [{"text": text}]}],
+            "artifacts": [{"artifactId": "final", "parts": [{"text": text}]}]}
+
+
+def test_a_history_message_repeating_the_artifact_injects_once():
+    ctx = FakeCtx()
+    manager = _manager(ScriptedPoll(_duplicate_payload()), ctx=ctx)
+    _add(manager)
+
+    assert manager.run_once(now=100.0) == 1
+
+    [injected] = ctx.injected
+    assert injected["content"].count("The final answer") == 1
+    assert "returned a result" in injected["content"]
+
+
+def test_a_status_message_repeating_the_artifact_injects_once():
+    payload = {"id": "t1", "contextId": "ctx-1",
+               "status": {"state": protocol.STATE_COMPLETED,
+                          "message": {"role": "ROLE_AGENT",
+                                      "parts": [{"text": "The final answer"}]}},
+               "artifacts": [{"artifactId": "final",
+                              "parts": [{"text": "The final answer"}]}]}
+    ctx = FakeCtx()
+    manager = _manager(ScriptedPoll(payload), ctx=ctx)
+    _add(manager)
+
+    manager.run_once(now=100.0)
+
+    assert len(ctx.injected) == 1
+
+
+def test_completion_after_the_history_text_was_delivered_injects_nothing_new():
+    ctx = FakeCtx()
+    manager = _manager(ScriptedPoll(
+        {"id": "t1", "contextId": "ctx-1", "status": {"state": protocol.STATE_WORKING},
+         "history": [{"role": "ROLE_AGENT", "parts": [{"text": "The final answer"}]}]},
+        _duplicate_payload(),
+    ), ctx=ctx)
+    _add(manager)
+
+    assert manager.run_once(now=100.0) == 1
+    assert len(ctx.injected) == 1
+    manager.run_once(now=200.0)
+
+    assert len(ctx.injected) == 1, [m["content"] for m in ctx.injected]
+
+
+def test_re_observing_the_duplicate_terminal_payload_injects_once():
+    ctx = FakeCtx()
+    manager = _manager(ScriptedPoll(_duplicate_payload()), ctx=ctx)
+    _add(manager)
+
+    manager.run_once(now=100.0)
+    manager.run_once(now=200.0)
+
+    assert len(ctx.injected) == 1
+
+
+def test_a_blocking_await_delivers_an_identical_history_and_artifact_once(monkeypatch):
+    """Blocking mode returns the backlog; a repeated history line would appear twice."""
+    ctx = FakeCtx()
+    monkeypatch.setattr(tools, "_CTX", ctx)
+    protocol.TaskStore().create("t1", "ctx-1", "peer", direction="outbound",
+                                remote_state=protocol.STATE_WORKING)
+    manager = _manager(ScriptedPoll(_duplicate_payload()))
+    assert manager.ownership.acquire("t1", SESSION_ID)
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+    monkeypatch.setattr(tools, "_rpc_request", lambda *a, **k: {"result": _duplicate_payload()})
+
+    out = tools.a2a_await(
+        {"agent": "peer", "task_id": "t1", "interval": 1, "timeout": 5}, SESSION_ID)
+
+    assert out.count("The final answer") == 1, out
+    assert manager.ownership.queued("t1") == []
+
+
+class _CountingCtx(FakeCtx):
+    """FakeCtx that separates offered calls from host-accepted deliveries."""
+
+    def __init__(self):
+        super().__init__()
+        self.accepted: list[str] = []
+
+    def inject_message(self, content, role="user", session_key=None, origin=None):
+        ok = super().inject_message(content, role=role, session_key=session_key, origin=origin)
+        if ok:
+            self.accepted.append(content)
+        return ok
+
+
+def test_a_refused_completion_is_still_delivered_after_the_host_recovers():
+    """P1: suppression of the duplicate must not count as host acceptance."""
+    ctx = _CountingCtx()
+    ctx.accept = False
+    manager = _manager(ScriptedPoll(_duplicate_payload()), ctx=ctx)
+    _add(manager)
+
+    manager.run_once(now=100.0)
+    assert ctx.accepted == []
+    assert [m["message_id"] for m in manager.ownership.queued("t1")] == ["artifact-id:final"]
+
+    # A fresh observation of the same terminal payload (another watch, a re-await).
+    tools._record_observation("t1", _duplicate_payload(), "peer", SESSION_ID)
+    assert [m["message_id"] for m in manager.ownership.queued("t1")] == ["artifact-id:final"], (
+        "re-observation consumed the result that was never delivered"
+    )
+
+    ctx.accept = True
+    manager.run_once(now=200.0)
+
+    assert len(ctx.accepted) == 1, [c[:80] for c in ctx.accepted]
+    assert "returned a result" in ctx.accepted[0]
+    assert manager.ownership.queued("t1") == []
+
+
+def test_a_pending_progress_notice_is_retired_when_the_result_covers_it():
+    """A queued progress copy must not slip out after the artifact supersedes it."""
+    ctx = _CountingCtx()
+    ctx.accept = False
+    manager = _manager(ScriptedPoll(
+        {"id": "t1", "contextId": "ctx-1", "status": {"state": protocol.STATE_WORKING},
+         "history": [{"role": "ROLE_AGENT", "parts": [{"text": "The final answer"}]}]},
+        _duplicate_payload(),
+    ), ctx=ctx)
+    _add(manager)
+
+    manager.run_once(now=100.0)
+    assert ctx.accepted == []
+    manager.run_once(now=200.0)
+    ctx.accept = True
+    manager.run_once(now=300.0)
+
+    assert len(ctx.accepted) == 1, [c[:80] for c in ctx.accepted]
+    assert "returned a result" in ctx.accepted[0]
+
+
+def test_a_new_owner_receives_a_result_not_delivered_to_its_predecessor():
+    """P1: the old owner's acknowledgement must not swallow the adopter's answer."""
+    ctx = _CountingCtx()
+    working = _duplicate_payload(state=protocol.STATE_WORKING)
+    del working["artifacts"]
+    manager = _manager(ScriptedPoll(working, _duplicate_payload()), ctx=ctx)
+    _add(manager)
+
+    manager.run_once(now=100.0)
+    assert len(ctx.accepted) == 1
+    assert manager.ownership.release("t1", SESSION_ID)
+
+    newctx = _CountingCtx()
+    successor = _manager(ScriptedPoll(_duplicate_payload()), ctx=newctx)
+    successor.add(session_id="sess-new",
+                  target={"session_key": "agent:main:telegram:dm:43"},
+                  tasks=[("peer", "t1")])
+    successor.run_once(now=200.0)
+
+    assert len(newctx.accepted) == 1, [c[:80] for c in newctx.accepted]
+
+
+def test_a_working_artifact_does_not_swallow_distinct_progress():
+    """P2: progress must survive a working artifact whose final text changes."""
+    ctx = _CountingCtx()
+    working = _duplicate_payload(state=protocol.STATE_WORKING, text="checkpoint ready")
+    final = _duplicate_payload(text="finished answer")
+    final["history"] = working["history"]
+    manager = _manager(ScriptedPoll(working, final), ctx=ctx)
+    _add(manager)
+
+    manager.run_once(now=100.0)
+    assert any("checkpoint ready" in text for text in ctx.accepted), "progress lost"
+    manager.run_once(now=200.0)
+    assert any("finished answer" in text for text in ctx.accepted)
+
+
+def test_reconciled_duplicates_deliver_once_on_background_adoption(monkeypatch):
+    """P2: adoption must not replay both representations of one answer."""
+    ctx = _CountingCtx()
+    manager = _manager(ScriptedPoll(_duplicate_payload()), ctx=ctx)
+    protocol.TaskStore().create("t1", "ctx-1", "peer", direction="outbound",
+                                remote_state=protocol.STATE_WORKING)
+    payload = _duplicate_payload()
+    assert manager.ownership.reconcile_observation(
+        "t1", protocol.STATE_COMPLETED, reply="The final answer",
+        messages=tools._observation_messages(payload, protocol.STATE_COMPLETED,
+                                             input_artifact_kind=True))
+    monkeypatch.setattr(tools, "_CTX", ctx)
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+    monkeypatch.setattr(tools, "_watch_manager", lambda ctx: manager)
+
+    result = tools.a2a_await({"agent": "peer", "task_id": "t1", "background": True}, SESSION_ID)
+
+    assert "Delivered 1 queued message(s)" in result
+    assert len(ctx.accepted) == 1, [c[:80] for c in ctx.accepted]
+
+
+def test_transfer_after_result_suppression_must_not_lose_the_new_owners_result():
+    """P1: suppression created by A's history must be reevaluated for B."""
+    ctx = _CountingCtx()
+    working = _duplicate_payload(state=protocol.STATE_WORKING)
+    del working["artifacts"]
+    manager = _manager(ScriptedPoll(working, _duplicate_payload()), ctx=ctx)
+    _add(manager)
+
+    manager.run_once(now=100.0)
+    assert len(ctx.accepted) == 1
+    # Record the terminal observation, then release before its publication. The
+    # artifact has never been delivered to any session.
+    tools._record_observation("t1", _duplicate_payload(), "peer", SESSION_ID)
+    assert len(ctx.accepted) == 1
+    assert manager.ownership.release("t1", SESSION_ID)
+
+    successor_ctx = _CountingCtx()
+    successor = _manager(ScriptedPoll(_duplicate_payload()), ctx=successor_ctx)
+    successor.add(session_id="sess-new",
+                  target={"session_key": "agent:main:telegram:dm:43"},
+                  tasks=[("peer", "t1")])
+    successor.run_once(now=300.0)
+
+    assert len(successor_ctx.accepted) == 1, [c[:80] for c in successor_ctx.accepted]

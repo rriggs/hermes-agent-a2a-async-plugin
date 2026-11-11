@@ -12,10 +12,13 @@ state, security helpers, and outbound synchronous/asynchronous client tools.
 
 Current state:
 
-- `main` is `1f715d3`, the merge of PR [#22](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/22)
-  (container gate builds the `a2a-sdk` venv and runs the compatibility tests), on top of `7663468`,
-  the merge of PR [#19](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/19)
-  (`fix/issue-13-inbound-file-parts`, Amy approved at `d171435`). That merge closed Issue #13 and
+- `main` is `45e6b64`, the merge of PR [#23](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/23)
+  (outbound `DataPart`/`FilePart` output, subscription parts, schema 8). That merge closed Issues
+  #14 and #20 and is tagged `v0.5.0`. Issue #21 (duplicate completion text) is the only open issue.
+- The merge sits on `1f715d3`, the merge of PR [#22](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/22)
+  (container gate builds the `a2a-sdk` venv and runs the compatibility tests), which is on top of
+  `7663468`, the merge of PR [#19](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/19)
+  (`fix/issue-13-inbound-file-parts`, Amy approved at `d171435`). PR #19 closed Issue #13 and
   shipped inbound `FilePart` materialization plus the body-deadline and locator fixes below.
 - The container gate is `e2e/container/run-suite.sh` with `SDK_VENV_DIR` / `A2A_SDK_VENV` overrides
   and `A2A_INTEROP_WORK_DIR` for a read-only export; its three interoperability tests now run
@@ -163,12 +166,11 @@ a2a:
     image: [text/plain, image/png]
 ```
 
-Issue #14 is implemented on `fix/issue-14-outbound-parts`, rebased onto `main` (`1f715d3`), pushed,
-and open as PR [#23](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/23). Amy reviewed
-`434f178` and returned REQUEST CHANGES with one P1 and two P2s; the fixes are local, uncommitted at
-the time of writing, and not yet pushed or re-submitted. Issue #20 is folded into the same round.
-Rob retains review and merge control. The PR body still says #20 is deferred; it must be updated
-when the fixes are pushed.
+Issues #14 and #20 shipped together in PR [#23](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/23),
+merged 2026-11-10 as `45e6b64` and tagged `v0.5.0`. Amy approved `7e412d0` after two repair rounds
+(one P1 and four P2s, all reproduced and fixed on the branch). The tag is the release marker for
+the schema-7 to 8 migration: an older plugin cannot open a v8 database, so deployments must move
+forward, not back.
 
 ### PR #23 review round (2026-11-10)
 
@@ -218,10 +220,9 @@ watcher resolves and passes its parts to `_emit_terminal`, and the already-termi
 Four regressions cover already-terminal and live subscriptions with both a `DataPart` and a
 `FilePart`; all four fail on `87b9ae8`.
 
-## Current verification for #14 + #20 (2026-11-10, round 2)
+## Verification at merge (2026-11-10)
 
-Tested on `fix/issue-14-outbound-parts` after the PR #23 review fixes, the folded #20 fix, and the
-second repair delta, before committing the delta:
+Tested on the branch head `7e412d0`, merged as `45e6b64`:
 
 - Host `pytest tests -q -p no:cacheprovider`: **426 passed, 3 skipped** (the three live-peer gates;
   the SDK venv exists in this checkout, so the interoperability module ran).
@@ -231,6 +232,10 @@ second repair delta, before committing the delta:
 - Classic CLI refusal E2E: PASS; `refused=true`, `peer_polls=0`, `watch_rows=0`.
 - `plugins validate` / `plugins doctor`: passed inside the container gate (13 tools, 3 hooks).
 - `git diff --check`: clean.
+
+Amy's independent review of `7e412d0` reproduced the same numbers (427 passed, 2 live-peer skips;
+3 interoperability tests; 39 probe and outbound-parts tests) and confirmed the pre-fix control at
+`88120f9` fails exactly the five intended cases.
 
 Regressions added in this round, each proven to fail on the pre-fix tree:
 `test_host_response_delivery_attaches_the_media_file` and

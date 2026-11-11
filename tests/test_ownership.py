@@ -403,7 +403,34 @@ def test_an_identical_result_repeating_a_history_message_queues_once():
     )
 
     assert [row["message_id"] for row in queued] == ["artifact-id:final"]
-    assert store.queued("t1")[0]["kind"] == "result"
+    with sqlite3.connect(str(Path(store.db_path))) as con:
+        history = con.execute(
+            "SELECT delivered_at, suppressed_at FROM a2a_task_messages"
+            " WHERE task_id='t1' AND message_id='history:0:abc'").fetchone()
+    assert history is not None
+    assert history[0] is None, "suppression must not claim host acceptance"
+    assert history[1] is not None
+
+
+def test_a_suppressed_duplicate_leaves_the_result_deliverable():
+    """P1: a refused artifact must survive re-observation of the same payload.
+
+    Suppressing the history Message used to mark it delivered; the next
+    observation then treated that synthetic mark as proof and consumed the
+    still-pending artifact, losing the answer.
+    """
+    _task()
+    store = _store()
+    entries = [("history:0:abc", "progress", "The final answer", False),
+               ("artifact-id:final", "result", "The final answer", True)]
+
+    assert [row["message_id"] for row in store.record_messages(
+        "t1", entries, session_id=SESSION_A)] == ["artifact-id:final"]
+    # The host refused the artifact, so nothing was acknowledged. A second
+    # observation of the same terminal payload must still offer it.
+    assert [row["message_id"] for row in store.record_messages(
+        "t1", entries, session_id=SESSION_A)] == ["artifact-id:final"]
+    assert [row["message_id"] for row in store.queued("t1")] == ["artifact-id:final"]
 
 
 def test_a_result_identical_to_an_already_delivered_history_message_is_not_queued():
@@ -422,6 +449,7 @@ def test_a_result_identical_to_an_already_delivered_history_message_is_not_queue
     )
 
     assert queued == []
+    assert store.queued("t1") == []
 
 
 def test_distinct_history_and_artifact_text_are_both_delivered():

@@ -394,7 +394,8 @@ class OwnershipStore:
                            kind=excluded.kind,
                            text=excluded.text,
                            delivered_at=NULL,
-                           delivered_to_session=''
+                           delivered_to_session='',
+                           suppressed_at=NULL
                        WHERE a2a_task_messages.text <> excluded.text
                           OR a2a_task_messages.kind <> excluded.kind""",
                     (task_id, message_id, kind or "progress", text or "", now))
@@ -452,7 +453,8 @@ class OwnershipStore:
                                kind=excluded.kind,
                                text=excluded.text,
                                delivered_at=NULL,
-                               delivered_to_session=''
+                               delivered_to_session='',
+                               suppressed_at=NULL
                            WHERE a2a_task_messages.text <> excluded.text
                               OR a2a_task_messages.kind <> excluded.kind""",
                         (task_id, message_id, kind or "progress", text or "", now))
@@ -469,7 +471,7 @@ class OwnershipStore:
             self._coalesce_identical_result_text(con, task_id, str(session_id or ""), now)
             rows = con.execute(
                 """SELECT * FROM a2a_task_messages
-                    WHERE task_id=? AND delivered_at IS NULL
+                    WHERE task_id=? AND delivered_at IS NULL AND suppressed_at IS NULL
                     ORDER BY created_at, message_id""",
                 (task_id,)).fetchall()
             return [dict(r) for r in rows]
@@ -477,61 +479,60 @@ class OwnershipStore:
     @staticmethod
     def _coalesce_identical_result_text(con: sqlite3.Connection, task_id: str,
                                         session_id: str, now: float) -> None:
-        """Deliver one body when a result repeats a peer Message's exact text.
+        """Retire the duplicate representation without claiming it was delivered.
 
         A2A peers may expose the same final answer as a history/status Message
         and as the result artifact. §3.7 makes the artifact canonical, so:
 
-        * both pending: the artifact publishes and the Message is marked
-          delivered;
-        * the Message was already delivered: the artifact is marked delivered
-          instead, so completion does not repeat the body;
+        * both pending: the Message is SUPPRESSED (``suppressed_at``) and the
+          artifact stays queued. Suppression is not acknowledgement: if the
+          host refuses the artifact, it remains deliverable, which a synthetic
+          ``delivered_at`` mark would have hidden (review round 3, P1);
+        * a Message was actually delivered: the artifact is suppressed instead,
+          so completion does not repeat a body the session already has;
         * the artifact was delivered first: a later identical Message is
           suppressed.
 
-        ``delivered_to_session`` records that the session has the BODY, which
-        it does through the other representation. Equality is exact and scoped
-        to one task; distinct text, other tasks, and other sessions' tasks are
-        untouched.
+        Equality is exact and scoped to one task; distinct text, other tasks,
+        and other sessions' tasks are untouched. A suppressed row is excluded
+        from ``queued()`` and from both delivery paths.
         """
         results = con.execute(
-            """SELECT message_id, text, delivered_at FROM a2a_task_messages
+            """SELECT message_id, text, delivered_at, suppressed_at
+                 FROM a2a_task_messages
                 WHERE task_id=? AND kind='result'""",
             (task_id,)).fetchall()
         for result in results:
             text = str(result["text"] or "")
-            if not text:
+            if not text or result["suppressed_at"] is not None:
                 continue
             peers = con.execute(
-                """SELECT message_id, delivered_at FROM a2a_task_messages
+                """SELECT message_id, delivered_at, suppressed_at
+                     FROM a2a_task_messages
                     WHERE task_id=? AND kind<>'result' AND text=?""",
                 (task_id, text)).fetchall()
-            if not peers:
+            live = [row for row in peers if row["suppressed_at"] is None]
+            if not live:
                 continue
             if result["delivered_at"] is not None:
-                con.execute(
-                    """UPDATE a2a_task_messages SET delivered_at=?, delivered_to_session=?
-                        WHERE task_id=? AND kind<>'result' AND text=?
-                          AND delivered_at IS NULL""",
-                    (now, session_id, task_id, text))
-            elif any(row["delivered_at"] is not None for row in peers):
-                con.execute(
-                    """UPDATE a2a_task_messages SET delivered_at=?, delivered_to_session=?
-                        WHERE task_id=? AND message_id=? AND delivered_at IS NULL""",
-                    (now, session_id, task_id, result["message_id"]))
+                suppress = [row["message_id"] for row in live
+                            if row["delivered_at"] is None]
+            elif any(row["delivered_at"] is not None for row in live):
+                suppress = [result["message_id"]]
             else:
+                suppress = [row["message_id"] for row in live]
+            for message_id in suppress:
                 con.execute(
-                    """UPDATE a2a_task_messages SET delivered_at=?, delivered_to_session=?
-                        WHERE task_id=? AND kind<>'result' AND text=?
-                          AND delivered_at IS NULL""",
-                    (now, session_id, task_id, text))
+                    """UPDATE a2a_task_messages SET suppressed_at=?
+                        WHERE task_id=? AND message_id=? AND suppressed_at IS NULL""",
+                    (now, task_id, message_id))
 
     def queued(self, task_id: str) -> list[dict]:
         """Undelivered messages for one task, oldest first."""
         with self._session() as con:
             rows = con.execute(
                 """SELECT * FROM a2a_task_messages
-                    WHERE task_id=? AND delivered_at IS NULL
+                    WHERE task_id=? AND delivered_at IS NULL AND suppressed_at IS NULL
                     ORDER BY created_at, message_id""",
                 (task_id,)).fetchall()
         return [dict(r) for r in rows]
@@ -632,6 +633,7 @@ class OwnershipStore:
                 con.execute(
                     """UPDATE a2a_task_messages SET delivered_at=?, delivered_to_session=?
                         WHERE task_id=? AND message_id=? AND delivered_at IS NULL
+                          AND suppressed_at IS NULL
                           AND EXISTS (SELECT 1 FROM a2a_tasks
                                        WHERE task_id=? AND owner_session_id=?)""",
                     (now, session_id, task_id, message_id, task_id, session_id))
@@ -648,7 +650,8 @@ class OwnershipStore:
             cur = con.execute(
                 f"""UPDATE a2a_task_messages
                        SET delivered_to_session=?, delivered_at=?
-                     WHERE task_id=? AND message_id IN ({marks}) AND delivered_at IS NULL""",
+                     WHERE task_id=? AND message_id IN ({marks}) AND delivered_at IS NULL
+                       AND suppressed_at IS NULL""",
                 (session_id, now, task_id, *ids))
             return cur.rowcount
 
@@ -816,7 +819,8 @@ class OwnershipStore:
                                kind=excluded.kind,
                                text=excluded.text,
                                delivered_at=NULL,
-                               delivered_to_session=''
+                               delivered_to_session='',
+                               suppressed_at=NULL
                            WHERE a2a_task_messages.text <> excluded.text
                               OR a2a_task_messages.kind <> excluded.kind""",
                         (task_id, message_id, kind or "progress", text or "", now))

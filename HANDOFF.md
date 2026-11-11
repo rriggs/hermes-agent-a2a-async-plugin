@@ -27,7 +27,7 @@ Current state:
 The plugin manifest declares:
 
 - name: `a2a-async`
-- version: `0.5.1` (0.5.0 plus the #21 duplicate-completion fix)
+- version: `0.5.1` (0.5.0 plus the #21 duplicate-completion fix and the schema-8 to 9 message-table migration)
 - kind: `platform`
 - requires Hermes: `>=0.22.2`
 - thirteen tools in the shared `a2a` toolset
@@ -240,18 +240,25 @@ request or a failure reason is communication, not output.
 **Receiver (peer side).** A peer may still repeat its final text in history or `status.message`
 and in the result artifact, which is a SHOULD violation a client must tolerate.
 `OwnershipStore.record_messages()` now coalesces exact-text duplicates within one task, in the same
-transaction that records them: when both are pending, the result is delivered and the Message is
-marked delivered; when the Message was already delivered, the artifact is not queued again.
-Distinct text, other tasks, and other sessions' tasks are untouched.
+transaction that records them. The duplicate half is marked `suppressed_at` (schema 9), which is
+deliberately NOT `delivered_at`: suppression retires a row from delivery without claiming the host
+accepted it. When both are pending the Message is suppressed and the artifact stays queued, so a
+refused artifact survives re-observation and is delivered when the host recovers (review round 3,
+P1). When a Message was actually delivered, the artifact is suppressed instead. Suppressed rows are
+excluded from `queued()`, from `publish_if_owned`, and from the outbox flush, which retires any
+pre-enqueued copy. Distinct text, other tasks, and other sessions' tasks are untouched.
 
 The receiver half also covers our own older emitters and any peer that violates §3.7. Tests assert
 the host-accepted injection count through the real watch path, the blocking `a2a_await` return
 value, and the store's undelivered rows; the pre-fix tree fails twelve of them, including the
 blocking duplicate rendered as `[queued progress] ...` followed by the same text as the result.
+Review round 3 added the refusal case: the host refuses the artifact, the payload is observed
+again, and the result must still be queued and delivered on recovery. That regression fails on
+`d47afe4`, where suppression had consumed the undelivered answer.
 
-Gates on the fixed tree: host **440 passed, 3 skipped**; container **441 passed, 2 skipped** with
+Gates on the fixed tree: host **444 passed, 3 skipped**; container **445 passed, 2 skipped** with
 all three `a2a-sdk` interoperability tests; TUI delivery and classic CLI refusal E2Es PASS;
-validate/doctor PASS (13 tools, 3 hooks). Plugin version is `0.5.1`.
+validate/doctor PASS (13 tools, 3 hooks). Plugin version is `0.5.1`, task schema is 9.
 
 ## Verification at merge (2026-11-10)
 

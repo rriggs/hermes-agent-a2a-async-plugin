@@ -54,7 +54,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "1.0"
-A2A_TASK_SCHEMA_VERSION = 8
+A2A_TASK_SCHEMA_VERSION = 9
 MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024
 _DEFAULT_OUTPUT_MODES = ("text/plain", "application/json")
 
@@ -1441,6 +1441,9 @@ class TaskStore:
             )
             # Queued peer messages (schema v6): while a task is unowned every message it produces
             # is recorded here and delivered to whoever adopts it. delivered_at IS NULL = queued.
+            # suppressed_at (schema v9) marks a Message whose body is delivered by an equivalent
+            # artifact: it is retired from delivery WITHOUT claiming the host accepted it, so a
+            # refused artifact stays queued (#21, review round 3 P1).
             con.execute(
                 """CREATE TABLE IF NOT EXISTS a2a_task_messages (
                 task_id TEXT NOT NULL,
@@ -1450,9 +1453,15 @@ class TaskStore:
                 created_at REAL NOT NULL,
                 delivered_to_session TEXT NOT NULL DEFAULT '',
                 delivered_at REAL,
+                suppressed_at REAL,
                 PRIMARY KEY (task_id, message_id)
             )"""
             )
+            message_columns = {
+                row[1] for row in con.execute("PRAGMA table_info(a2a_task_messages)")
+            }
+            if "suppressed_at" not in message_columns:
+                con.execute("ALTER TABLE a2a_task_messages ADD COLUMN suppressed_at REAL")
             con.execute(
                 """CREATE INDEX IF NOT EXISTS idx_a2a_task_messages_pending
                        ON a2a_task_messages (task_id, delivered_at)"""

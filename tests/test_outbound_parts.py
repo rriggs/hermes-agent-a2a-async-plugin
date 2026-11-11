@@ -258,6 +258,31 @@ def test_taskstore_migrates_schema_v7_without_losing_text_reply(tmp_path):
     assert migrated["reply_parts"] == []
 
 
+def test_taskstore_migrates_a_v8_message_table_with_suppression(tmp_path):
+    """Schema 9 adds suppressed_at without touching queued rows from a v8 database."""
+    import sqlite3
+
+    db_path = tmp_path / "tasks-v8.db"
+    store = protocol.TaskStore(str(db_path))
+    store.create("task-v8", "ctx-v8", "peer")
+    with sqlite3.connect(db_path) as con:
+        con.execute("ALTER TABLE a2a_task_messages DROP COLUMN suppressed_at")
+        con.execute("PRAGMA user_version = 8")
+
+    migrated = protocol.TaskStore(str(db_path))
+    from a2a_async_plugin.ownership import OwnershipStore
+
+    messages = OwnershipStore(str(db_path))
+    messages.add_message("task-v8", "m1", "result", "answer")
+
+    with sqlite3.connect(db_path) as con:
+        columns = {row[1] for row in con.execute("PRAGMA table_info(a2a_task_messages)")}
+        version = int(con.execute("PRAGMA user_version").fetchone()[0])
+    assert "suppressed_at" in columns
+    assert version == protocol.A2A_TASK_SCHEMA_VERSION
+    assert [row["message_id"] for row in messages.queued("task-v8")] == ["m1"]
+
+
 def test_final_adapter_reply_persists_negotiated_json_data_part(monkeypatch, tmp_path):
     from gateway.config import PlatformConfig
     from a2a_async_plugin.adapter import A2AAdapter

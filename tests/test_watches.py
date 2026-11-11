@@ -2492,3 +2492,63 @@ def test_a_blocking_await_delivers_an_identical_history_and_artifact_once(monkey
 
     assert out.count("The final answer") == 1, out
     assert manager.ownership.queued("t1") == []
+
+
+class _CountingCtx(FakeCtx):
+    """FakeCtx that separates offered calls from host-accepted deliveries."""
+
+    def __init__(self):
+        super().__init__()
+        self.accepted: list[str] = []
+
+    def inject_message(self, content, role="user", session_key=None, origin=None):
+        ok = super().inject_message(content, role=role, session_key=session_key, origin=origin)
+        if ok:
+            self.accepted.append(content)
+        return ok
+
+
+def test_a_refused_completion_is_still_delivered_after_the_host_recovers():
+    """P1: suppression of the duplicate must not count as host acceptance."""
+    ctx = _CountingCtx()
+    ctx.accept = False
+    manager = _manager(ScriptedPoll(_duplicate_payload()), ctx=ctx)
+    _add(manager)
+
+    manager.run_once(now=100.0)
+    assert ctx.accepted == []
+    assert [m["message_id"] for m in manager.ownership.queued("t1")] == ["artifact-id:final"]
+
+    # A fresh observation of the same terminal payload (another watch, a re-await).
+    tools._record_observation("t1", _duplicate_payload(), "peer", SESSION_ID)
+    assert [m["message_id"] for m in manager.ownership.queued("t1")] == ["artifact-id:final"], (
+        "re-observation consumed the result that was never delivered"
+    )
+
+    ctx.accept = True
+    manager.run_once(now=200.0)
+
+    assert len(ctx.accepted) == 1, [c[:80] for c in ctx.accepted]
+    assert "returned a result" in ctx.accepted[0]
+    assert manager.ownership.queued("t1") == []
+
+
+def test_a_pending_progress_notice_is_retired_when_the_result_covers_it():
+    """A queued progress copy must not slip out after the artifact supersedes it."""
+    ctx = _CountingCtx()
+    ctx.accept = False
+    manager = _manager(ScriptedPoll(
+        {"id": "t1", "contextId": "ctx-1", "status": {"state": protocol.STATE_WORKING},
+         "history": [{"role": "ROLE_AGENT", "parts": [{"text": "The final answer"}]}]},
+        _duplicate_payload(),
+    ), ctx=ctx)
+    _add(manager)
+
+    manager.run_once(now=100.0)
+    assert ctx.accepted == []
+    manager.run_once(now=200.0)
+    ctx.accept = True
+    manager.run_once(now=300.0)
+
+    assert len(ctx.accepted) == 1, [c[:80] for c in ctx.accepted]
+    assert "returned a result" in ctx.accepted[0]

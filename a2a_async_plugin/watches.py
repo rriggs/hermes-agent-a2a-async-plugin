@@ -1674,8 +1674,9 @@ class WatchManager:
                 and not self.ownership.has_kind(task_id, "result")):
             entries.append((f"state:{raw_state}", "result",
                             f"task reached {_short_state(raw_state)} with no text reply", False))
-        return self.ownership.record_messages(task_id, entries, session_id=session_id,
-                                              state=state, reply=reply)
+        return self.ownership.record_messages(
+            task_id, entries, session_id=session_id, state=state, reply=reply,
+            terminal=raw_state in protocol.TERMINAL_STATES)
 
     def _note_peer_failure(self, peer: str, now: float) -> None:
         """Back off a peer after a failed reconciliation attempt (60s doubling, capped at 1h)."""

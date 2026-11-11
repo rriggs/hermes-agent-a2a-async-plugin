@@ -399,7 +399,7 @@ def test_an_identical_result_repeating_a_history_message_queues_once():
         "t1",
         [("history:0:abc", "progress", "The final answer", False),
          ("artifact-id:final", "result", "The final answer", True)],
-        session_id=SESSION_A,
+        session_id=SESSION_A, terminal=True,
     )
 
     assert [row["message_id"] for row in queued] == ["artifact-id:final"]
@@ -425,11 +425,11 @@ def test_a_suppressed_duplicate_leaves_the_result_deliverable():
                ("artifact-id:final", "result", "The final answer", True)]
 
     assert [row["message_id"] for row in store.record_messages(
-        "t1", entries, session_id=SESSION_A)] == ["artifact-id:final"]
+        "t1", entries, session_id=SESSION_A, terminal=True)] == ["artifact-id:final"]
     # The host refused the artifact, so nothing was acknowledged. A second
     # observation of the same terminal payload must still offer it.
     assert [row["message_id"] for row in store.record_messages(
-        "t1", entries, session_id=SESSION_A)] == ["artifact-id:final"]
+        "t1", entries, session_id=SESSION_A, terminal=True)] == ["artifact-id:final"]
     assert [row["message_id"] for row in store.queued("t1")] == ["artifact-id:final"]
 
 
@@ -445,7 +445,7 @@ def test_a_result_identical_to_an_already_delivered_history_message_is_not_queue
 
     queued = store.record_messages(
         "t1", [("artifact-id:final", "result", "The final answer", True)],
-        session_id=SESSION_A,
+        session_id=SESSION_A, terminal=True,
     )
 
     assert queued == []
@@ -1062,3 +1062,67 @@ def test_abandon_with_expected_state_keeps_a_recovered_answer():
     row = protocol.TaskStore().get("t1")
     assert row["state"] == protocol.STATE_COMPLETED
     assert row["reply"] == "the answer"
+
+
+def test_another_sessions_acknowledgement_does_not_suppress_the_new_result():
+    """P1: delivered marks are per delivery session, not global suppression proof."""
+    _task()
+    store = _store()
+    assert store.acquire("t1", SESSION_A)
+    store.record_messages(
+        "t1", [("history:0:abc", "progress", "The final answer", False)],
+        session_id=SESSION_A,
+    )
+    assert store.mark_delivered("t1", ["history:0:abc"], SESSION_A) == 1
+    assert store.release("t1", SESSION_A)
+
+    queued = store.record_messages(
+        "t1", [("artifact-id:final", "result", "The final answer", True)],
+        session_id=SESSION_B, terminal=True,
+    )
+
+    assert [row["message_id"] for row in queued] == ["artifact-id:final"], (
+        "the adopter's never-delivered result was suppressed by the old owner's ack"
+    )
+
+
+def test_a_working_artifact_does_not_suppress_distinct_progress():
+    """P2: a mutable, unpublished working artifact is not a final deliverable."""
+    _task()
+    store = _store()
+
+    queued = store.record_messages(
+        "t1",
+        [("history:0:abc", "progress", "checkpoint ready", False),
+         ("artifact-id:final", "result", "checkpoint ready", True)],
+        session_id=SESSION_A, terminal=False,
+    )
+    assert {row["message_id"] for row in queued} == {"history:0:abc", "artifact-id:final"}
+
+    queued = store.record_messages(
+        "t1", [("artifact-id:final", "result", "finished answer", True)],
+        session_id=SESSION_A, terminal=True,
+    )
+    assert {row["message_id"] for row in queued} == {"history:0:abc", "artifact-id:final"}
+    with sqlite3.connect(str(Path(store.db_path))) as con:
+        suppressed = con.execute(
+            "SELECT suppressed_at FROM a2a_task_messages"
+            " WHERE task_id='t1' AND message_id='history:0:abc'").fetchone()[0]
+    assert suppressed is None
+
+
+def test_reconciliation_coalesces_a_recovered_terminal_backlog():
+    """P2: the sweep/adoption path must share the coalescer."""
+    _task()
+    store = _store()
+    payload = {"id": "t1", "contextId": "ctx-1",
+               "status": {"state": protocol.STATE_COMPLETED},
+               "history": [{"role": "ROLE_AGENT", "parts": [{"text": "The final answer"}]}],
+               "artifacts": [{"artifactId": "final", "parts": [{"text": "The final answer"}]}]}
+
+    assert store.reconcile_observation(
+        "t1", protocol.STATE_COMPLETED, reply="The final answer",
+        messages=tools._observation_messages(payload, protocol.STATE_COMPLETED,
+                                             input_artifact_kind=True))
+
+    assert [row["message_id"] for row in store.queued("t1")] == ["artifact-id:final"]

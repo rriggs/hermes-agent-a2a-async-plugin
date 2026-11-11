@@ -2552,3 +2552,61 @@ def test_a_pending_progress_notice_is_retired_when_the_result_covers_it():
 
     assert len(ctx.accepted) == 1, [c[:80] for c in ctx.accepted]
     assert "returned a result" in ctx.accepted[0]
+
+
+def test_a_new_owner_receives_a_result_not_delivered_to_its_predecessor():
+    """P1: the old owner's acknowledgement must not swallow the adopter's answer."""
+    ctx = _CountingCtx()
+    working = _duplicate_payload(state=protocol.STATE_WORKING)
+    del working["artifacts"]
+    manager = _manager(ScriptedPoll(working, _duplicate_payload()), ctx=ctx)
+    _add(manager)
+
+    manager.run_once(now=100.0)
+    assert len(ctx.accepted) == 1
+    assert manager.ownership.release("t1", SESSION_ID)
+
+    newctx = _CountingCtx()
+    successor = _manager(ScriptedPoll(_duplicate_payload()), ctx=newctx)
+    successor.add(session_id="sess-new",
+                  target={"session_key": "agent:main:telegram:dm:43"},
+                  tasks=[("peer", "t1")])
+    successor.run_once(now=200.0)
+
+    assert len(newctx.accepted) == 1, [c[:80] for c in newctx.accepted]
+
+
+def test_a_working_artifact_does_not_swallow_distinct_progress():
+    """P2: progress must survive a working artifact whose final text changes."""
+    ctx = _CountingCtx()
+    working = _duplicate_payload(state=protocol.STATE_WORKING, text="checkpoint ready")
+    final = _duplicate_payload(text="finished answer")
+    final["history"] = working["history"]
+    manager = _manager(ScriptedPoll(working, final), ctx=ctx)
+    _add(manager)
+
+    manager.run_once(now=100.0)
+    assert any("checkpoint ready" in text for text in ctx.accepted), "progress lost"
+    manager.run_once(now=200.0)
+    assert any("finished answer" in text for text in ctx.accepted)
+
+
+def test_reconciled_duplicates_deliver_once_on_background_adoption(monkeypatch):
+    """P2: adoption must not replay both representations of one answer."""
+    ctx = _CountingCtx()
+    manager = _manager(ScriptedPoll(_duplicate_payload()), ctx=ctx)
+    protocol.TaskStore().create("t1", "ctx-1", "peer", direction="outbound",
+                                remote_state=protocol.STATE_WORKING)
+    payload = _duplicate_payload()
+    assert manager.ownership.reconcile_observation(
+        "t1", protocol.STATE_COMPLETED, reply="The final answer",
+        messages=tools._observation_messages(payload, protocol.STATE_COMPLETED,
+                                             input_artifact_kind=True))
+    monkeypatch.setattr(tools, "_CTX", ctx)
+    monkeypatch.setattr(tools, "_resolve_peer", lambda agent: {"url": "http://peer.test"})
+    monkeypatch.setattr(tools, "_watch_manager", lambda ctx: manager)
+
+    result = tools.a2a_await({"agent": "peer", "task_id": "t1", "background": True}, SESSION_ID)
+
+    assert "Delivered 1 queued message(s)" in result
+    assert len(ctx.accepted) == 1, [c[:80] for c in ctx.accepted]

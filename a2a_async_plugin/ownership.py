@@ -411,7 +411,8 @@ class OwnershipStore:
                         messages: Iterable[tuple[str, str, str, bool]],
                         *, session_id: str = "",
                         require_owner: bool = False,
-                        state: str = "", reply: str = "") -> Optional[list[dict]]:
+                        state: str = "", reply: str = "",
+                        terminal: bool = False) -> Optional[list[dict]]:
         """Apply one observation's message upserts under the ownership write lock.
 
         ``messages`` is ``(message_id, kind, text, update_existing)`` per peer message. Recording
@@ -467,8 +468,12 @@ class OwnershipStore:
             # One answer, two representations: a peer that repeats its final
             # text in a Message (history or status) and in the result artifact
             # must not produce two notifications. §3.7 puts results in
-            # artifacts, so the result is canonical (issue #21).
-            self._coalesce_identical_result_text(con, task_id, str(session_id or ""), now)
+            # artifacts, so the result is canonical (issue #21). Only the
+            # terminal observation is a final deliverable: a working artifact is
+            # mutable and unpublished, so suppressing progress against it would
+            # lose a note the final revision no longer repeats.
+            if terminal:
+                self._coalesce_identical_result_text(con, task_id, str(session_id or ""), now)
             rows = con.execute(
                 """SELECT * FROM a2a_task_messages
                     WHERE task_id=? AND delivered_at IS NULL AND suppressed_at IS NULL
@@ -488,17 +493,25 @@ class OwnershipStore:
           artifact stays queued. Suppression is not acknowledgement: if the
           host refuses the artifact, it remains deliverable, which a synthetic
           ``delivered_at`` mark would have hidden (review round 3, P1);
-        * a Message was actually delivered: the artifact is suppressed instead,
-          so completion does not repeat a body the session already has;
-        * the artifact was delivered first: a later identical Message is
-          suppressed.
+        * a Message was delivered to the SAME session: the artifact is
+          suppressed instead, so completion does not repeat a body the session
+          already has;
+        * the artifact was delivered to the same session first: a later
+          identical Message is suppressed.
 
-        Equality is exact and scoped to one task; distinct text, other tasks,
-        and other sessions' tasks are untouched. A suppressed row is excluded
-        from ``queued()`` and from both delivery paths.
+        Only an acknowledgement from the session being recorded counts. A
+        previous owner's delivered row must not suppress the new owner's
+        result after adoption (review round 4, P1). Equality is exact and
+        scoped to one task; distinct text, other tasks, and other sessions'
+        tasks are untouched. A suppressed row is excluded from ``queued()`` and
+        from both delivery paths.
         """
+        def own(row) -> bool:
+            return (row["delivered_at"] is not None
+                    and str(row["delivered_to_session"] or "") == session_id)
+
         results = con.execute(
-            """SELECT message_id, text, delivered_at, suppressed_at
+            """SELECT message_id, text, delivered_at, delivered_to_session, suppressed_at
                  FROM a2a_task_messages
                 WHERE task_id=? AND kind='result'""",
             (task_id,)).fetchall()
@@ -507,20 +520,26 @@ class OwnershipStore:
             if not text or result["suppressed_at"] is not None:
                 continue
             peers = con.execute(
-                """SELECT message_id, delivered_at, suppressed_at
+                """SELECT message_id, delivered_at, delivered_to_session, suppressed_at
                      FROM a2a_task_messages
                     WHERE task_id=? AND kind<>'result' AND text=?""",
                 (task_id, text)).fetchall()
             live = [row for row in peers if row["suppressed_at"] is None]
             if not live:
                 continue
+            pending = [row["message_id"] for row in live if row["delivered_at"] is None]
             if result["delivered_at"] is not None:
-                suppress = [row["message_id"] for row in live
-                            if row["delivered_at"] is None]
-            elif any(row["delivered_at"] is not None for row in live):
+                # This session already has the body via the artifact.
+                if own(result):
+                    suppress = pending
+                else:
+                    suppress = []
+            elif any(own(row) for row in live):
+                # This session already has the body via the Message.
                 suppress = [result["message_id"]]
             else:
-                suppress = [row["message_id"] for row in live]
+                # Both are pending for this session: the artifact is canonical.
+                suppress = pending
             for message_id in suppress:
                 con.execute(
                     """UPDATE a2a_task_messages SET suppressed_at=?
@@ -830,6 +849,13 @@ class OwnershipStore:
                                (task_id, message_id, kind, text, created_at)
                            VALUES (?, ?, ?, ?, ?)""",
                         (task_id, message_id, kind or "progress", text or "", now))
+            # Reconciliation is the second observation path (sweep/adoption): a
+            # recovered terminal task must coalesce here too, or its backlog
+            # delivers the history copy and the artifact copy as two callbacks.
+            # The task is unowned while this runs, so no session's acknowledgement
+            # applies; the artifact stays queued for the adopter.
+            if terminal:
+                self._coalesce_identical_result_text(con, task_id, "", now)
             return True
 
     def mark_reconciled(self, task_id: str, now: Optional[float] = None,

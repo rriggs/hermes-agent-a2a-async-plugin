@@ -927,7 +927,8 @@ def _record_observation(task_id: str, payload: dict, peer: str,
             entries.append((f"state:{state}", "result",
                             f"task reached {_short_state(state)} with no text reply", False))
         return store.record_messages(task_id, entries, session_id=session_id,
-                                     require_owner=bool(session_id))
+                                     require_owner=bool(session_id),
+                                     terminal=state in protocol.TERMINAL_STATES)
     except Exception:
         logger.debug("A2A: message recording failed", exc_info=True)
         return store.queued(task_id)

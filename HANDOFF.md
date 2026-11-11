@@ -239,14 +239,20 @@ request or a failure reason is communication, not output.
 
 **Receiver (peer side).** A peer may still repeat its final text in history or `status.message`
 and in the result artifact, which is a SHOULD violation a client must tolerate.
-`OwnershipStore.record_messages()` now coalesces exact-text duplicates within one task, in the same
-transaction that records them. The duplicate half is marked `suppressed_at` (schema 9), which is
-deliberately NOT `delivered_at`: suppression retires a row from delivery without claiming the host
-accepted it. When both are pending the Message is suppressed and the artifact stays queued, so a
-refused artifact survives re-observation and is delivered when the host recovers (review round 3,
-P1). When a Message was actually delivered, the artifact is suppressed instead. Suppressed rows are
-excluded from `queued()`, from `publish_if_owned`, and from the outbox flush, which retires any
-pre-enqueued copy. Distinct text, other tasks, and other sessions' tasks are untouched.
+`OwnershipStore.record_messages()` and `reconcile_observation()` coalesce exact-text duplicates
+within one task in the same transaction that records them. The duplicate half is marked
+`suppressed_at` (schema 9), which is deliberately NOT `delivered_at`: suppression retires a row
+from delivery without claiming the host accepted it. When both are pending the Message is
+suppressed and the artifact stays queued, so a refused artifact survives re-observation and is
+delivered when the host recovers (review round 3, P1). Suppression is scoped to the delivery
+session: only an acknowledgement from the session being recorded counts, so a previous owner's
+delivered history cannot swallow the adopter's never-delivered result (round 4, P1). Coalescing
+runs only at the terminal observation, because a working artifact is mutable and unpublished;
+suppressing progress against it loses text the final revision no longer repeats (round 4, P2).
+The sweep/adoption path shares the coalescer, so a reconciled backlog delivers one copy rather
+than two (round 4, P2). Suppressed rows are excluded from `queued()`, from `publish_if_owned`,
+and from the outbox flush, which retires any pre-enqueued copy. Distinct text, other tasks, and
+other sessions' tasks are untouched.
 
 The receiver half also covers our own older emitters and any peer that violates §3.7. Tests assert
 the host-accepted injection count through the real watch path, the blocking `a2a_await` return
@@ -254,9 +260,12 @@ value, and the store's undelivered rows; the pre-fix tree fails twelve of them, 
 blocking duplicate rendered as `[queued progress] ...` followed by the same text as the result.
 Review round 3 added the refusal case: the host refuses the artifact, the payload is observed
 again, and the result must still be queued and delivered on recovery. That regression fails on
-`d47afe4`, where suppression had consumed the undelivered answer.
+`d47afe4`, where suppression had consumed the undelivered answer. Review round 4 added three
+boundaries: ownership transfer must not let the old owner's acknowledgement suppress the adopter's
+result, a working artifact must not permanently suppress progress, and reconciliation must coalesce
+so adoption delivers one copy. All six fail on `d844152`.
 
-Gates on the fixed tree: host **444 passed, 3 skipped**; container **445 passed, 2 skipped** with
+Gates on the fixed tree: host **450 passed, 3 skipped**; container **451 passed, 2 skipped** with
 all three `a2a-sdk` interoperability tests; TUI delivery and classic CLI refusal E2Es PASS;
 validate/doctor PASS (13 tools, 3 hooks). Plugin version is `0.5.1`, task schema is 9.
 

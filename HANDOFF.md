@@ -5,26 +5,26 @@ Owner: Sven
 Repository: https://github.com/rriggs/hermes-agent-a2a-async-plugin.git
 Workspace: /home/hermes/.hermes/profiles/sven/workspace/hermes-agent-a2a-async-plugin
 
-## Current status
+## Current handoff status (2026-11-10)
 
 The standalone plugin provides the inbound asynchronous A2A gateway adapter, durable protocol/task
 state, security helpers, and outbound synchronous/asynchronous client tools.
 
 Current state:
 
-- `main` is `7663468`, the merge of PR [#19](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/19)
+- `main` is `1f715d3`, the merge of PR [#22](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/22)
+  (container gate builds the `a2a-sdk` venv and runs the compatibility tests), on top of `7663468`,
+  the merge of PR [#19](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/19)
   (`fix/issue-13-inbound-file-parts`, Amy approved at `d171435`). That merge closed Issue #13 and
   shipped inbound `FilePart` materialization plus the body-deadline and locator fixes below.
-- `fix/container-sdk-venv` (off `main`) makes the container suite build the `a2a-sdk` venv and run
-  the three compatibility tests instead of skipping them: `e2e/container/run-suite.sh`, the
-  `SDK_VENV_DIR` / `A2A_SDK_VENV` overrides, and `A2A_INTEROP_WORK_DIR` for a read-only export.
-- Issue #14 (outbound parts) is still local and uncommitted, stacked on the old #13 branch; it
-  rebases onto `main` cleanly except for this file's status block. Issue #20 is its follow-up.
+- The container gate is `e2e/container/run-suite.sh` with `SDK_VENV_DIR` / `A2A_SDK_VENV` overrides
+  and `A2A_INTEROP_WORK_DIR` for a read-only export; its three interoperability tests now run
+  instead of skipping.
 
 The plugin manifest declares:
 
 - name: `a2a-async`
-- version: `0.4.2`
+- version: `0.5.0` (0.4.2 plus the #14 outbound-parts feature and the schema-7 to 8 migration)
 - kind: `platform`
 - requires Hermes: `>=0.22.2`
 - thirteen tools in the shared `a2a` toolset
@@ -86,6 +86,11 @@ Verification of this round (worktree `fix/issue-13-inbound-file-parts`; round 2 
   `test_extract_text_budget_keeps_every_file_locator` fail on `53df155`;
   `test_drip_fed_body_still_hits_the_deadline_while_the_drip_continues` fails on `66bf09b`.
 
+- Issue #14: `fix/issue-14-outbound-parts` is rebased onto `1f715d3` and is being gated now. The
+  branch is local only, not pushed. It adds outbound `DataPart`/`FilePart` emission, the
+  `reply_parts` store column (schema 8), and the configurable output modes documented below.
+- Issue #21: open bug for duplicate completion text in history and artifact.
+
 ## Recent Agent Card identity fix
 
 In a multiplexed gateway, `os.environ` can contain the default profile's bridged values. The adapter now resolves Agent Card identity in this order:
@@ -121,28 +126,145 @@ redirect validation, no environment proxy, and the same byte limit. The Agent Ca
 must complete within 30 seconds or the adapter answers `408` (see review round 2 above).
 
 Configuration: `A2A_FILES_DIR`, `A2A_MAX_INBOUND_FILE_MB`,
-`A2A_INBOUND_FILE_MEDIA_TYPES`, and `A2A_INBOUND_FILE_TTL_DAYS`. In the current worktree this
-change is still under review and is not part of `main`; outbound `DataPart`/`FilePart` emission is
-tracked separately in Issue #14.
+`A2A_INBOUND_FILE_MEDIA_TYPES`, and `A2A_INBOUND_FILE_TTL_DAYS`. This shipped on `main` in PR #19
+(merged 2026-11-10 as `7663468`) after Amy approved `d171435`; the two round-2 findings (stalled
+bodies starving small requests, attachment paths truncated from listings) are fixed there and
+covered by regressions.
+
+## Outbound content parts (Issue #14)
+
+The outbound path can return structured JSON as a `DataPart` and generated files as `FilePart`s.
+Agent Cards default to `text/plain` and `application/json`, with text first; `a2a.output_modes`
+configures global output modes and `a2a.skill_output_modes` configures per-toolset modes. Because
+SendMessage does not name a selected skill, the dispatch path uses the union of the global and
+per-toolset modes. A peer's `acceptedOutputModes` still gates each non-text part; if omitted, the
+reply remains text-only for compatibility.
+
+Local file parts are restricted to regular non-symlink files and a 20 MiB aggregate raw-byte cap per
+reply. Safe public HTTP(S) URLs are carried as URL file parts. Terminal reply parts are stored in
+`TaskStore.reply_parts` (schema version 8), included in completed task messages/artifacts, and
+preserved across restarts.
+
+Attachments are assembled at the host delivery boundary, not inside `send()`. The base adapter's
+`_extract_response_content()` strips `MEDIA:` directives and image links before the text send, so
+the adapter overrides it to stash the extracted files, settles the task with text plus parts on the
+send (or in `_deliver_attachments` for a file-only reply, where no text send happens at all), and
+makes the native upload hooks return success because A2A carries files inside the task. A send
+removes the entry from the stash as it takes it, so the encoded payload does not outlive delivery;
+a turn that ends without delivering drops its entry, and the watchdog sweeps anything older than
+120 seconds independently of the originating context.
+
+Configuration example:
+
+```yaml
+a2a:
+  output_modes: [text/plain, application/json, image/png]
+  skill_output_modes:
+    image: [text/plain, image/png]
+```
+
+Issue #14 is implemented on `fix/issue-14-outbound-parts`, rebased onto `main` (`1f715d3`), pushed,
+and open as PR [#23](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/23). Amy reviewed
+`434f178` and returned REQUEST CHANGES with one P1 and two P2s; the fixes are local, uncommitted at
+the time of writing, and not yet pushed or re-submitted. Issue #20 is folded into the same round.
+Rob retains review and merge control. The PR body still says #20 is deferred; it must be updated
+when the fixes are pushed.
+
+### PR #23 review round (2026-11-10)
+
+- **P1 file emission was disconnected from host delivery.** Attachments were extracted only inside
+  `send()`, but the host strips `MEDIA:` first and then calls the native upload hooks, so a real
+  turn produced a text-only task and logged `send_image_file fallback`. Fixed at the boundary:
+  `_extract_response_content` override (+ stash), settlement on the text send, `_deliver_attachments`
+  for file-only replies, native hooks as success no-ops.
+- **P2 omitted `acceptedOutputModes` still allowed a raw FilePart.** A `text/plain` attachment
+  matched the legacy MIME list. Missing preferences now mean the text-carrier contract: no file
+  parts at all.
+- **P2 routed profiles bypassed negotiation.** `_prepare_task` returned the forwarded reply before
+  capturing modes or building parts. The non-local path now negotiates, persists `reply_parts`, and
+  returns the stored task.
+
+All four of Amy's probes (three findings plus her non-blocking MEDIA-retention diagnostic) pass on
+the fixed tree. The new regressions fail on `434f178` with the exact defects, verified in a detached
+worktree.
+
+### PR #23 review round 2 (`88120f9`)
+
+Two P2s, no P1:
+
+- **Routed profiles never emitted a FilePart.** The forwarded reply went straight into
+  `build_output_parts()` without splitting its `MEDIA` carriers, so an advertised image mode still
+  produced text with a path. The non-local path now extracts and encodes attachments with the same
+  limits and validation as local replies, and the legacy fallback keeps the raw directive when the
+  peer does not accept the carrier. Regressions cover accepted and rejected file modes on that
+  route.
+- **The attachment stash retained encoded payloads after delivery.** A claim marked the entry
+  instead of removing it, the early return skipped the TTL, and only another extraction for the
+  same context could clear it, so each completed turn kept a full base64 copy. A claim now pops the
+  entry, turn completion drops it, and the watchdog sweeps expired entries regardless of context.
+  Regressions cover delivered, file-only, failed, and abandoned-expired turns.
+
+## SubscribeToTask output parts (Issue #20)
+
+Issue [#20](https://github.com/rriggs/hermes-agent-a2a-async-plugin/issues/20) tracks a gap exposed
+by #14: `_rpc_tasks_subscribe()` waited for the task state and reply, then called
+`_emit_terminal()` without the persisted `reply_parts`, so a completed task subscribed through SSE
+emitted a text-only status message instead of its stored `DataPart` or `FilePart` artifact.
+`tasks/get` already rendered those parts.
+
+Fixed in PR #23, since it is the same surface: the subscribe path re-reads the row after the
+watcher resolves and passes its parts to `_emit_terminal`, and the already-terminal branch of
+`message/stream` now renders the parts carried by the terminal task instead of re-extracting text.
+Four regressions cover already-terminal and live subscriptions with both a `DataPart` and a
+`FilePart`; all four fail on `87b9ae8`.
+
+## Current verification for #14 + #20 (2026-11-10, round 2)
+
+Tested on `fix/issue-14-outbound-parts` after the PR #23 review fixes, the folded #20 fix, and the
+second repair delta, before committing the delta:
+
+- Host `pytest tests -q -p no:cacheprovider`: **426 passed, 3 skipped** (the three live-peer gates;
+  the SDK venv exists in this checkout, so the interoperability module ran).
+- Clean-export container suite (`e2e/container/run-suite.sh`): **427 passed, 2 skipped**; the three
+  `a2a-sdk` interoperability tests ran and passed.
+- TUI delivery E2E: PASS; watch complete, result published.
+- Classic CLI refusal E2E: PASS; `refused=true`, `peer_polls=0`, `watch_rows=0`.
+- `plugins validate` / `plugins doctor`: passed inside the container gate (13 tools, 3 hooks).
+- `git diff --check`: clean.
+
+Regressions added in this round, each proven to fail on the pre-fix tree:
+`test_host_response_delivery_attaches_the_media_file` and
+`test_host_response_delivery_of_a_file_only_reply_settles_the_task` drive the inherited
+`_process_message_background` pipeline (not a direct `send()`), `test_missing_output_preferences_keep_the_legacy_text_carrier`
+uses a `text/plain` file part, and `test_forwarded_agent_honors_advertised_json` goes through
+`_rpc_message_send` with a non-local agent. The stream regression still fails when
+`_rpc_message_stream` drops `parts=parts`. For #20,
+`test_subscribe_already_terminal_emits_the_persisted_parts` and
+`test_subscribe_live_completion_emits_the_persisted_parts` are parametrized over `DataPart` and
+`FilePart` and all four cases fail on `87b9ae8`. For the second delta,
+`test_routed_profile_file_reply_returns_a_file_part` and the four stash-lifetime regressions
+(delivered, file-only, failed turn, abandoned-expired) fail on `88120f9`.
+
+Push payloads remain text-only; that is out of scope for #14/#20.
 
 ## Architecture
 
 The root `__init__.py` is the directory-plugin entry point. It registers:
 
-- all ten outbound/client tools under `toolset="a2a"`
+- all thirteen outbound/client tools under `toolset="a2a"`
 - the inbound platform named `a2a`
 - the `A2AAdapter` HTTP server through `ctx.register_platform`
 
 Implementation package:
 
-- `a2a_async_plugin/adapter.py` -- inbound HTTP server, JSON-RPC dispatch, SSE, task lifecycle, push notification handling, watchdog/recovery behavior
-- `a2a_async_plugin/protocol.py` -- A2A protocol helpers, SQLite `TaskStore`, task state, persistence, listing, recovery, metrics
+- `a2a_async_plugin/adapter.py` -- inbound HTTP server, Agent Card, inbound/outbound part handling, JSON-RPC dispatch, SSE, task lifecycle, push notification handling, watchdog/recovery behavior
+- `a2a_async_plugin/protocol.py` -- A2A protocol and MIME negotiation helpers, SQLite `TaskStore`, task state, persistence, listing, recovery, metrics
 - `a2a_async_plugin/security.py` -- authentication, bind safety, redaction, injection filtering, audit, push signing
-- `a2a_async_plugin/tools.py` -- all ten client tool schemas and handlers
+- `a2a_async_plugin/tools.py` -- all thirteen client tool schemas and handlers
 
 The plugin must be the sole inbound A2A platform owner. Do not run a duplicate bundled inbound A2A adapter alongside it. Synchronous and asynchronous tools remain in the single shared `a2a` toolset.
 
-## Verification
+## Historical verification (2026-09)
 
 Local verification using the Hermes source tree and virtualenv:
 

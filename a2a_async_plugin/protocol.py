@@ -54,7 +54,9 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "1.0"
-A2A_TASK_SCHEMA_VERSION = 7
+A2A_TASK_SCHEMA_VERSION = 8
+MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024
+_DEFAULT_OUTPUT_MODES = ("text/plain", "application/json")
 
 
 def _load_plugin_version() -> str:
@@ -134,6 +136,80 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
+def normalize_output_modes(values: Any = None, *,
+                           default: tuple[str, ...] = _DEFAULT_OUTPUT_MODES) -> list[str]:
+    """Validate MIME modes, dedupe them, and always advertise text/plain first."""
+    if values is None:
+        candidates = default
+    elif isinstance(values, str):
+        candidates = values.split(",")
+    elif isinstance(values, (list, tuple)):
+        candidates = values
+    else:
+        candidates = ()
+    modes = []
+    for value in candidates:
+        mode = str(value or "").strip().lower()
+        if (not mode or mode.count("/") != 1 or mode.startswith("/") or mode.endswith("/")
+                or any(char.isspace() or ord(char) < 33 for char in mode)):
+            continue
+        major, minor = mode.split("/", 1)
+        if not major or not minor or ("*" in mode and mode not in {"*/*"} and not mode.endswith("/*")):
+            continue
+        if mode not in modes and mode != "text/plain":
+            modes.append(mode)
+    return ["text/plain", *modes]
+
+
+def _output_mode_matches(media_type: str, modes: list[str]) -> bool:
+    candidate = str(media_type or "").strip().lower()
+    return any(
+        mode == "*/*" or mode == candidate
+        or (mode.endswith("/*") and candidate.startswith(mode[:-1]))
+        for mode in modes
+    )
+
+
+def build_output_parts(text: str, attachments: Optional[list[dict]] = None, *,
+                       output_modes: Any = None,
+                       accepted_output_modes: Any = None) -> list[dict]:
+    """Choose response Parts from configured and peer-accepted MIME modes.
+
+    Missing peer preferences are treated as text-only for compatibility with
+    pre-v1.0 callers. Valid JSON is structured only when both sides advertise
+    ``application/json``; file/data parts likewise require both sides to accept
+    their media type.
+    """
+    local_modes = normalize_output_modes(output_modes)
+    if accepted_output_modes is None:
+        # Pre-v1.0 caller: an omitted acceptedOutputModes means the legacy
+        # text-carrier contract, not "text/plain MIME is acceptable". Matching
+        # on MIME alone would let a text/plain FilePart through, which is a
+        # different carrier than an older peer knows how to handle.
+        return [text_part(text)] if text else []
+    peer_modes = normalize_output_modes(accepted_output_modes, default=("text/plain",))
+    parts: list[dict] = []
+    if text:
+        if (_output_mode_matches("application/json", local_modes)
+                and _output_mode_matches("application/json", peer_modes)):
+            try:
+                value = json.loads(text)
+            except (TypeError, ValueError):
+                value = None
+            else:
+                parts.append(data_part(value))
+        if not parts:
+            parts.append(text_part(text))
+    for part in attachments or []:
+        if not isinstance(part, dict):
+            continue
+        media_type = str(part.get("mediaType") or "application/octet-stream").strip().lower()
+        if (_output_mode_matches(media_type, local_modes)
+                and _output_mode_matches(media_type, peer_modes)):
+            parts.append(copy.deepcopy(part))
+    return parts
+
+
 # --------------------------------------------------------------------------
 # Agent Card (v1.0)
 # --------------------------------------------------------------------------
@@ -149,6 +225,7 @@ def build_agent_card(
     auth_required: bool = False,
     tenant: str = "",
     input_modes: Optional[list[str]] = None,
+    output_modes: Optional[list[str]] = None,
 ) -> dict:
     """Construct an A2A v1.0 Agent Card document.
 
@@ -180,7 +257,7 @@ def build_agent_card(
             "extendedAgentCard": False,
         },
         "defaultInputModes": input_modes or ["text/plain"],
-        "defaultOutputModes": ["text/plain"],
+        "defaultOutputModes": normalize_output_modes(output_modes),
         "skills": skills or [],
     }
     if auth_required:
@@ -191,7 +268,8 @@ def build_agent_card(
     return card
 
 
-def skills_from_toolsets(toolsets: "list[str] | dict[str, list[str]] | None") -> list[dict]:
+def skills_from_toolsets(toolsets: "list[str] | dict[str, list[str]] | None",
+                         *, output_modes: Optional[dict[str, Any]] = None) -> list[dict]:
     """Derive A2A skill descriptors from the agent's toolsets.
 
     Accepts either a plain list of toolset names, or a mapping of toolset name
@@ -199,30 +277,43 @@ def skills_from_toolsets(toolsets: "list[str] | dict[str, list[str]] | None") ->
     tool names become tags so peers can match tasks to us).
     """
     skills = []
+    mode_overrides = output_modes or {}
+
+    def add_modes(skill: dict, toolset_name: str) -> None:
+        if toolset_name in mode_overrides:
+            skill["outputModes"] = normalize_output_modes(
+                mode_overrides[toolset_name], default=("text/plain",))
+
     if isinstance(toolsets, dict):
         for ts_name in sorted(toolsets.keys()):
             tool_names = [str(t) for t in (toolsets[ts_name] or [])]
-            skills.append({
+            skill = {
                 "id": f"toolset.{ts_name}",
                 "name": ts_name,
                 "description": f"Hermes '{ts_name}' capabilities",
                 "tags": [ts_name] + tool_names[:10],
-            })
+            }
+            add_modes(skill, ts_name)
+            skills.append(skill)
     else:
         for ts in sorted(set(toolsets or [])):
-            skills.append({
+            skill = {
                 "id": f"toolset.{ts}",
                 "name": ts,
                 "description": f"Hermes '{ts}' capabilities",
                 "tags": [ts],
-            })
+            }
+            add_modes(skill, ts)
+            skills.append(skill)
     if not skills:
-        skills.append({
+        skill = {
             "id": "general",
             "name": "general",
             "description": "General-purpose conversational agent",
             "tags": ["general"],
-        })
+        }
+        add_modes(skill, "general")
+        skills.append(skill)
     return skills
 
 
@@ -300,16 +391,71 @@ def file_part(url: str = "", raw: str = "", filename: str = "",
     return part
 
 
+def outbound_file_part(path_or_url: "os.PathLike[str] | str", filename: str = "",
+                       media_type: str = "", *,
+                       max_bytes: int = MAX_OUTBOUND_FILE_BYTES) -> tuple[Optional[dict], str]:
+    """Encode a bounded local file as raw base64, or preserve a safe public URL."""
+    source = os.fspath(path_or_url)
+    parsed = urllib.parse.urlsplit(source)
+    windows_drive_path = len(parsed.scheme) == 1 and len(source) > 2 and source[1] == ":"
+    if (parsed.scheme or parsed.netloc) and not windows_drive_path:
+        if parsed.scheme.lower() not in {"http", "https"} or not _safe_inbound_url(source):
+            return None, "file URL is not an allowed public HTTP(S) address"
+        safe_name = _safe_inbound_filename(filename or _inbound_url_filename(source))
+        effective_type = _normalise_media_type(media_type) or mimetypes.guess_type(parsed.path)[0]
+        return file_part(
+            url=source,
+            filename=safe_name,
+            media_type=effective_type or "application/octet-stream",
+        ), ""
+
+    if max_bytes < 0:
+        return None, "outbound file limit must be non-negative"
+    path = Path(source).expanduser()
+    safe_name = _safe_inbound_filename(filename or path.name)
+    fd = -1
+    try:
+        try:
+            if stat.S_ISLNK(path.lstat().st_mode):
+                return None, "file path is not a regular file"
+        except OSError:
+            pass
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(path, flags)
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode):
+            return None, "file path is not a regular file"
+        if file_stat.st_size > max_bytes:
+            return None, f"file exceeds the {max_bytes}-byte outbound limit"
+        with os.fdopen(fd, "rb") as stream:
+            fd = -1
+            payload = stream.read(max_bytes + 1)
+        if len(payload) > max_bytes:
+            return None, f"file exceeds the {max_bytes}-byte outbound limit"
+    except OSError as exc:
+        logger.debug("A2A: outbound file could not be read (%s)", type(exc).__name__)
+        return None, f"file could not be read ({type(exc).__name__})"
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    effective_type = _normalise_media_type(media_type) or mimetypes.guess_type(safe_name)[0]
+    part = {"raw": base64.b64encode(payload).decode("ascii"),
+            "filename": safe_name,
+            "mediaType": effective_type or "application/octet-stream"}
+    return part, ""
+
+
 def data_part(data: Any, media_type: str = "application/json") -> dict:
     """Build a v1.0 data Part (structured data, no ``kind`` field)."""
     return {"data": data, "mediaType": media_type}
 
 
-def text_message(role: str, text: str, context_id: str = "") -> dict:
-    """Build an A2A v1.0 Message with a single text Part."""
+def text_message(role: str, text: str, context_id: str = "", *,
+                 parts: Optional[list[dict]] = None) -> dict:
+    """Build a v1.0 Message, defaulting to a single text Part for compatibility."""
     msg: dict[str, Any] = {
         "role": role,  # ROLE_USER | ROLE_AGENT
-        "parts": [text_part(text)],
+        "parts": copy.deepcopy(parts) if parts is not None else [text_part(text)],
         "messageId": uuid.uuid4().hex,
     }
     if context_id:
@@ -814,8 +960,8 @@ def extract_text(message_or_params: dict, *, task_id: str = "",
                 entries.append((True, error + (f" ({mtype})" if mtype else "")))
             continue
         # v1.0 data part — include JSON content
-        data = part.get("data")
-        if data is not None:
+        if "data" in part:
+            data = part["data"]
             try:
                 rendered = json.dumps(data, ensure_ascii=False, default=str)
             except (TypeError, ValueError):
@@ -824,7 +970,7 @@ def extract_text(message_or_params: dict, *, task_id: str = "",
             entries.append((False, f"[data ({mtype})]\n{rendered}"))
             continue
         # v0.3 data part: kind == "data"
-        if part.get("kind") == "data" and part.get("data") is not None:
+        if part.get("kind") == "data" and "data" in part:
             try:
                 rendered = json.dumps(part["data"], ensure_ascii=False, default=str)
             except (TypeError, ValueError):
@@ -882,6 +1028,7 @@ def build_task(
     agent_text: str = "",
     *,
     created_at: str = "",
+    parts: Optional[list[dict]] = None,
 ) -> dict:
     """Build an A2A v1.0 Task object for a message/send result.
 
@@ -897,12 +1044,14 @@ def build_task(
         "contextId": context_id,
         "status": {"state": state, "timestamp": now},
     }
-    if agent_text:
-        task["status"]["message"] = text_message(ROLE_AGENT, agent_text, context_id)
+    reply_parts = copy.deepcopy(parts) if parts is not None else ([text_part(agent_text)] if agent_text else [])
+    if reply_parts:
+        task["status"]["message"] = text_message(
+            ROLE_AGENT, agent_text, context_id, parts=reply_parts)
         if state == STATE_COMPLETED:
             task["artifacts"] = [{
                 "artifactId": uuid.uuid4().hex,
-                "parts": [text_part(agent_text)],
+                "parts": copy.deepcopy(reply_parts),
             }]
     return task
 
@@ -911,23 +1060,27 @@ def build_task(
 # Streaming (v1.0 StreamResponse events)
 # --------------------------------------------------------------------------
 
-def status_update(task_id: str, context_id: str, state: str, text: str = "") -> dict:
+def status_update(task_id: str, context_id: str, state: str, text: str = "", *,
+                  parts: Optional[list[dict]] = None) -> dict:
     """v1.0 StreamResponse with a statusUpdate member."""
     status: dict[str, Any] = {"state": state, "timestamp": now_iso()}
-    if text:
-        status["message"] = text_message(ROLE_AGENT, text, context_id)
+    reply_parts = copy.deepcopy(parts) if parts is not None else ([text_part(text)] if text else [])
+    if reply_parts:
+        status["message"] = text_message(ROLE_AGENT, text, context_id, parts=reply_parts)
     return {"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}}
 
 
-def artifact_update(task_id: str, context_id: str, text: str) -> dict:
+def artifact_update(task_id: str, context_id: str, text: str = "", *,
+                    parts: Optional[list[dict]] = None) -> dict:
     """v1.0 StreamResponse with an artifactUpdate member."""
+    artifact_parts = copy.deepcopy(parts) if parts is not None else ([text_part(text)] if text else [])
     return {
         "artifactUpdate": {
             "taskId": task_id,
             "contextId": context_id,
             "artifact": {
                 "artifactId": uuid.uuid4().hex,
-                "parts": [text_part(text)],
+                "parts": artifact_parts,
             },
         }
     }
@@ -1162,6 +1315,7 @@ class TaskStore:
                 tenant TEXT NOT NULL DEFAULT '',
                 state TEXT NOT NULL,
                 reply TEXT NOT NULL DEFAULT '',
+                reply_parts TEXT NOT NULL DEFAULT '[]',
                 created_at REAL NOT NULL,
                 created_iso TEXT NOT NULL,
                 completed_at REAL,
@@ -1178,6 +1332,7 @@ class TaskStore:
             )""")
             columns = {row[1] for row in con.execute("PRAGMA table_info(a2a_tasks)")}
             for name, definition in (
+                ("reply_parts", "TEXT NOT NULL DEFAULT '[]'"),
                 ("direction", "TEXT NOT NULL DEFAULT 'inbound'"),
                 ("ownership", "TEXT NOT NULL DEFAULT 'local'"),
                 ("remote_state", "TEXT NOT NULL DEFAULT ''"),
@@ -1317,7 +1472,7 @@ class TaskStore:
                 rows = con.execute(
                     "SELECT task_id, context_id, peer, agent_slug, tenant, state,"
                     " reply, created_at, created_iso, completed_at, direction,"
-                    " ownership, remote_state FROM a2a_tasks"
+                    " ownership, remote_state, reply_parts FROM a2a_tasks"
                 ).fetchall()
             finally:
                 con.close()
@@ -1363,6 +1518,11 @@ class TaskStore:
                     "push_url": "", "push_config_id": "",
                     "direction": row[10], "ownership": row[11], "remote_state": row[12],
                 }
+                try:
+                    reply_parts = json.loads(row[13] or "[]")
+                except (TypeError, ValueError):
+                    reply_parts = []
+                rec["reply_parts"] = reply_parts if isinstance(reply_parts, list) else []
             except (IndexError, TypeError, ValueError) as exc:
                 # One malformed row must not discard the rest of the
                 # recovered set — bounded error, log and continue.
@@ -1401,17 +1561,19 @@ class TaskStore:
                 self._ensure_db(con)
                 con.execute(
                     "INSERT INTO a2a_tasks (task_id, context_id, peer, agent_slug,"
-                    " tenant, state, reply, created_at, created_iso, completed_at,"
+                    " tenant, state, reply, reply_parts, created_at, created_iso, completed_at,"
                     " direction, ownership, remote_state)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT(task_id) DO UPDATE SET state=excluded.state,"
-                    " reply=excluded.reply, completed_at=excluded.completed_at,"
+                    " reply=excluded.reply, reply_parts=excluded.reply_parts,"
+                    " completed_at=excluded.completed_at,"
                     " direction=excluded.direction, ownership=excluded.ownership,"
                     " remote_state=excluded.remote_state",
                     (
                         rec["task_id"], rec["context_id"], rec.get("peer", ""),
                         rec.get("agent_slug", ""), rec.get("tenant", ""),
                         rec["state"], rec.get("reply", ""),
+                        json.dumps(rec.get("reply_parts", []), ensure_ascii=False, separators=(",", ":")),
                         rec.get("created_at", 0.0), rec.get("created_iso", ""),
                         rec.get("completed_at"), rec.get("direction", "inbound"),
                         rec.get("ownership", "local"), rec.get("remote_state", ""),
@@ -1456,6 +1618,7 @@ class TaskStore:
             "tenant": tenant or "",
             "state": STATE_SUBMITTED,
             "reply": "",
+            "reply_parts": [],
             "created_at": time.time(),
             "created_iso": now_iso(),
             "push_url": "",
@@ -1589,7 +1752,8 @@ class TaskStore:
             logger.debug("A2A: context_peer lookup failed for %s", context_id, exc_info=True)
             return ""
 
-    def complete(self, task_id: str, state: str, reply: str = "") -> Optional[dict]:
+    def complete(self, task_id: str, state: str, reply: str = "",
+                 reply_parts: Optional[list[dict]] = None) -> Optional[dict]:
         """Transition a task to a terminal state. Idempotent."""
         watchers: list[Future] = []
         out = None
@@ -1599,6 +1763,7 @@ class TaskStore:
                 return None
             rec["state"] = state
             rec["reply"] = reply
+            rec["reply_parts"] = copy.deepcopy(reply_parts) if reply_parts is not None else []
             rec["completed_at"] = time.time()
             if rec.get("direction") == "outbound":
                 rec["remote_state"] = state
@@ -1708,6 +1873,7 @@ class TaskStore:
             rec["state"],
             rec.get("reply", ""),
             created_at=rec.get("created_iso", ""),
+            parts=rec.get("reply_parts") or None,
         )
         if not include_artifacts:
             task.pop("artifacts", None)

@@ -200,6 +200,8 @@ def test_agent_card_default_modes(gateway):
         for m in modes:
             assert isinstance(m, str) and "/" in m, \
                 f"{key} entries must be media-type strings, got {m!r}"
+    assert card["defaultInputModes"][0] == "text/plain"
+    assert card["defaultOutputModes"] == ["text/plain", "application/json"]
 
 
 def test_agent_card_skills_block(gateway):

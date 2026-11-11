@@ -275,6 +275,28 @@ admission slot so a JSON-RPC operation never queues behind a stalled attachment 
 body must arrive within 30 seconds of the request line or the adapter answers `408` and closes the
 connection.
 
+## Outbound content parts
+
+Outbound Agent Cards advertise `text/plain` and `application/json` by default, with text first.
+Configure the profile's `a2a.output_modes` list to advertise other MIME types; optional
+`a2a.skill_output_modes` maps toolset names to per-skill modes. Skill modes are also available to the
+shared reply path because A2A `SendMessage` does not identify a selected skill.
+
+```yaml
+a2a:
+  output_modes: [text/plain, application/json, image/png]
+  skill_output_modes:
+    image: [text/plain, image/png]
+```
+
+Replies become `DataPart`s only when the reply is valid JSON and both sides support
+`application/json`. Generated media referenced by `MEDIA:` directives or Markdown image links can
+be returned as `FilePart`s. Local files must be regular non-symlinks; raw output is capped at `20`
+MiB total per reply. Safe public HTTP(S) URLs are represented as URL file parts rather than fetched.
+The peer must include the part's media type in `acceptedOutputModes`; when the peer omits that field,
+only text parts are emitted and plain text replies remain unchanged. Completed reply parts are
+persisted and survive task-store restarts.
+
 ## Architecture
 
 ```text
@@ -294,14 +316,15 @@ The plugin uses the stdlib HTTP transport and the A2A JSON-RPC protocol. It has 
 |---|---|
 | `plugin.yaml` | Hermes plugin manifest |
 | `__init__.py` | Hermes plugin entry point; delegates to the implementation package |
-| `a2a_async_plugin/adapter.py` | Inbound A2A HTTP server, Agent Card, attachment ingestion, JSON-RPC/SSE dispatch, push notifications, and metrics |
+| `a2a_async_plugin/adapter.py` | Inbound A2A HTTP server, Agent Card, inbound and outbound part handling, JSON-RPC/SSE dispatch, push notifications, and metrics |
 | `a2a_async_plugin/tools.py` | Synchronous and asynchronous A2A client tools, task-result rendering, and registration |
-| `a2a_async_plugin/protocol.py` | A2A protocol helpers, inbound attachment materialization, Agent Card construction, and durable task store |
+| `a2a_async_plugin/protocol.py` | A2A protocol helpers, inbound/outbound parts and MIME negotiation, Agent Card construction, and durable task store |
 | `a2a_async_plugin/ownership.py` | Session-scoped task ownership and queued-message backlog |
 | `a2a_async_plugin/task_admin.py` | Operator CLI and slash commands for task ownership |
 | `a2a_async_plugin/watches.py` | Background watch manager: polling, leases, completion publishing |
 | `a2a_async_plugin/security.py` | Inbound authentication, bind safety, outbound redaction, and audit helpers |
 | `tests/test_inbound_files.py` | Regression tests for inbound file parts, safe URL downloads, and request limits |
+| `tests/test_outbound_parts.py` | Regression tests for negotiated DataPart/FilePart replies and persistence |
 
 ## Development
 

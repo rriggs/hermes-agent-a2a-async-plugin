@@ -23,6 +23,7 @@ import pytest
 
 from a2a_async_plugin import adapter as adapter_mod
 from a2a_async_plugin import protocol
+from a2a_async_plugin import security
 
 
 CTX = "ctx-deferred-1"
@@ -53,8 +54,11 @@ def _make_adapter(store, monkeypatch) -> "adapter_mod.A2AAdapter":
     return adp
 
 
-def _add_waiter(adp, task_id: str, context_id: str = CTX) -> Future:
-    fut = adp._add_pending(task_id, context_id)
+def _add_waiter(adp, task_id: str, context_id: str = CTX, *,
+                output_modes=None, accepted_output_modes=None) -> Future:
+    fut = adp._add_pending(
+        task_id, context_id,
+        output_modes=output_modes, accepted_output_modes=accepted_output_modes)
     adp.tasks.create(task_id, context_id, "peer-a")
     return fut
 
@@ -66,8 +70,9 @@ def _rec(store, task_id: str) -> dict:
 
 
 class _Event:
-    def __init__(self, task_id: str = "", context_id: str = CTX):
+    def __init__(self, task_id: str = "", context_id: str = CTX, *, internal: bool = False):
         self.message_id = task_id
+        self.internal = internal
         self.source = type("Source", (), {"chat_id": context_id})()
 
 
@@ -212,6 +217,95 @@ def test_caller_walk_away_does_not_cancel_a_deferred_task(isolated_home, monkeyp
     assert _rec(adp.tasks, "task-1")["state"] == protocol.STATE_WORKING
 
 
+def test_working_progress_is_egress_redacted(isolated_home, monkeypatch):
+    """Progress is outbound egress on its own; final-report redaction is too late."""
+    adp = _make_adapter(protocol.TaskStore(), monkeypatch)
+    _add_waiter(adp, "task-progress")
+    adp._note_turn_start(CTX, "task-progress")
+    text = "Contact synthetic-review@example.invalid for status"
+    expected = security.redact_outbound(text)
+    assert expected != text, "the control must actually redact"
+
+    asyncio.run(adp.send(CTX, "[WORKING] " + text, metadata={"notify": True}))
+
+    rec = _rec(adp.tasks, "task-progress")
+    rendered = protocol.TaskStore.to_task(rec)["status"]["message"]["parts"][0]["text"]
+    assert rendered == expected
+    assert "synthetic-review@example.invalid" not in rec["reply"]
+
+
+def test_a_steered_arrival_does_not_steal_the_deferred_report(isolated_home, monkeypatch):
+    """The wake turn's reply belongs to the arrival AND the deferred task."""
+    adp = _make_adapter(protocol.TaskStore(), monkeypatch)
+    original = _add_waiter(adp, "task-original")
+    adp._note_turn_start(CTX, "task-original")
+    asyncio.run(adp.send(CTX, "[WORKING] building", metadata={"notify": True}))
+
+    # Synthetic background turn: internal, no message id.
+    wake = _Event("", internal=True)
+    asyncio.run(adp.on_processing_start(wake))  # type: ignore[arg-type]
+    arriving = _add_waiter(adp, "task-arriving")
+    adp._note_arrival(CTX, "task-arriving", folded_into_turn=True)
+
+    asyncio.run(adp.send(CTX, "the completed build report", metadata={"notify": True}))
+
+    assert arriving.result(timeout=0) == (
+        protocol.STATE_COMPLETED, "the completed build report")
+    assert original.result(timeout=0) == (
+        protocol.STATE_COMPLETED, "the completed build report")
+
+
+@pytest.mark.parametrize("disconnect", [False, True])
+def test_a_deferred_report_keeps_json_negotiation(isolated_home, monkeypatch, disconnect):
+    adp = _make_adapter(protocol.TaskStore(), monkeypatch)
+    fut = _add_waiter(
+        adp, "task-json", output_modes=["application/json"],
+        accepted_output_modes=["application/json"])
+    adp._note_turn_start(CTX, "task-json")
+    asyncio.run(adp.send(CTX, "[WORKING] building", metadata={"notify": True}))
+    if disconnect:
+        adp._pop_pending("task-json")
+
+    asyncio.run(adp.send(CTX, '{"result": 42}', metadata={"notify": True}))
+
+    if not disconnect:
+        state, reply = fut.result(timeout=0)
+        adp._finalize_task(
+            {"task_id": "task-json", "context_id": CTX, "peer": "peer-a",
+             "started": time.time()},
+            state, reply,
+        )
+    rec = _rec(adp.tasks, "task-json")
+    parts = protocol.TaskStore.to_task(rec)["artifacts"][0]["parts"]
+    assert parts == [protocol.data_part({"result": 42})], parts
+
+
+@pytest.mark.parametrize("disconnect", [False, True])
+def test_a_deferred_report_keeps_file_parts(isolated_home, monkeypatch, disconnect):
+    adp = _make_adapter(protocol.TaskStore(), monkeypatch)
+    fut = _add_waiter(
+        adp, "task-file", output_modes=["image/png"],
+        accepted_output_modes=["image/png"])
+    adp._note_turn_start(CTX, "task-file")
+    asyncio.run(adp.send(CTX, "[WORKING] building", metadata={"notify": True}))
+    if disconnect:
+        adp._pop_pending("task-file")
+    path = isolated_home / "report.png"
+    path.write_bytes(b"synthetic-image-payload")
+
+    asyncio.run(adp.send(CTX, f"report\nMEDIA:{path}", metadata={"notify": True}))
+
+    if not disconnect:
+        state, reply = fut.result(timeout=0)
+        adp._finalize_task(
+            {"task_id": "task-file", "context_id": CTX, "peer": "peer-a",
+             "started": time.time()},
+            state, reply,
+        )
+    rec = _rec(adp.tasks, "task-file")
+    assert any("raw" in part for part in rec["reply_parts"]), rec["reply_parts"]
+
+
 def test_a_second_working_reply_refreshes_the_progress(isolated_home, monkeypatch):
     adp = _make_adapter(protocol.TaskStore(), monkeypatch)
     waiter = _add_waiter(adp, "task-1")
@@ -311,14 +405,16 @@ def test_deferred_at_survives_a_v10_migration(tmp_path):
     store.complete("task-v10", protocol.STATE_COMPLETED, "legacy reply")
     with sqlite3.connect(db_path) as con:
         con.execute("ALTER TABLE a2a_tasks DROP COLUMN deferred_at")
+        con.execute("ALTER TABLE a2a_tasks DROP COLUMN output_settings")
         con.execute("PRAGMA user_version = 10")
 
     migrated = protocol.TaskStore(str(db_path))
     rec = _rec(migrated, "task-v10")
     assert rec["reply"] == "legacy reply"
     assert rec["deferred_at"] == 0
+    assert rec["output_settings"] == {}
     with sqlite3.connect(db_path) as con:
         columns = {row[1] for row in con.execute("PRAGMA table_info(a2a_tasks)")}
         version = int(con.execute("PRAGMA user_version").fetchone()[0])
-    assert "deferred_at" in columns
+    assert {"deferred_at", "output_settings"} <= columns
     assert version == protocol.A2A_TASK_SCHEMA_VERSION

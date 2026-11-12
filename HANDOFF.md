@@ -18,16 +18,23 @@ Current state:
 - Working tree: `0.6.0`, schema 11, implements Issue
   [#25](https://github.com/rriggs/hermes-agent-a2a-async-plugin/issues/25): the `[WORKING]`
   deferral marker keeps an inbound task non-terminal across the turn that starts background work,
-  and the later report completes it. Uncommitted at the time of this note.
+  and the later report completes it. Round-1 review fixes are also in the worktree: progress text
+  is egress-redacted before it reaches the row or a Part, a steered arrival no longer consumes the
+  deferred task's report, and the caller's output negotiation is persisted for the durable
+  completion path. Uncommitted at the time of this note.
+- PR [#26](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/26) is open at `7b07995`;
+  Amy's first review returned REQUEST CHANGES with three boundary findings, all fixed in the
+  worktree and verified against her probes.
 - Open issue: #25. Issues #21, #20, #14 and earlier are closed.
-- Verification for this diff: host suite 469 passed, 3 skipped; clean-export container suite
-  470 passed, 2 skipped with all three `a2a-sdk` interoperability tests; TUI delivery and classic
-  CLI refusal E2Es PASS (2026-11-12, export from `3d85e4a` plus this diff).
+- Verification for the review-fix diff: host suite 475 passed, 3 skipped; clean-export container
+  suite 476 passed, 2 skipped with all three `a2a-sdk` interoperability tests; TUI delivery and
+  classic CLI refusal E2Es PASS; Amy's six PR26 probes pass (2026-11-12).
 
 The plugin manifest declares:
 
 - name: `a2a-async`
-- version: `0.6.0` (0.5.1 plus the Issue #25 deferral path and schema 10 to 11 `deferred_at` column)
+- version: `0.6.0` (0.5.1 plus the Issue #25 deferral path and schema 10 to 11 `deferred_at` and
+  `output_settings` columns)
 - kind: `platform`
 - requires Hermes: `>=0.22.2`
 - thirteen tools in the shared `a2a` toolset

@@ -656,6 +656,10 @@ class A2AAdapter(BasePlatformAdapter):
         # Kept across the deferring turn so the background-completion turn (which
         # has no message id and therefore no _turn_tasks record) can settle them.
         self._deferred: Dict[str, list[str]] = {}
+        # Contexts whose current turn is a synthetic background-completion wake.
+        # That turn has no trigger task id, so an arrival steered into it would
+        # otherwise consume the report and leave the deferred task pending.
+        self._reporting_turns: Dict[str, bool] = {}
         self._turn_lock = threading.Lock()
 
         # Orphaned task watchdog
@@ -1127,7 +1131,14 @@ class A2AAdapter(BasePlatformAdapter):
         blocking HTTP thread) keeps waiting, and the background-completion turn's
         final send resolves it with the real result. The durable row carries the
         progress text in ``status.message`` so GetTask and watches see WORKING.
+
+        The progress text is outbound egress on its own: it is redacted before it
+        is rendered or stored, not only when a later final report is finalized.
         """
+        # Egress scrub before the text reaches any Part, the row, or the audit log.
+        text = security.redact_outbound(text or "")
+        if raw_text is not None:
+            raw_text = security.redact_outbound(raw_text)
         had_record, batch = self._take_turn_batch(context_id)
         if not had_record:
             # A deferral sent outside a recorded turn (direct call / late send):
@@ -1154,7 +1165,13 @@ class A2AAdapter(BasePlatformAdapter):
                 accepted_output_modes=settings.get("accepted_output_modes"),
                 raw_text=raw_text,
             )
-            stored = self.tasks.defer(task_id, protocol.STATE_WORKING, text, reply_parts=parts)
+            stored = self.tasks.defer(
+                task_id, protocol.STATE_WORKING, text, reply_parts=parts,
+                output_settings={
+                    "output_modes": settings.get("output_modes", self._output_modes),
+                    "accepted_output_modes": settings.get("accepted_output_modes"),
+                },
+            )
             if stored:
                 security.audit("outbound", str(stored.get("peer") or ""), task_id, text)
                 deferred_ids.append(task_id)
@@ -1214,7 +1231,10 @@ class A2AAdapter(BasePlatformAdapter):
             "peer": rec.get("peer", ""),
             "started": rec.get("created_at", time.time()),
         }
-        self._finalize_task(pending, state, text, attachments=attachments, raw_text=raw_text)
+        self._finalize_task(
+            pending, state, text, attachments=attachments, raw_text=raw_text,
+            output_settings=rec.get("output_settings") or None,
+        )
         return True
 
     def _arrival_folds_into_turn(self, event: MessageEvent) -> bool:
@@ -1566,7 +1586,8 @@ class A2AAdapter(BasePlatformAdapter):
 
     def _finalize_task(self, pending: dict, state: str, reply: str, *,
                        attachments: Optional[list[dict]] = None,
-                       raw_text: Optional[str] = None) -> tuple[str, str]:
+                       raw_text: Optional[str] = None,
+                       output_settings: Optional[dict] = None) -> tuple[str, str]:
         """Record the outcome of a dispatched task. Returns (state, reply) after
         redaction and input-required detection.
 
@@ -1580,6 +1601,8 @@ class A2AAdapter(BasePlatformAdapter):
         ``attachments``/``raw_text`` are the direct-completion path for a deferred
         row whose waiter is gone; the normal path reads them from
         ``_pending_output_settings`` (populated by ``_resolve_task``).
+        ``output_settings`` restores the caller's negotiated output modes on that
+        direct path, where ``_pending_output_settings`` was already popped.
         """
         task_id = pending["task_id"]
         context_id = pending["context_id"]
@@ -1613,18 +1636,20 @@ class A2AAdapter(BasePlatformAdapter):
             security.audit("outbound", peer, task_id, reply)
 
             with self._pending_lock:
-                output_settings = dict(self._pending_output_settings.get(task_id) or {})
-                output_settings["attachments"] = list(
+                resolved = dict(
+                    output_settings if output_settings is not None
+                    else (self._pending_output_settings.get(task_id) or {}))
+                resolved["attachments"] = list(
                     attachments if attachments is not None
-                    else (output_settings.get("attachments") or []))
+                    else (resolved.get("attachments") or []))
                 if raw_text is not None:
-                    output_settings["raw_text"] = raw_text
+                    resolved["raw_text"] = raw_text
             reply_parts = self._negotiated_parts(
                 reply,
-                output_settings.get("attachments"),
-                output_modes=output_settings.get("output_modes", self._output_modes),
-                accepted_output_modes=output_settings.get("accepted_output_modes"),
-                raw_text=output_settings.get("raw_text"),
+                resolved.get("attachments"),
+                output_modes=resolved.get("output_modes", self._output_modes),
+                accepted_output_modes=resolved.get("accepted_output_modes"),
+                raw_text=resolved.get("raw_text"),
             )
             stored = self.tasks.complete(task_id, state, reply, reply_parts=reply_parts)
             if stored is None:
@@ -2204,11 +2229,32 @@ class A2AAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=True, message_id=message_id)
 
+        with self._turn_lock:
+            # A wake turn has no trigger record; an arrival folded into it is the
+            # only turn record present. That shape, with deferred work waiting,
+            # identifies the reporting turn even on paths that did not call
+            # on_processing_start (direct sends, tests).
+            reporting = self._reporting_turns.get(chat_id, False) or (
+                chat_id in self._arrived
+                and chat_id not in self._turn_tasks
+                and bool(self._deferred.get(chat_id)))
         settled = self._settle_turn(
             chat_id, protocol.STATE_COMPLETED, reply_text, attachments,
             raw_text=content or "",
         )
-        if settled is None:
+        with self._turn_lock:
+            self._reporting_turns.pop(chat_id, None)
+        if reporting:
+            # This is the synthetic background-completion turn. Its reply belongs
+            # to the deferred task(s) it is reporting on, even when a peer message
+            # steered into the turn was also answered by it. Settle both recipients.
+            reported = self._settle_deferred(
+                chat_id, protocol.STATE_COMPLETED, reply_text, attachments,
+                raw_text=content or "",
+            )
+            if reported:
+                settled = (settled or 0) + reported
+        elif settled is None:
             # A later turn (notably the synthetic background-completion wake,
             # which has no message id) reports the result of a deferred task.
             settled = self._settle_deferred(
@@ -2459,9 +2505,17 @@ class A2AAdapter(BasePlatformAdapter):
 
         The turn's reply settles it by identity rather than by arrival order, which
         is what stops a reply from landing on a task that is still queued behind it.
+        A synthetic internal event with no message id is the background-completion
+        wake: it has no task of its own, but its reply owns the deferred task(s) it
+        is reporting on, plus any peer message steered into it.
         """
         context_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
-        self._note_turn_start(context_id, str(getattr(event, "message_id", "") or ""))
+        task_id = str(getattr(event, "message_id", "") or "")
+        if context_id and not task_id and getattr(event, "internal", False):
+            with self._turn_lock:
+                self._reporting_turns[context_id] = True
+            return
+        self._note_turn_start(context_id, task_id)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Resolve the task future(s) when processing ends without a reply send.
@@ -2489,7 +2543,10 @@ class A2AAdapter(BasePlatformAdapter):
                 self._resolve_task(task_id, state, text)
         if context_id:
             # The turn is over: any attachments it never delivered must not
-            # outlive it in memory.
+            # outlive it in memory, and a reporting-turn flag that never reached
+            # send() must not leak into the next turn.
+            with self._turn_lock:
+                self._reporting_turns.pop(context_id, None)
             self._drop_turn_attachments(context_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:

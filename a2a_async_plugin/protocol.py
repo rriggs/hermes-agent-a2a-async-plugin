@@ -1371,7 +1371,8 @@ class TaskStore:
                 unowned_since REAL NOT NULL DEFAULT 0,
                 cancel_requested_at REAL NOT NULL DEFAULT 0,
                 reconciled_at REAL NOT NULL DEFAULT 0,
-                deferred_at REAL NOT NULL DEFAULT 0
+                deferred_at REAL NOT NULL DEFAULT 0,
+                output_settings TEXT NOT NULL DEFAULT '{}'
             )""")
             columns = {row[1] for row in con.execute("PRAGMA table_info(a2a_tasks)")}
             for name, definition in (
@@ -1396,6 +1397,12 @@ class TaskStore:
                 # row is waiting for that report, not for a caller reply, so the 300s orphan
                 # watchdog must not fail it.
                 ("deferred_at", "REAL NOT NULL DEFAULT 0"),
+                # Output negotiation at admission (schema v11, issue #25 review P2): the
+                # durable deferred-completion path must render JSON/FileParts with the
+                # modes the caller actually accepted, even after _pending_output_settings
+                # is popped with the waiter. JSON: {"output_modes": [...],
+                # "accepted_output_modes": [...] | null}.
+                ("output_settings", "TEXT NOT NULL DEFAULT '{}'"),
             ):
                 if name not in columns:
                     con.execute(f"ALTER TABLE a2a_tasks ADD COLUMN {name} {definition}")
@@ -1534,7 +1541,8 @@ class TaskStore:
                 rows = con.execute(
                     "SELECT task_id, context_id, peer, agent_slug, tenant, state,"
                     " reply, created_at, created_iso, completed_at, direction,"
-                    " ownership, remote_state, reply_parts, deferred_at FROM a2a_tasks"
+                    " ownership, remote_state, reply_parts, deferred_at, output_settings"
+                    " FROM a2a_tasks"
                 ).fetchall()
             finally:
                 con.close()
@@ -1586,6 +1594,11 @@ class TaskStore:
                 except (TypeError, ValueError):
                     reply_parts = []
                 rec["reply_parts"] = reply_parts if isinstance(reply_parts, list) else []
+                try:
+                    output_settings = json.loads(row[15] or "{}")
+                except (TypeError, ValueError):
+                    output_settings = {}
+                rec["output_settings"] = output_settings if isinstance(output_settings, dict) else {}
             except (IndexError, TypeError, ValueError) as exc:
                 # One malformed row must not discard the rest of the
                 # recovered set — bounded error, log and continue.
@@ -1626,13 +1639,14 @@ class TaskStore:
                 con.execute(
                     "INSERT INTO a2a_tasks (task_id, context_id, peer, agent_slug,"
                     " tenant, state, reply, reply_parts, created_at, created_iso, completed_at,"
-                    " direction, ownership, remote_state, deferred_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    " direction, ownership, remote_state, deferred_at, output_settings)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT(task_id) DO UPDATE SET state=excluded.state,"
                     " reply=excluded.reply, reply_parts=excluded.reply_parts,"
                     " completed_at=excluded.completed_at,"
                     " direction=excluded.direction, ownership=excluded.ownership,"
-                    " remote_state=excluded.remote_state, deferred_at=excluded.deferred_at",
+                    " remote_state=excluded.remote_state, deferred_at=excluded.deferred_at,"
+                    " output_settings=excluded.output_settings",
                     (
                         rec["task_id"], rec["context_id"], rec.get("peer", ""),
                         rec.get("agent_slug", ""), rec.get("tenant", ""),
@@ -1642,6 +1656,8 @@ class TaskStore:
                         rec.get("completed_at"), rec.get("direction", "inbound"),
                         rec.get("ownership", "local"), rec.get("remote_state", ""),
                         rec.get("deferred_at", 0.0),
+                        json.dumps(rec.get("output_settings") or {}, ensure_ascii=False,
+                                   separators=(",", ":")),
                     ),
                 )
                 con.commit()
@@ -1692,6 +1708,7 @@ class TaskStore:
             "ownership": ownership or "local",
             "remote_state": remote_state or "",
             "deferred_at": 0.0,
+            "output_settings": {},
         }
         with self._lock:
             self._tasks[task_id] = rec
@@ -1846,7 +1863,8 @@ class TaskStore:
         return out
 
     def defer(self, task_id: str, state: str, reply: str = "",
-              reply_parts: Optional[list[dict]] = None) -> Optional[dict]:
+              reply_parts: Optional[list[dict]] = None,
+              output_settings: Optional[dict] = None) -> Optional[dict]:
         """Record a non-terminal progress observation and keep the task open.
 
         The agent reported that the work continues past this turn. The row stays
@@ -1854,6 +1872,10 @@ class TaskStore:
         puts non-completed output there), and ``deferred_at`` marks it as waiting
         for the agent's own later report rather than for a caller reply. The
         orphan watchdog must not treat that as an orphan.
+
+        ``output_settings`` carries the caller's negotiated output modes onto the
+        row so the durable completion path can still emit DataPart/FilePart after
+        the in-memory waiter (and its settings) is gone.
         """
         with self._lock:
             rec = self._tasks.get(task_id)
@@ -1865,6 +1887,8 @@ class TaskStore:
             rec["reply"] = reply
             rec["reply_parts"] = copy.deepcopy(reply_parts) if reply_parts is not None else []
             rec["deferred_at"] = time.time()
+            if output_settings is not None:
+                rec["output_settings"] = copy.deepcopy(output_settings)
             out = dict(rec)
         self._persist(out)
         return out

@@ -44,6 +44,20 @@ def register(ctx) -> None:
     from .task_admin import dispatch_namespace, register_cli, slash_command
 
     register_tools(ctx)
+    # Tell the agent how to keep an inbound A2A task open when it starts
+    # background work. Register best-effort so older hosts still load the plugin.
+    register_prompt_section = getattr(ctx, "register_system_prompt_section", None)
+    if register_prompt_section is not None:
+        try:
+            register_prompt_section(
+                "a2a-working-marker",
+                "When you are answering an inbound A2A task and you start background work "
+                "that will finish after this turn, begin your reply with [WORKING]. The "
+                "task stays open and your next reply in that A2A conversation completes "
+                "it. Do not use [WORKING] for a normal final answer.",
+            )
+        except Exception:
+            logger.debug("A2A: could not register the [WORKING] prompt section", exc_info=True)
     # Operator commands, not agent tools: ownership release/transfer is an explicit user action.
     # Guarded so older hosts and minimal test contexts still load the tool surface.
     register_cli_command = getattr(ctx, "register_cli_command", None)

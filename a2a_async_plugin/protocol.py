@@ -54,7 +54,7 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = "1.0"
-A2A_TASK_SCHEMA_VERSION = 10
+A2A_TASK_SCHEMA_VERSION = 11
 MAX_OUTBOUND_FILE_BYTES = 20 * 1024 * 1024
 _DEFAULT_OUTPUT_MODES = ("text/plain", "application/json")
 
@@ -102,6 +102,12 @@ ROLE_AGENT = "ROLE_AGENT"
 # the peer before it can complete the task; the adapter maps such replies to
 # TASK_STATE_INPUT_REQUIRED (marker stripped, text in status.message).
 INPUT_REQUIRED_MARKER = "[INPUT_REQUIRED]"
+
+# The agent starts its reply with this marker when the task will outlive the
+# turn because it started background work; the adapter maps such replies to
+# TASK_STATE_WORKING and keeps the task open (marker stripped, text in
+# status.message). The next turn-final reply in the context completes it.
+WORKING_MARKER = "[WORKING]"
 
 # JSON-RPC / A2A error codes.
 # -32001..-32003 are A2A spec-defined and used only with their spec semantics.
@@ -1364,7 +1370,8 @@ class TaskStore:
                 released_at REAL NOT NULL DEFAULT 0,
                 unowned_since REAL NOT NULL DEFAULT 0,
                 cancel_requested_at REAL NOT NULL DEFAULT 0,
-                reconciled_at REAL NOT NULL DEFAULT 0
+                reconciled_at REAL NOT NULL DEFAULT 0,
+                deferred_at REAL NOT NULL DEFAULT 0
             )""")
             columns = {row[1] for row in con.execute("PRAGMA table_info(a2a_tasks)")}
             for name, definition in (
@@ -1384,6 +1391,11 @@ class TaskStore:
                 # checked against its peer. Independent of ownership so an unowned row gets
                 # exactly one GetTask per interval instead of one per poller pass.
                 ("reconciled_at", "REAL NOT NULL DEFAULT 0"),
+                # Deferral (schema v11, issue #25): the agent reported a non-terminal
+                # progress note and will send the result on a later turn. Non-zero means the
+                # row is waiting for that report, not for a caller reply, so the 300s orphan
+                # watchdog must not fail it.
+                ("deferred_at", "REAL NOT NULL DEFAULT 0"),
             ):
                 if name not in columns:
                     con.execute(f"ALTER TABLE a2a_tasks ADD COLUMN {name} {definition}")
@@ -1522,7 +1534,7 @@ class TaskStore:
                 rows = con.execute(
                     "SELECT task_id, context_id, peer, agent_slug, tenant, state,"
                     " reply, created_at, created_iso, completed_at, direction,"
-                    " ownership, remote_state, reply_parts FROM a2a_tasks"
+                    " ownership, remote_state, reply_parts, deferred_at FROM a2a_tasks"
                 ).fetchall()
             finally:
                 con.close()
@@ -1567,6 +1579,7 @@ class TaskStore:
                     "reply": row[6], "created_at": row[7], "created_iso": row[8],
                     "push_url": "", "push_config_id": "",
                     "direction": row[10], "ownership": row[11], "remote_state": row[12],
+                    "deferred_at": float(row[14] or 0.0),
                 }
                 try:
                     reply_parts = json.loads(row[13] or "[]")
@@ -1589,6 +1602,7 @@ class TaskStore:
                 rec["state"] = STATE_FAILED
                 rec["reply"] = "[gateway restarted before task completed]"
                 rec["completed_at"] = time.time()
+                rec["deferred_at"] = 0.0
                 restarted += 1
             with self._lock:
                 if rec["task_id"] not in self._tasks:
@@ -1612,13 +1626,13 @@ class TaskStore:
                 con.execute(
                     "INSERT INTO a2a_tasks (task_id, context_id, peer, agent_slug,"
                     " tenant, state, reply, reply_parts, created_at, created_iso, completed_at,"
-                    " direction, ownership, remote_state)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                    " direction, ownership, remote_state, deferred_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                     " ON CONFLICT(task_id) DO UPDATE SET state=excluded.state,"
                     " reply=excluded.reply, reply_parts=excluded.reply_parts,"
                     " completed_at=excluded.completed_at,"
                     " direction=excluded.direction, ownership=excluded.ownership,"
-                    " remote_state=excluded.remote_state",
+                    " remote_state=excluded.remote_state, deferred_at=excluded.deferred_at",
                     (
                         rec["task_id"], rec["context_id"], rec.get("peer", ""),
                         rec.get("agent_slug", ""), rec.get("tenant", ""),
@@ -1627,6 +1641,7 @@ class TaskStore:
                         rec.get("created_at", 0.0), rec.get("created_iso", ""),
                         rec.get("completed_at"), rec.get("direction", "inbound"),
                         rec.get("ownership", "local"), rec.get("remote_state", ""),
+                        rec.get("deferred_at", 0.0),
                     ),
                 )
                 con.commit()
@@ -1676,6 +1691,7 @@ class TaskStore:
             "direction": direction or "inbound",
             "ownership": ownership or "local",
             "remote_state": remote_state or "",
+            "deferred_at": 0.0,
         }
         with self._lock:
             self._tasks[task_id] = rec
@@ -1815,6 +1831,9 @@ class TaskStore:
             rec["reply"] = reply
             rec["reply_parts"] = copy.deepcopy(reply_parts) if reply_parts is not None else []
             rec["completed_at"] = time.time()
+            # Any terminal transition ends the deferral window. INPUT_REQUIRED is
+            # non-terminal but still ends the "agent is working" state.
+            rec["deferred_at"] = 0.0
             if rec.get("direction") == "outbound":
                 rec["remote_state"] = state
             watchers = self._watchers.pop(task_id, [])
@@ -1825,6 +1844,49 @@ class TaskStore:
             if not fut.done():
                 fut.set_result((state, reply))
         return out
+
+    def defer(self, task_id: str, state: str, reply: str = "",
+              reply_parts: Optional[list[dict]] = None) -> Optional[dict]:
+        """Record a non-terminal progress observation and keep the task open.
+
+        The agent reported that the work continues past this turn. The row stays
+        non-terminal, the text is exposed as a status Message (``build_task``
+        puts non-completed output there), and ``deferred_at`` marks it as waiting
+        for the agent's own later report rather than for a caller reply. The
+        orphan watchdog must not treat that as an orphan.
+        """
+        with self._lock:
+            rec = self._tasks.get(task_id)
+            if not rec or rec["state"] in TERMINAL_STATES:
+                return None
+            if state in TERMINAL_STATES:
+                return None
+            rec["state"] = state or STATE_WORKING
+            rec["reply"] = reply
+            rec["reply_parts"] = copy.deepcopy(reply_parts) if reply_parts is not None else []
+            rec["deferred_at"] = time.time()
+            out = dict(rec)
+        self._persist(out)
+        return out
+
+    def oldest_deferred(self, context_id: str, agent_slug: str = "",
+                        tenant: str = "") -> Optional[dict]:
+        """The oldest non-terminal deferred inbound task in this context.
+
+        Used when a later turn's report arrives after the in-memory waiter is
+        gone (a blocking caller disconnected, or the finalizer thread ended). The
+        row, not the queue, is the durable record of the deferral.
+        """
+        with self._lock:
+            for rec in self._tasks.values():
+                if (rec.get("context_id") != context_id
+                        or rec.get("direction", "inbound") != "inbound"
+                        or rec.get("state") in TERMINAL_STATES
+                        or not rec.get("deferred_at")
+                        or not self._in_scope(rec, agent_slug, tenant)):
+                    continue
+                return dict(rec)
+        return None
 
     def watch(self, task_id: str, agent_slug: str = "", tenant: str = "") -> Optional[Future]:
         with self._lock:
@@ -1870,8 +1932,9 @@ class TaskStore:
         return page, next_offset
 
     def fail_orphans(self, timeout_seconds: int = 300,
-                     protected: Optional["set[str]"] = None) -> list[str]:
-        """Fail non-terminal LOCAL-INBOUND tasks older than ``timeout_seconds``.
+                     protected: Optional["set[str]"] = None,
+                     *, deferred_timeout_seconds: float = 28800.0) -> list[str]:
+        """Fail non-terminal LOCAL-INBOUND tasks that nobody is coming to finish.
 
         Only inbound/local rows are eligible: on the callee side a pending
         task with no waiter and no progress is genuinely orphaned — nobody
@@ -1889,21 +1952,39 @@ class TaskStore:
         is still connected and waiting — an orphaned task by definition has
         nobody waiting. Async-accepted long tasks are additionally bounded by
         their own A2A_ASYNC_TIMEOUT deadline in the finalizer thread.
+
+        Two states are waiting on somebody who is not the watchdog:
+
+        - ``INPUT_REQUIRED`` is waiting on the CALLER. The caller may answer
+          minutes or hours later; failing it after 300 seconds changes a
+          truthful "needs input" into a false "failed" (issue #25). It stays
+          until the caller answers or cancels it.
+        - A deferred task (``deferred_at`` set) is waiting on the AGENT's own
+          later report. It gets ``deferred_timeout_seconds`` (the async task
+          lifetime), not the 300-second orphan window (issue #25).
         """
         protected = protected or set()
         with self._lock:
             now = time.time()
-            stale = [
-                tid for tid, rec in self._tasks.items()
-                if rec["state"] not in TERMINAL_STATES
-                and tid not in protected
-                and rec.get("direction", "inbound") == "inbound"
-                and rec.get("ownership", "local") == "local"
-                and now - rec["created_at"] > timeout_seconds
-            ]
+            stale: list[tuple[str, str]] = []
+            for tid, rec in self._tasks.items():
+                if (rec["state"] in TERMINAL_STATES
+                        or tid in protected
+                        or rec.get("direction", "inbound") != "inbound"
+                        or rec.get("ownership", "local") != "local"):
+                    continue
+                if rec["state"] == STATE_INPUT_REQUIRED:
+                    continue
+                deferred_at = float(rec.get("deferred_at") or 0.0)
+                if deferred_at > 0:
+                    if now - deferred_at > deferred_timeout_seconds:
+                        stale.append((tid, "[deferred task expired — no result reported]"))
+                    continue
+                if now - rec["created_at"] > timeout_seconds:
+                    stale.append((tid, "[task orphaned — no reply produced]"))
         failed = []
-        for tid in stale:
-            if self.complete(tid, STATE_FAILED, "[task orphaned — no reply produced]"):
+        for tid, reason in stale:
+            if self.complete(tid, STATE_FAILED, reason):
                 failed.append(tid)
         return failed
 

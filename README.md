@@ -59,6 +59,25 @@ deadline is required.
 Profile-forwarded tasks keep a bounded dispatch timeout (default 300s): expiry kills the child
 process, so the `FAILED` outcome there is truthful.
 
+### Work that outlives the turn
+
+A turn-final reply is normally the task's answer. If the agent starts background work and cannot
+finish inside the turn, it begins its reply with `[WORKING]`:
+
+```text
+[WORKING] build at 15%, sims green; will report the resource table when the run finishes
+```
+
+The adapter strips the marker and records `TASK_STATE_WORKING` with the text in `status.message`,
+so `GetTask`, `a2a_get_task`, and watches see a progress note and keep the task open. The task
+completes when the agent's next reply in the same A2A context arrives, normally from the
+background-completion turn; that reply becomes the artifact. `A2A_ASYNC_TIMEOUT` bounds the whole
+deferral. A blocking caller's disconnect or reply timeout ends the wait, not the task: the report is
+still recorded when it arrives, and the caller can poll `GetTask` for it.
+
+Without the marker the first reply completes the task, exactly as before. Use `[WORKING]` whenever
+a background process or other deferred work will produce the result later.
+
 ## Task ownership
 
 A task is either **unowned** or **owned by exactly one session**. Ownership belongs to the session,

@@ -305,6 +305,36 @@ def test_a_terminal_state_injects_one_message_and_updates_the_task_record(tmp_pa
     assert len(manager.ctx.injected) == 1
 
 
+def test_a_working_progress_note_is_delivered_and_the_watch_stays_open(tmp_path):
+    """A [WORKING] status message is a progress note, not the task result (issue #25)."""
+    def working_note(text):
+        return {
+            "id": "t1", "contextId": "ctx-1",
+            "status": {
+                "state": protocol.STATE_WORKING,
+                "message": {"role": "ROLE_AGENT", "parts": [{"text": text}]},
+            },
+        }
+
+    poll = ScriptedPoll(
+        working_note("build at 15%"),
+        task_payload(state=protocol.STATE_COMPLETED, text="build finished"),
+    )
+    manager = _manager(poll)
+    watch = _add(manager)
+
+    assert manager.run_once(now=100.0) == 1
+    [progress] = manager.ctx.injected
+    assert "build at 15%" in progress["content"]
+    stored = _store().get(watch["watch_id"])
+    assert stored["state"] == watches.WATCH_ACTIVE, "a progress note must not close the watch"
+    assert stored["items"][0]["state"] != watches.ITEM_DONE
+
+    assert manager.run_once(now=200.0) == 1
+    assert "build finished" in manager.ctx.injected[-1]["content"]
+    assert _store().get(watch["watch_id"])["state"] == watches.WATCH_COMPLETE
+
+
 def test_one_completion_per_task_while_siblings_keep_running():
     poll = ScriptedPoll(
         task_payload(task_id="t1", state=protocol.STATE_COMPLETED, text="one done"),

@@ -306,6 +306,87 @@ def test_a_deferred_report_keeps_file_parts(isolated_home, monkeypatch, disconne
     assert any("raw" in part for part in rec["reply_parts"]), rec["reply_parts"]
 
 
+def _host_event(adp, context_id: str, task_id: str | None = None, *, internal: bool = False):
+    from gateway.platforms.base import MessageEvent, MessageType
+
+    event = MessageEvent(
+        text="generate", message_type=MessageType.TEXT,
+        source=adp.build_source(chat_id=context_id, chat_type="dm", user_id="peer"),
+        message_id=task_id,
+    )
+    event.internal = internal
+    return event
+
+
+def test_file_only_report_reaches_a_deferred_caller_with_a_steered_arrival(
+        isolated_home, monkeypatch):
+    """The file-only host path must use the same recipient union as text."""
+    adp = _make_adapter(protocol.TaskStore(), monkeypatch)
+    original = _add_waiter(
+        adp, "task-original", output_modes=["image/png"],
+        accepted_output_modes=["image/png"])
+    adp._note_turn_start(CTX, "task-original")
+    asyncio.run(adp.send(CTX, "[WORKING] building", metadata={"notify": True}))
+    path = isolated_home / "report.png"
+    path.write_bytes(b"synthetic-image-payload")
+
+    async def handler(event):
+        _add_waiter(adp, "task-arriving", output_modes=["image/png"],
+                    accepted_output_modes=["image/png"])
+        adp._note_arrival(CTX, "task-arriving", folded_into_turn=True)
+        return f"MEDIA:{path}"
+
+    adp._message_handler = handler
+    event = _host_event(adp, CTX, internal=True)
+    asyncio.run(adp._process_message_background(event, adp._event_session_key(event)))
+
+    assert adp._pending["task-arriving"][1].done(), "arrival control failed"
+    assert original.done(), "file-only report left the deferred caller pending"
+
+
+def test_file_only_report_completes_the_durable_row_without_bookkeeping(
+        isolated_home, monkeypatch):
+    adp = _make_adapter(protocol.TaskStore(), monkeypatch)
+    _add_waiter(adp, "task-original", output_modes=["image/png"],
+                accepted_output_modes=["image/png"])
+    adp._note_turn_start(CTX, "task-original")
+    asyncio.run(adp.send(CTX, "[WORKING] building", metadata={"notify": True}))
+    adp._pop_pending("task-original")
+    adp._deferred.clear()
+    path = isolated_home / "report.png"
+    path.write_bytes(b"synthetic-image-payload")
+
+    async def handler(event):
+        return f"MEDIA:{path}"
+
+    adp._message_handler = handler
+    event = _host_event(adp, CTX)
+    asyncio.run(adp._process_message_background(event, adp._event_session_key(event)))
+
+    rec = _rec(adp.tasks, "task-original")
+    assert rec["state"] == protocol.STATE_COMPLETED, rec
+    assert any("raw" in part for part in rec["reply_parts"]), rec["reply_parts"]
+
+
+def test_second_progress_after_disconnect_keeps_the_rows_negotiation(
+        isolated_home, monkeypatch):
+    adp = _make_adapter(protocol.TaskStore(), monkeypatch)
+    _add_waiter(adp, "task-original", output_modes=["application/json"],
+                accepted_output_modes=["application/json"])
+    adp._note_turn_start(CTX, "task-original")
+    asyncio.run(adp.send(CTX, "[WORKING] building", metadata={"notify": True}))
+    adp._pop_pending("task-original")
+
+    asyncio.run(adp.send(CTX, "[WORKING] now 90%", metadata={"notify": True}))
+    rec = _rec(adp.tasks, "task-original")
+    assert rec["output_settings"]["accepted_output_modes"] == ["application/json"]
+
+    asyncio.run(adp.send(CTX, '{"result": 42}', metadata={"notify": True}))
+    rec = _rec(adp.tasks, "task-original")
+    parts = protocol.TaskStore.to_task(rec)["artifacts"][0]["parts"]
+    assert parts == [protocol.data_part({"result": 42})], parts
+
+
 def test_a_second_working_reply_refreshes_the_progress(isolated_home, monkeypatch):
     adp = _make_adapter(protocol.TaskStore(), monkeypatch)
     waiter = _add_waiter(adp, "task-1")

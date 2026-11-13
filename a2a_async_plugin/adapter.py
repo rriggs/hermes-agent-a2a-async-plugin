@@ -1158,18 +1158,25 @@ class A2AAdapter(BasePlatformAdapter):
         for task_id in batch:
             with self._pending_lock:
                 settings = dict(self._pending_output_settings.get(task_id) or {})
+            if not settings:
+                # The waiter (and its live negotiation) is gone, but a previous
+                # deferral persisted it. Do not overwrite the row with defaults.
+                existing = self.tasks.get(task_id) or {}
+                settings = dict(existing.get("output_settings") or {})
+            output_modes = settings.get("output_modes", self._output_modes)
+            accepted_output_modes = settings.get("accepted_output_modes")
             parts = self._negotiated_parts(
                 text,
                 attachments,
-                output_modes=settings.get("output_modes", self._output_modes),
-                accepted_output_modes=settings.get("accepted_output_modes"),
+                output_modes=output_modes,
+                accepted_output_modes=accepted_output_modes,
                 raw_text=raw_text,
             )
             stored = self.tasks.defer(
                 task_id, protocol.STATE_WORKING, text, reply_parts=parts,
                 output_settings={
-                    "output_modes": settings.get("output_modes", self._output_modes),
-                    "accepted_output_modes": settings.get("accepted_output_modes"),
+                    "output_modes": output_modes,
+                    "accepted_output_modes": accepted_output_modes,
                 },
             )
             if stored:
@@ -1209,6 +1216,55 @@ class A2AAdapter(BasePlatformAdapter):
                 settled += 1
             elif self._complete_deferred_row(task_id, state, text, attachments, raw_text):
                 settled += 1
+        return settled
+
+    def _settle_reply(self, context_id: str, text: str,
+                      attachments: Optional[list[dict]] = None,
+                      raw_text: Optional[str] = None) -> "int | bool | None":
+        """Settle a completed turn's intended recipients.
+
+        Shared by the text send path and the host's file-only attachment
+        delivery. A wake turn's reply belongs to its deferred task(s) even when
+        a steered arrival is also answered by it; when the in-memory waiter and
+        deferral bookkeeping are both gone, the durable row still owns the
+        result. Keeping this in one place stops the text and file carriers from
+        drifting apart on those two rules.
+        """
+        with self._turn_lock:
+            reporting = self._reporting_turns.get(context_id, False) or (
+                context_id in self._arrived
+                and context_id not in self._turn_tasks
+                and bool(self._deferred.get(context_id)))
+        settled = self._settle_turn(
+            context_id, protocol.STATE_COMPLETED, text, attachments,
+            raw_text=raw_text,
+        )
+        with self._turn_lock:
+            self._reporting_turns.pop(context_id, None)
+        if reporting:
+            reported = self._settle_deferred(
+                context_id, protocol.STATE_COMPLETED, text, attachments,
+                raw_text=raw_text,
+            )
+            if reported:
+                settled = (settled or 0) + reported
+        elif settled is None:
+            settled = self._settle_deferred(
+                context_id, protocol.STATE_COMPLETED, text, attachments,
+                raw_text=raw_text,
+            )
+        if settled is None:
+            deferred_rec = self.tasks.oldest_deferred(context_id)
+            if deferred_rec and self._complete_deferred_row(
+                    deferred_rec["task_id"], protocol.STATE_COMPLETED, text,
+                    attachments, raw_text=raw_text):
+                settled = 1
+        if settled is None:
+            if not self._resolve_oldest_for_context(
+                    context_id, protocol.STATE_COMPLETED, text, attachments,
+                    raw_text=raw_text):
+                return None
+            settled = 1
         return settled
 
     def _complete_deferred_row(self, task_id: str, state: str, text: str,
@@ -2229,50 +2285,10 @@ class A2AAdapter(BasePlatformAdapter):
                 )
             return SendResult(success=True, message_id=message_id)
 
-        with self._turn_lock:
-            # A wake turn has no trigger record; an arrival folded into it is the
-            # only turn record present. That shape, with deferred work waiting,
-            # identifies the reporting turn even on paths that did not call
-            # on_processing_start (direct sends, tests).
-            reporting = self._reporting_turns.get(chat_id, False) or (
-                chat_id in self._arrived
-                and chat_id not in self._turn_tasks
-                and bool(self._deferred.get(chat_id)))
-        settled = self._settle_turn(
-            chat_id, protocol.STATE_COMPLETED, reply_text, attachments,
-            raw_text=content or "",
+        settled = self._settle_reply(
+            chat_id, reply_text, attachments, content or "",
         )
-        with self._turn_lock:
-            self._reporting_turns.pop(chat_id, None)
-        if reporting:
-            # This is the synthetic background-completion turn. Its reply belongs
-            # to the deferred task(s) it is reporting on, even when a peer message
-            # steered into the turn was also answered by it. Settle both recipients.
-            reported = self._settle_deferred(
-                chat_id, protocol.STATE_COMPLETED, reply_text, attachments,
-                raw_text=content or "",
-            )
-            if reported:
-                settled = (settled or 0) + reported
-        elif settled is None:
-            # A later turn (notably the synthetic background-completion wake,
-            # which has no message id) reports the result of a deferred task.
-            settled = self._settle_deferred(
-                chat_id, protocol.STATE_COMPLETED, reply_text, attachments,
-                raw_text=content or "",
-            )
         if settled is None:
-            # The context's deferral bookkeeping may be gone (adapter reload) while
-            # the durable row survives. Settle that row rather than dropping the
-            # report that was produced for it.
-            deferred_rec = self.tasks.oldest_deferred(chat_id)
-            if deferred_rec and self._complete_deferred_row(
-                    deferred_rec["task_id"], protocol.STATE_COMPLETED, reply_text,
-                    attachments, raw_text=content or ""):
-                settled = 1
-        if settled is None and not self._resolve_oldest_for_context(
-                chat_id, protocol.STATE_COMPLETED, reply_text, attachments,
-                raw_text=content or ""):
             # A final reply that matches no open task is lost work, not a late
             # chunk: report it at warning level instead of hiding it in debug.
             logger.warning(
@@ -2445,35 +2461,15 @@ class A2AAdapter(BasePlatformAdapter):
         if chat_id:
             claimed = self._claim_turn_attachments(chat_id)
             if claimed is not None:
-                settled = self._settle_turn(
-                    chat_id, protocol.STATE_COMPLETED, claimed.get("text", ""), claimed["parts"],
-                    raw_text=claimed.get("text", ""),
+                self._settle_reply(
+                    chat_id, claimed.get("text", ""), claimed["parts"],
+                    claimed.get("text", ""),
                 )
-                if settled is None:
-                    settled = self._settle_deferred(
-                        chat_id, protocol.STATE_COMPLETED, claimed.get("text", ""),
-                        claimed["parts"], raw_text=claimed.get("text", ""),
-                    )
-                if settled is None:
-                    self._resolve_oldest_for_context(
-                        chat_id, protocol.STATE_COMPLETED, claimed.get("text", ""),
-                        claimed["parts"], raw_text=claimed.get("text", ""),
-                    )
             elif not anything_sent:
                 # No text send happened and no parts survived encoding; the
                 # task still has to settle or the caller waits out the timeout.
                 text = getattr(extracted, "text_content", "") or ""
-                settled = self._settle_turn(
-                    chat_id, protocol.STATE_COMPLETED, text, [],
-                )
-                if settled is None:
-                    settled = self._settle_deferred(
-                        chat_id, protocol.STATE_COMPLETED, text, [],
-                    )
-                if settled is None:
-                    self._resolve_oldest_for_context(
-                        chat_id, protocol.STATE_COMPLETED, text, [],
-                    )
+                self._settle_reply(chat_id, text, [])
         if has_attachments:
             record_delivery(SendResult(
                 success=True, message_id=str(int(time.time() * 1000)),

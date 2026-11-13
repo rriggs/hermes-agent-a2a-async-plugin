@@ -1747,6 +1747,9 @@ class A2AAdapter(BasePlatformAdapter):
             return state, reply
         finally:
             self._pop_pending(task_id)
+            current = self.tasks.get(task_id)
+            if current and current.get("state") in protocol.TERMINAL_STATES:
+                self._forget_deferred(task_id)
 
     @staticmethod
     def _client_alive_check(handler):
@@ -2124,6 +2127,7 @@ class A2AAdapter(BasePlatformAdapter):
                 req_id, protocol.ERR_TASK_NOT_CANCELABLE,
                 f"task {task_id} already {rec['state']}")
         self.tasks.complete(task_id, protocol.STATE_CANCELED, "")
+        self._forget_deferred(task_id)
         self._turns.reset(rec["context_id"])
         self._resolve_task(task_id, protocol.STATE_CANCELED, "")
         rec = self.tasks.get(task_id, *self._scope_for_agent(agent)) or rec

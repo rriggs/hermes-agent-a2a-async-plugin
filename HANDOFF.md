@@ -19,19 +19,17 @@ Current state:
   [#25](https://github.com/rriggs/hermes-agent-a2a-async-plugin/issues/25): the `[WORKING]`
   deferral marker keeps an inbound task non-terminal across the turn that starts background work,
   and the later report completes it. Round-1 fixes are committed at `63f48e5`; round-2 fixes are
-  committed at `66fb059`. Round-3 review fixes are uncommitted: the `[WORKING]` prompt section now
-  renders only for `platform == "a2a"`, the watchdog drops terminalized deferred ids, and the
-  README scopes the deferral timeout to async-accepted tasks and documents that one reply settles
-  every task deferred in a context.
-- PR [#26](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/26) is open at `66fb059`;
-  Amy's round 1 and round 2 returned REQUEST CHANGES with boundary findings, all fixed. Her round 3
-  found one P1 (the prompt section was process-global and would leak `[WORKING]` into Telegram/CLI
-  sessions) plus follow-ups; the P1 and the deferred-id leak are fixed in the worktree. The
-  `INPUT_REQUIRED` terminal-path follow-up is drafted at
+  committed at `66fb059`; round-3 fixes are committed at `13d2b30`.
+- PR [#26](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/26) is open; the last
+  independently reviewed head is `13d2b30` (ACCEPT-WITH-NOTES). The round-3 fixes made the
+  `[WORKING]` prompt section A2A-only, dropped terminalized deferred ids in the watchdog, and
+  corrected the README/HANDOFF scope. A terminal-cleanup follow-up for cancellation and
+  async-deadline races is committed on the same branch after `13d2b30`. The `INPUT_REQUIRED`
+  terminal-path follow-up is drafted at
   `docs/issue-drafts/2026-11-12-a2a-input-required-no-terminal-path.md` but not filed.
 - Open issue: #25. Follow-up draft as above, not filed. Issues #21, #20, #14 and earlier are closed.
-- Verification for the round-3 review-fix diff: host suite 481 passed, 3 skipped; clean-export
-  container suite 482 passed, 2 skipped with all three `a2a-sdk` interoperability tests; TUI
+- Verification for the terminal-cleanup diff: host suite 484 passed, 3 skipped; clean-export
+  container suite 485 passed, 2 skipped with all three `a2a-sdk` interoperability tests; TUI
   delivery and classic CLI refusal E2Es PASS (2026-11-12).
 
 The plugin manifest declares:

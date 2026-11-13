@@ -401,6 +401,51 @@ def test_forget_deferred_drops_a_terminalized_id(isolated_home, monkeypatch):
     assert CTX not in adp._deferred
 
 
+def test_cancel_releases_a_deferred_id(isolated_home, monkeypatch):
+    adp = _make_adapter(protocol.TaskStore(), monkeypatch)
+    fut = _add_waiter(adp, "task-cancel")
+    adp._note_turn_start(CTX, "task-cancel")
+    asyncio.run(adp.send(CTX, "[WORKING] running", metadata={"notify": True}))
+    pending = dict(task_id="task-cancel", context_id=CTX, peer="peer-a",
+                   future=fut, started=time.time())
+
+    response = adp._rpc_tasks_cancel(1, {"id": "task-cancel"})
+    assert "result" in response, response
+    adp._finalize_task(pending, *fut.result(timeout=0))
+    rec = adp.tasks.get("task-cancel")
+    assert rec is not None and rec["state"] == protocol.STATE_CANCELED
+    assert "task-cancel" not in adp._deferred.get(CTX, [])
+
+
+def test_async_timeout_releases_a_deferred_id(isolated_home, monkeypatch):
+    monkeypatch.setenv("A2A_ASYNC_TIMEOUT", "1")
+    adp = _make_adapter(protocol.TaskStore(), monkeypatch)
+    fut = _add_waiter(adp, "task-slow")
+    adp._note_turn_start(CTX, "task-slow")
+    asyncio.run(adp.send(CTX, "[WORKING] running", metadata={"notify": True}))
+    pending = dict(task_id="task-slow", context_id=CTX, peer="peer-a",
+                   future=fut, started=time.time() - 2)
+
+    adp._finalize_in_background(pending)
+    rec = adp.tasks.get("task-slow")
+    assert rec is not None and rec["state"] == protocol.STATE_FAILED
+    assert "task-slow" not in adp._deferred.get(CTX, [])
+
+
+def test_caller_walk_away_keeps_the_deferred_id(isolated_home, monkeypatch):
+    adp = _make_adapter(protocol.TaskStore(), monkeypatch)
+    fut = _add_waiter(adp, "task-walk")
+    adp._note_turn_start(CTX, "task-walk")
+    asyncio.run(adp.send(CTX, "[WORKING] running", metadata={"notify": True}))
+    pending = dict(task_id="task-walk", context_id=CTX, peer="peer-a",
+                   future=fut, started=time.time())
+
+    state, _ = adp._finalize_task(
+        pending, protocol.STATE_CANCELED, "[client disconnected]")
+    assert state == protocol.STATE_WORKING
+    assert "task-walk" in adp._deferred.get(CTX, [])
+
+
 def test_a_second_working_reply_refreshes_the_progress(isolated_home, monkeypatch):
     adp = _make_adapter(protocol.TaskStore(), monkeypatch)
     waiter = _add_waiter(adp, "task-1")

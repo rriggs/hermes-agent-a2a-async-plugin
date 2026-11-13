@@ -457,16 +457,36 @@ def data_part(data: Any, media_type: str = "application/json") -> dict:
 
 
 def text_message(role: str, text: str, context_id: str = "", *,
-                 parts: Optional[list[dict]] = None) -> dict:
+                 parts: Optional[list[dict]] = None,
+                 message_id: Optional[str] = None) -> dict:
     """Build a v1.0 Message, defaulting to a single text Part for compatibility."""
     msg: dict[str, Any] = {
         "role": role,  # ROLE_USER | ROLE_AGENT
         "parts": copy.deepcopy(parts) if parts is not None else [text_part(text)],
-        "messageId": uuid.uuid4().hex,
+        "messageId": message_id or uuid.uuid4().hex,
     }
     if context_id:
         msg["contextId"] = context_id
     return msg
+
+
+def _status_message_id(task_id: str, context_id: str, state: str,
+                       parts: list[dict]) -> str:
+    """Stable Message identity for a non-terminal status snapshot.
+
+    A status message is rebuilt every time ``GetTask`` renders the task. A fresh
+    UUID per render makes every poll look like a new message to a watcher, which
+    then re-delivers the same progress note on every poll. Derive the id from the
+    content instead: identical snapshots keep their id, and a changed note gets a
+    new one.
+    """
+    canonical = json.dumps(parts, sort_keys=True, separators=(",", ":"),
+                           ensure_ascii=False, default=str)
+    digest = hashlib.sha256(canonical.encode("utf-8", "replace")).hexdigest()
+    return uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"a2a:status:{task_id}:{context_id}:{state}:{digest}",
+    ).hex
 
 
 def message_with_parts(role: str, parts: list[dict], context_id: str = "") -> dict:
@@ -1065,8 +1085,12 @@ def build_task(
         else:
             # Non-completed states have no output artifact: a working note, a
             # clarification request, or a failure reason IS communication.
+            # The id is content-derived because this snapshot is re-rendered on
+            # every GetTask; a fresh uuid would look like a new message to a
+            # watcher and re-deliver the same progress note on every poll.
             task["status"]["message"] = text_message(
-                ROLE_AGENT, agent_text, context_id, parts=reply_parts)
+                ROLE_AGENT, agent_text, context_id, parts=reply_parts,
+                message_id=_status_message_id(task_id, context_id, state, reply_parts))
     return task
 
 
@@ -1108,7 +1132,9 @@ def status_update(task_id: str, context_id: str, state: str, text: str = "", *,
     if state != STATE_COMPLETED:
         reply_parts = copy.deepcopy(parts) if parts is not None else ([text_part(text)] if text else [])
         if reply_parts:
-            status["message"] = text_message(ROLE_AGENT, text, context_id, parts=reply_parts)
+            status["message"] = text_message(
+                ROLE_AGENT, text, context_id, parts=reply_parts,
+                message_id=_status_message_id(task_id, context_id, state, reply_parts))
     return {"statusUpdate": {"taskId": task_id, "contextId": context_id, "status": status}}
 
 

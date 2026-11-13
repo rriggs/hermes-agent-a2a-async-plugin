@@ -335,6 +335,31 @@ def test_a_working_progress_note_is_delivered_and_the_watch_stays_open(tmp_path)
     assert _store().get(watch["watch_id"])["state"] == watches.WATCH_COMPLETE
 
 
+def test_repeated_polls_of_one_working_note_deliver_once(tmp_path):
+    """The same deferred snapshot polled again is the same message, not a new one."""
+    poll = ScriptedPoll(
+        protocol.build_task("t1", "ctx-1", protocol.STATE_WORKING, "build at 15%"),
+        protocol.build_task("t1", "ctx-1", protocol.STATE_WORKING, "build at 15%"),
+        protocol.build_task("t1", "ctx-1", protocol.STATE_WORKING, "build at 40%"),
+        task_payload(state=protocol.STATE_COMPLETED, text="build finished"),
+    )
+    manager = _manager(poll)
+    watch = _add(manager)
+
+    assert manager.run_once(now=100.0) == 1
+    assert len(manager.ctx.injected) == 1
+    assert manager.run_once(now=200.0) == 1
+    assert len(manager.ctx.injected) == 1, (
+        "an unchanged progress note polled again must not be re-delivered")
+    assert manager.run_once(now=300.0) == 1
+    assert len(manager.ctx.injected) == 2
+    assert "build at 40%" in manager.ctx.injected[-1]["content"]
+    assert manager.run_once(now=400.0) == 1
+    assert len(manager.ctx.injected) == 3
+    assert "build finished" in manager.ctx.injected[-1]["content"]
+    assert _store().get(watch["watch_id"])["state"] == watches.WATCH_COMPLETE
+
+
 def test_one_completion_per_task_while_siblings_keep_running():
     poll = ScriptedPoll(
         task_payload(task_id="t1", state=protocol.STATE_COMPLETED, text="one done"),

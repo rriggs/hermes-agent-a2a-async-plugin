@@ -12,31 +12,29 @@ state, security helpers, and outbound synchronous/asynchronous client tools.
 
 Current state:
 
-- `main` is `3d85e4a`, after the PR [#24](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/24)
-  merge (`0ae30a4`, Issue #21) and the v8-message migration test commit. Release tag `v0.5.1`
-  names the tree before that test commit.
-- Working tree: `0.6.0`, schema 11, implements Issue
-  [#25](https://github.com/rriggs/hermes-agent-a2a-async-plugin/issues/25): the `[WORKING]`
-  deferral marker keeps an inbound task non-terminal across the turn that starts background work,
-  and the later report completes it. Round-1 fixes are committed at `63f48e5`; round-2 fixes are
-  committed at `66fb059`; round-3 fixes are committed at `13d2b30`.
-- PR [#26](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/26) is open; the last
-  independently reviewed head is `13d2b30` (ACCEPT-WITH-NOTES). The round-3 fixes made the
-  `[WORKING]` prompt section A2A-only, dropped terminalized deferred ids in the watchdog, and
-  corrected the README/HANDOFF scope. A terminal-cleanup follow-up for cancellation and
-  async-deadline races is committed on the same branch after `13d2b30`. The `INPUT_REQUIRED`
-  terminal-path follow-up is drafted at
-  `docs/issue-drafts/2026-11-12-a2a-input-required-no-terminal-path.md` but not filed.
-- Open issue: #25. Follow-up draft as above, not filed. Issues #21, #20, #14 and earlier are closed.
-- Verification for the terminal-cleanup diff: host suite 484 passed, 3 skipped; clean-export
-  container suite 485 passed, 2 skipped with all three `a2a-sdk` interoperability tests; TUI
-  delivery and classic CLI refusal E2Es PASS (2026-11-12).
+- `main` is `3dd3d00`, the merge commit of PR
+  [#26](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/26) (Issue #25). The annotated
+  tag `v0.6.0` names that tree; Issue #25 is closed.
+- `v0.6.0` is deployed to 23 copies across four hosts: 16 on diamond (default + 15 profiles), one
+  on hai, five on emerald (nic plus dave/kevin/phil/stuart), one on alex. Hai and Nic are live at
+  0.6.0/schema 11. Diamond and Alex are staged at 0.6.0 and still run 0.5.1 until their gateways
+  restart.
+- Working tree: `0.6.1`, schema 11, on branch `fix/duplicate-progress-status-id`. It fixes Nic's
+  duplicate-progress finding: a non-terminal status message was rebuilt on every `GetTask` with a
+  fresh UUID, so a watch re-delivered the same progress note on every poll. `build_task()` and
+  `status_update()` now derive a stable, content-based `messageId`. No PR yet.
+- Follow-up drafts, not filed:
+  `docs/issue-drafts/2026-11-12-a2a-input-required-no-terminal-path.md` and
+  `docs/issue-drafts/2026-11-12-a2a-duplicate-deferred-progress.md`. Issues #25, #21, #20, #14 and
+  earlier are closed.
+- Verification for the 0.6.1 diff: host suite 486 passed, 3 skipped; clean-export container suite
+  487 passed, 2 skipped with all three `a2a-sdk` interoperability tests; TUI delivery and classic
+  CLI refusal E2Es PASS (2026-11-12).
 
 The plugin manifest declares:
 
 - name: `a2a-async`
-- version: `0.6.0` (0.5.1 plus the Issue #25 deferral path and schema 10 to 11 `deferred_at` and
-  `output_settings` columns)
+- version: `0.6.1` (0.6.0 plus the stable non-terminal status-message id; schema stays 11)
 - kind: `platform`
 - requires Hermes: `>=0.22.2`
 - thirteen tools in the shared `a2a` toolset

@@ -41,6 +41,26 @@ def test_text_only_task_puts_its_reply_in_the_artifact():
     assert task["artifacts"][0]["parts"] == [protocol.text_part("plain reply")]
 
 
+def test_non_terminal_status_message_id_is_stable_across_renders():
+    first = protocol.build_task("task-working", "ctx-working", protocol.STATE_WORKING,
+                                "build at 15%")
+    second = protocol.build_task("task-working", "ctx-working", protocol.STATE_WORKING,
+                                 "build at 15%")
+    changed = protocol.build_task("task-working", "ctx-working", protocol.STATE_WORKING,
+                                  "build at 40%")
+    other_task = protocol.build_task("task-other", "ctx-working", protocol.STATE_WORKING,
+                                     "build at 15%")
+    other_state = protocol.build_task("task-working", "ctx-working",
+                                      protocol.STATE_INPUT_REQUIRED, "build at 15%")
+
+    first_id = first["status"]["message"]["messageId"]
+    assert first_id == second["status"]["message"]["messageId"], (
+        "GetTask re-renders must not mint a new id for the same status snapshot")
+    assert first_id != changed["status"]["message"]["messageId"]
+    assert first_id != other_task["status"]["message"]["messageId"]
+    assert first_id != other_state["status"]["message"]["messageId"]
+
+
 def test_artifact_update_accepts_multiple_parts():
     parts = [protocol.text_part("image result"), protocol.file_part(raw="aGVsbG8=", filename="x.txt", media_type="text/plain")]
 

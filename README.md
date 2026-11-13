@@ -76,6 +76,10 @@ background-completion turn; that reply becomes the artifact. For an async-accept
 not by the deferral timer. A blocking caller's disconnect or reply timeout ends the wait, not the
 task: the report is still recorded when it arrives, and the caller can poll `GetTask` for it.
 
+A non-terminal status message is a snapshot, not a new message on every read: its `messageId` is
+derived from the task, state, and Parts, so repeated `GetTask` calls return the same id and a watch
+does not re-deliver an unchanged progress note.
+
 One reply settles every task deferred in that A2A context. If two callers defer on the same
 context, both receive the same report; use separate contexts when their results must stay distinct.
 

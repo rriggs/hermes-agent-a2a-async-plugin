@@ -43,6 +43,7 @@ behaviour matches contract §7."
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import shutil
@@ -106,13 +107,15 @@ def _make_working_db(path: Path, rows: list[dict] | None = None) -> Path:
             completed_at REAL,
             direction TEXT NOT NULL DEFAULT 'inbound',
             ownership TEXT NOT NULL DEFAULT 'local',
-            remote_state TEXT NOT NULL DEFAULT ''
+            remote_state TEXT NOT NULL DEFAULT '',
+            deferred_at REAL NOT NULL DEFAULT 0,
+            output_settings TEXT NOT NULL DEFAULT '{}'
         )"""
         )
         con.execute(f"PRAGMA user_version = {A2A_TASK_SCHEMA_VERSION}")
         for r in (rows or []):
             con.execute(
-                "INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     r["task_id"], r["context_id"], r["peer"],
                     r.get("agent_slug", ""), r.get("tenant", ""),
@@ -121,6 +124,8 @@ def _make_working_db(path: Path, rows: list[dict] | None = None) -> Path:
                     r.get("created_iso", "2025-01-01T00:00:00.000Z"),
                     r.get("completed_at"), r.get("direction", "inbound"),
                     r.get("ownership", "local"), r.get("remote_state", ""),
+                    r.get("deferred_at", 0.0),
+                    json.dumps(r.get("output_settings") or {}, separators=(",", ":")),
                 ),
             )
         con.commit()
@@ -374,12 +379,12 @@ def test_storage_interrupted_write_is_recoverable_via_wal(tmp_path):
     try:
         bad.execute("BEGIN IMMEDIATE")
         bad.execute(
-            "INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 "interrupted-2", "ctx-interrupted", "peer-interrupted",
                 "", "", STATE_COMPLETED, "this should roll back", "[]",
                 time.time(), "2025-01-01T00:00:00.000Z", time.time(),
-                "inbound", "local", "",
+                "inbound", "local", "", 0.0, "{}",
             ),
         )
         # Close without commit. The connection's __del__ would
@@ -438,12 +443,12 @@ def test_storage_wal_recovery_after_kill(tmp_path):
     a.execute("PRAGMA journal_mode=WAL")
     a.execute("BEGIN")
     a.execute(
-        "INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             "wal-2", "ctx-wal", "peer-wal", "", "",
             STATE_COMPLETED, "completed pre-kill", "[]",
             time.time(), "2025-01-01T00:00:00.000Z", time.time(),
-            "inbound", "local", "",
+            "inbound", "local", "", 0.0, "{}",
         ),
     )
     a.commit()
@@ -578,11 +583,11 @@ def test_storage_cross_process_kill_leaves_recoverable_db(
         "con = sqlite3.connect(db)\n"
         "con.execute('PRAGMA journal_mode=WAL')\n"
         "con.execute(\n"
-        "    'INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',\n"
+        "    'INSERT INTO a2a_tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',\n"
         "    ('kill-1', 'ctx-kill', 'peer-kill', '', '',"
         f" '{STATE_COMPLETED}', 'completed pre-kill', '[]',"
         " time.time(), '2025-01-01T00:00:00.000Z', time.time(),"
-        " 'inbound', 'local', ''),\n"
+        " 'inbound', 'local', '', 0.0, '{}'),\n"
         ")\n"
         "con.commit()\n"
         "# Note: NO explicit WAL checkpoint — the test exercises\n"

@@ -11,12 +11,16 @@ class Context:
     def __init__(self) -> None:
         self.tools = []
         self.platforms = []
+        self.prompt_sections = []
 
     def register_tool(self, **kwargs):
         self.tools.append(kwargs)
 
     def register_platform(self, **kwargs):
         self.platforms.append(kwargs)
+
+    def register_system_prompt_section(self, section_id, content, **kwargs):
+        self.prompt_sections.append((section_id, content, kwargs))
 
 
 def load_plugin():
@@ -46,6 +50,43 @@ def test_registers_all_tools_into_shared_a2a_toolset():
     assert all(callable(entry["handler"]) for entry in context.tools)
     assert all(entry["schema"]["name"] == entry["name"] for entry in context.tools)
     assert [entry["name"] for entry in context.platforms] == ["a2a"]
+
+
+def test_working_marker_prompt_section_is_a2a_only():
+    plugin = load_plugin()
+    context = Context()
+    plugin.register(context)
+
+    [(section_id, content, _)] = context.prompt_sections
+    assert section_id == "a2a-working-marker"
+    assert callable(content), "a static section would render in every platform session"
+    text = content({"platform": "a2a"})
+    assert isinstance(text, str)
+    assert text.startswith("When you are answering an inbound A2A task")
+    assert content({"platform": "telegram"}) == ""
+    assert content({"platform": "cli"}) == ""
+    assert content({}) == ""
+
+
+def test_working_marker_section_is_skipped_by_the_core_renderer_for_telegram():
+    from types import MappingProxyType
+
+    from hermes_cli.plugins_dispatch import PluginDispatchMixin, PluginSystemPromptSection
+
+    plugin = load_plugin()
+    context = Context()
+    plugin.register(context)
+    [(section_id, content, _)] = context.prompt_sections
+    section = PluginSystemPromptSection(
+        id=section_id, content=content, position="after_memory",
+        max_chars=4000, plugin="a2a-async",
+    )
+    assert PluginDispatchMixin._render_prompt_section_text(
+        section, MappingProxyType({"platform": "telegram"})) is None
+    assert PluginDispatchMixin._render_prompt_section_text(
+        section, MappingProxyType({"platform": "cli"})) is None
+    assert PluginDispatchMixin._render_prompt_section_text(
+        section, MappingProxyType({"platform": "a2a"})) is not None
 
 
 def test_plugin_manifest_declares_registered_tools():

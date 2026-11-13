@@ -113,6 +113,12 @@ The contract test (`test_restart_contract.py`) re-asserts this
 clause against the real subprocess restart path (the Phase 1 launcher
 harness), so the policy cannot silently regress in a refactor.
 
+A deferred task (`TASK_STATE_WORKING` with `deferred_at` set, produced by
+the `[WORKING]` marker) is still a non-terminal inbound task. It follows
+this same policy: a gateway restart fails it with the restart marker and
+does not wait for the later report. Deferral is durable across turns in one
+process, not across a gateway restart.
+
 ### 4.1. Why "fail with marker" not "recover"
 
 Recovery would require the plugin's execution engine to be

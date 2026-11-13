@@ -5,29 +5,38 @@ Owner: Sven
 Repository: https://github.com/rriggs/hermes-agent-a2a-async-plugin.git
 Workspace: /home/hermes/.hermes/profiles/sven/workspace/hermes-agent-a2a-async-plugin
 
-## Current handoff status (2026-11-10)
+## Current handoff status (2026-11-12)
 
 The standalone plugin provides the inbound asynchronous A2A gateway adapter, durable protocol/task
 state, security helpers, and outbound synchronous/asynchronous client tools.
 
 Current state:
 
-- `main` is `45e6b64`, the merge of PR [#23](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/23)
-  (outbound `DataPart`/`FilePart` output, subscription parts, schema 8). That merge closed Issues
-  #14 and #20 and is tagged `v0.5.0`. Issue #21 (duplicate completion text) is the only open issue.
-- The merge sits on `1f715d3`, the merge of PR [#22](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/22)
-  (container gate builds the `a2a-sdk` venv and runs the compatibility tests), which is on top of
-  `7663468`, the merge of PR [#19](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/19)
-  (`fix/issue-13-inbound-file-parts`, Amy approved at `d171435`). PR #19 closed Issue #13 and
-  shipped inbound `FilePart` materialization plus the body-deadline and locator fixes below.
-- The container gate is `e2e/container/run-suite.sh` with `SDK_VENV_DIR` / `A2A_SDK_VENV` overrides
-  and `A2A_INTEROP_WORK_DIR` for a read-only export; its three interoperability tests now run
-  instead of skipping.
+- `main` is `3d85e4a`, after the PR [#24](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/24)
+  merge (`0ae30a4`, Issue #21) and the v8-message migration test commit. Release tag `v0.5.1`
+  names the tree before that test commit.
+- Working tree: `0.6.0`, schema 11, implements Issue
+  [#25](https://github.com/rriggs/hermes-agent-a2a-async-plugin/issues/25): the `[WORKING]`
+  deferral marker keeps an inbound task non-terminal across the turn that starts background work,
+  and the later report completes it. Round-1 fixes are committed at `63f48e5`; round-2 fixes are
+  committed at `66fb059`; round-3 fixes are committed at `13d2b30`.
+- PR [#26](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/26) is open; the last
+  independently reviewed head is `13d2b30` (ACCEPT-WITH-NOTES). The round-3 fixes made the
+  `[WORKING]` prompt section A2A-only, dropped terminalized deferred ids in the watchdog, and
+  corrected the README/HANDOFF scope. A terminal-cleanup follow-up for cancellation and
+  async-deadline races is committed on the same branch after `13d2b30`. The `INPUT_REQUIRED`
+  terminal-path follow-up is drafted at
+  `docs/issue-drafts/2026-11-12-a2a-input-required-no-terminal-path.md` but not filed.
+- Open issue: #25. Follow-up draft as above, not filed. Issues #21, #20, #14 and earlier are closed.
+- Verification for the terminal-cleanup diff: host suite 484 passed, 3 skipped; clean-export
+  container suite 485 passed, 2 skipped with all three `a2a-sdk` interoperability tests; TUI
+  delivery and classic CLI refusal E2Es PASS (2026-11-12).
 
 The plugin manifest declares:
 
 - name: `a2a-async`
-- version: `0.5.1` (0.5.0 plus the #21 duplicate-completion fix and the schema-8 to 10 message-table migrations)
+- version: `0.6.0` (0.5.1 plus the Issue #25 deferral path and schema 10 to 11 `deferred_at` and
+  `output_settings` columns)
 - kind: `platform`
 - requires Hermes: `>=0.22.2`
 - thirteen tools in the shared `a2a` toolset

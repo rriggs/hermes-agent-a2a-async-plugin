@@ -12,24 +12,26 @@ state, security helpers, and outbound synchronous/asynchronous client tools.
 
 Current state:
 
-- `main` is `3dd3d00`, the merge commit of PR
-  [#26](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/26) (Issue #25). The annotated
-  tag `v0.6.0` names that tree; Issue #25 is closed.
-- `v0.6.0` is deployed to 23 copies across four hosts: 16 on diamond (default + 15 profiles), one
-  on hai, five on emerald (nic plus dave/kevin/phil/stuart), one on alex. Hai and Nic are live at
-  0.6.0/schema 11. Diamond and Alex are staged at 0.6.0 and still run 0.5.1 until their gateways
-  restart.
-- Working tree: `0.6.1`, schema 11, on branch `fix/duplicate-progress-status-id`. It fixes Nic's
+- `main` is `9386c87`, the merge commit of PR
+  [#27](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/27) on top of PR #26. The
+  annotated tag `v0.6.1` names the post-merge tip after the promoted review probes and this status
+  update.
+- `v0.6.1` is 0.6.0 plus a stable non-terminal status-message id (schema stays 11). It fixes Nic's
   duplicate-progress finding: a non-terminal status message was rebuilt on every `GetTask` with a
   fresh UUID, so a watch re-delivered the same progress note on every poll. `build_task()` and
-  `status_update()` now derive a stable, content-based `messageId`. No PR yet.
+  `status_update()` now derive a stable, content-based `messageId`. PR #27 is merged; the reviewed
+  head was `7faf2b1` (ACCEPT).
+- 0.6.0 was deployed to 23 copies across four hosts: 16 on diamond (default + 15 profiles), one on
+  hai, five on emerald (nic plus dave/kevin/phil/stuart), one on alex. Hai and Nic are live at
+  0.6.0/schema 11. Diamond and Alex are staged and still run 0.5.1 until their gateways restart.
+  0.6.1 replaces the same 23 copies; no schema change.
 - Follow-up drafts, not filed:
   `docs/issue-drafts/2026-11-12-a2a-input-required-no-terminal-path.md` and
   `docs/issue-drafts/2026-11-12-a2a-duplicate-deferred-progress.md`. Issues #25, #21, #20, #14 and
   earlier are closed.
-- Verification for the 0.6.1 diff: host suite 486 passed, 3 skipped; clean-export container suite
-  487 passed, 2 skipped with all three `a2a-sdk` interoperability tests; TUI delivery and classic
-  CLI refusal E2Es PASS (2026-11-12).
+- Verification for the 0.6.1 tree including the promoted review probes: host suite 494 passed,
+  3 skipped; clean-export container suite 495 passed, 2 skipped with all three `a2a-sdk`
+  interoperability tests; TUI delivery and classic CLI refusal E2Es PASS (2026-11-12).
 
 The plugin manifest declares:
 

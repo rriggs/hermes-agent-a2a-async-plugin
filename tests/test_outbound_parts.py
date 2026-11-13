@@ -3,9 +3,11 @@ from __future__ import annotations
 import base64
 import asyncio
 from concurrent.futures import Future
+import copy
 import hashlib
 import io
 import json
+import sqlite3
 import threading
 import time
 
@@ -59,6 +61,79 @@ def test_non_terminal_status_message_id_is_stable_across_renders():
     assert first_id != changed["status"]["message"]["messageId"]
     assert first_id != other_task["status"]["message"]["messageId"]
     assert first_id != other_state["status"]["message"]["messageId"]
+
+
+def test_normal_user_messages_still_have_fresh_identity():
+    one = protocol.text_message(protocol.ROLE_USER, "same", "c1")
+    two = protocol.text_message(protocol.ROLE_USER, "same", "c1")
+
+    assert one["messageId"] != two["messageId"]
+    assert protocol.text_message(
+        protocol.ROLE_USER, "same", message_id="explicit")["messageId"] == "explicit"
+
+
+@pytest.mark.parametrize("state", [
+    protocol.STATE_WORKING,
+    protocol.STATE_INPUT_REQUIRED,
+    protocol.STATE_FAILED,
+    protocol.STATE_CANCELED,
+    protocol.STATE_REJECTED,
+])
+def test_status_snapshot_id_is_stable_across_states_and_part_variants(state):
+    parts = [
+        protocol.text_part("正在运行"),
+        protocol.data_part({"z": 1, "a": 2}),
+        protocol.file_part(raw="aGVsbG8=", filename="note.txt", media_type="text/plain"),
+    ]
+    original = copy.deepcopy(parts)
+
+    def snapshot(context="c1", ps=parts):
+        return protocol.build_task("t1", context, state, parts=ps)["status"]["message"]
+
+    first = snapshot()
+    assert first["messageId"] == snapshot()["messageId"]
+
+    stream = protocol.status_update("t1", "c1", state, parts=parts)
+    assert stream["statusUpdate"]["status"]["message"]["messageId"] == first["messageId"]
+    assert snapshot("c2")["messageId"] != first["messageId"]
+
+    reordered = copy.deepcopy(parts)
+    reordered[1]["data"] = {"a": 2, "z": 1}
+    assert snapshot(ps=reordered)["messageId"] == first["messageId"]
+
+    changed = copy.deepcopy(parts)
+    changed[2]["raw"] = "d29ybGQ="
+    assert snapshot(ps=changed)["messageId"] != first["messageId"]
+    assert snapshot(ps=list(reversed(parts)))["messageId"] != first["messageId"]
+    assert parts == original
+
+
+def test_taskstore_renders_and_restart_transition_have_correct_identity(tmp_path):
+    path = tmp_path / "status-id.db"
+    store = protocol.TaskStore(str(path))
+    store.create("t1", "c1", "peer")
+    assert store.defer("t1", protocol.STATE_WORKING, "running") is not None
+
+    record = store.get("t1")
+    assert record is not None
+    first = store.to_task(record)["status"]["message"]["messageId"]
+    again = store.get("t1")
+    assert again is not None
+    assert first == store.to_task(again)["status"]["message"]["messageId"]
+    assert first == protocol.status_update(
+        "t1", "c1", protocol.STATE_WORKING, "running",
+    )["statusUpdate"]["status"]["message"]["messageId"]
+
+    reopened = protocol.TaskStore(str(path))
+    recovered = reopened.get("t1")
+    assert recovered is not None and recovered["state"] == protocol.STATE_FAILED
+    second = reopened.to_task(recovered)["status"]["message"]["messageId"]
+    assert first != second
+    again = reopened.get("t1")
+    assert again is not None
+    assert second == reopened.to_task(again)["status"]["message"]["messageId"]
+    with sqlite3.connect(path) as con:
+        assert con.execute("PRAGMA user_version").fetchone()[0] == 11
 
 
 def test_artifact_update_accepts_multiple_parts():

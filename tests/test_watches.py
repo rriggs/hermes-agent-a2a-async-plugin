@@ -360,6 +360,30 @@ def test_repeated_polls_of_one_working_note_deliver_once(tmp_path):
     assert _store().get(watch["watch_id"])["state"] == watches.WATCH_COMPLETE
 
 
+def test_repeated_snapshots_keep_one_durable_message_and_publication(tmp_path):
+    def snapshot(text):
+        return protocol.build_task("t1", "ctx-1", protocol.STATE_WORKING, text)
+
+    poll = ScriptedPoll(
+        snapshot("first"), snapshot("first"), snapshot("second"), snapshot("second"),
+        protocol.build_task("t1", "ctx-1", protocol.STATE_COMPLETED, "done"),
+    )
+    manager = _manager(poll)
+    watch = _add(manager)
+
+    for now, count in [(100, 1), (200, 1), (300, 2), (400, 2), (500, 3)]:
+        manager.run_once(now=now)
+        assert len(manager.ctx.injected) == count
+        assert len(_outbox(watch["watch_id"])) == count
+        with _store()._session() as con:
+            rows = con.execute(
+                "SELECT COUNT(*) FROM a2a_task_messages WHERE task_id='t1'",
+            ).fetchone()[0]
+        assert rows == count
+
+    assert _store().get(watch["watch_id"])["state"] == watches.WATCH_COMPLETE
+
+
 def test_one_completion_per_task_while_siblings_keep_running():
     poll = ScriptedPoll(
         task_payload(task_id="t1", state=protocol.STATE_COMPLETED, text="one done"),

@@ -18,21 +18,21 @@ Current state:
 - Working tree: `0.6.0`, schema 11, implements Issue
   [#25](https://github.com/rriggs/hermes-agent-a2a-async-plugin/issues/25): the `[WORKING]`
   deferral marker keeps an inbound task non-terminal across the turn that starts background work,
-  and the later report completes it. Round-1 review fixes are committed at `63f48e5`: progress
-  text is egress-redacted before it reaches the row or a Part, a steered arrival no longer consumes
-  the deferred task's report, and the caller's output negotiation is persisted for the durable
-  completion path. Round-2 review fixes are uncommitted in the worktree: the file-only host carrier
-  now uses the same recipient union and durable fallback as text, and a second progress note after
-  disconnect preserves the row's negotiation instead of overwriting it with defaults.
-- PR [#26](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/26) is open at `63f48e5`;
-  Amy's first review returned REQUEST CHANGES with three boundary findings, fixed at `63f48e5`;
-  her second review returned three residual findings (file-only attribution, file-only durable
-  fallback, repeated progress clobbering negotiation), all fixed in the worktree and verified
-  against her ten independent probes.
-- Open issue: #25. Issues #21, #20, #14 and earlier are closed.
-- Verification for the round-2 review-fix diff: host suite 478 passed, 3 skipped; clean-export
-  container suite 479 passed, 2 skipped with all three `a2a-sdk` interoperability tests; TUI
-  delivery and classic CLI refusal E2Es PASS; Amy's ten PR26 probes pass (2026-11-12).
+  and the later report completes it. Round-1 fixes are committed at `63f48e5`; round-2 fixes are
+  committed at `66fb059`. Round-3 review fixes are uncommitted: the `[WORKING]` prompt section now
+  renders only for `platform == "a2a"`, the watchdog drops terminalized deferred ids, and the
+  README scopes the deferral timeout to async-accepted tasks and documents that one reply settles
+  every task deferred in a context.
+- PR [#26](https://github.com/rriggs/hermes-agent-a2a-async-plugin/pull/26) is open at `66fb059`;
+  Amy's round 1 and round 2 returned REQUEST CHANGES with boundary findings, all fixed. Her round 3
+  found one P1 (the prompt section was process-global and would leak `[WORKING]` into Telegram/CLI
+  sessions) plus follow-ups; the P1 and the deferred-id leak are fixed in the worktree. The
+  `INPUT_REQUIRED` terminal-path follow-up is drafted at
+  `docs/issue-drafts/2026-11-12-a2a-input-required-no-terminal-path.md` but not filed.
+- Open issue: #25. Follow-up draft as above, not filed. Issues #21, #20, #14 and earlier are closed.
+- Verification for the round-3 review-fix diff: host suite 481 passed, 3 skipped; clean-export
+  container suite 482 passed, 2 skipped with all three `a2a-sdk` interoperability tests; TUI
+  delivery and classic CLI refusal E2Es PASS (2026-11-12).
 
 The plugin manifest declares:
 

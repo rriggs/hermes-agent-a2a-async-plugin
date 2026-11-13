@@ -780,6 +780,7 @@ class A2AAdapter(BasePlatformAdapter):
                         deferred_timeout_seconds=_async_timeout()):
                     logger.warning("A2A: orphaned task %s marked failed (timeout %ds)", tid, _ORPHAN_TIMEOUT)
                     protocol.metrics.tasks_failed += 1
+                    self._forget_deferred(tid)
                 self._cleanup_inbound_files()
                 self._sweep_turn_attachments()
             except Exception:
@@ -1266,6 +1267,20 @@ class A2AAdapter(BasePlatformAdapter):
                 return None
             settled = 1
         return settled
+
+    def _forget_deferred(self, task_id: str) -> None:
+        """Drop a task id from the per-context deferral bookkeeping.
+
+        The watchdog can terminalize a deferred row before its report arrives.
+        Leaving the id behind makes later replies in that context take the
+        deferral path and log a false 'no open task' warning.
+        """
+        with self._turn_lock:
+            for context_id, task_ids in list(self._deferred.items()):
+                if task_id in task_ids:
+                    task_ids.remove(task_id)
+                    if not task_ids:
+                        self._deferred.pop(context_id, None)
 
     def _complete_deferred_row(self, task_id: str, state: str, text: str,
                                attachments: Optional[list[dict]] = None,

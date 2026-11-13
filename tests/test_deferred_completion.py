@@ -387,6 +387,20 @@ def test_second_progress_after_disconnect_keeps_the_rows_negotiation(
     assert parts == [protocol.data_part({"result": 42})], parts
 
 
+def test_forget_deferred_drops_a_terminalized_id(isolated_home, monkeypatch):
+    adp = _make_adapter(protocol.TaskStore(), monkeypatch)
+    _add_waiter(adp, "task-1")
+    adp._note_turn_start(CTX, "task-1")
+    asyncio.run(adp.send(CTX, "[WORKING] building", metadata={"notify": True}))
+    with adp._turn_lock:
+        adp._deferred[CTX] = ["task-1", "task-2"]
+
+    adp._forget_deferred("task-1")
+    assert adp._deferred[CTX] == ["task-2"]
+    adp._forget_deferred("task-2")
+    assert CTX not in adp._deferred
+
+
 def test_a_second_working_reply_refreshes_the_progress(isolated_home, monkeypatch):
     adp = _make_adapter(protocol.TaskStore(), monkeypatch)
     waiter = _add_waiter(adp, "task-1")
